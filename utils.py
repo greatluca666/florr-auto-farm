@@ -223,6 +223,111 @@ def calc_anti_stuck(borders, weight=1.0):
     return final_position[0], final_position[1]
 
 
+# 地图感知脱困的搜索参数(小地图像素). 蚁穴这类"大房间 + 一两像素宽细走廊"的图
+# 没标定墙壁色, execute_anti_stuck 原来只能随机蒙一个方向硬闯 1.5 秒 —— 卡在走廊
+# 拐角时 8 个方向里大半是继续顶墙。改成读 maps/<图>.png 的可走图: 沿可走路径找
+# 附近"净空更大"(离墙更远)的地方, 朝路径上的下一小段走, 走的是通道不是穿墙直线.
+MAP_ESCAPE_SEARCH_STEPS = 25     # BFS 最多沿路径往外找这么多步
+MAP_ESCAPE_LOOKAHEAD = 4         # 朝路径上第几步的点转向(太远会在拐角处抄近路顶墙)
+MAP_ESCAPE_STEP_PENALTY = 0.15   # 每多走一步扣多少净空分, 越大越倾向就近脱身
+MAP_ESCAPE_MIN_GAIN = 0.5        # 比原地净空至少好这么多才值得动, 否则算"已经在最宽处"
+MAP_ESCAPE_TIE_BAND = 1.0        # 得分在最优这个范围内的候选随机挑一个 —— 别每次都
+                                 # 选同一个点, 不然被怪/别的障碍挡住时会原地死循环
+
+
+def map_escape_step(binary_map, pos):
+    """从 pos 出发沿可走路径找一个净空明显更大的地方, 返回路径上前 MAP_ESCAPE_LOOKAHEAD
+    步的那个点 (x, y); pos 不在可走像素上 / 附近没有更宽的地方 -> None.
+
+    净空 = 到最近墙的欧氏距离(cv2.distanceTransform). 卡住的角色往往贴着墙、
+    净空很小; 往净空大的地方走 = 离开墙、回到通道中线. 用 BFS 沿路径搜(8 邻域,
+    跟 lazy_theta_star 的邻居定义一致), 不是直线距离 —— 细走廊里直线目标常常隔着墙.
+    """
+    if binary_map is None:
+        return None
+    h, w = binary_map.shape[:2]
+    x, y = int(round(pos[0])), int(round(pos[1]))
+    if not (0 <= x < w and 0 <= y < h) or binary_map[y, x] != 255:
+        return None
+
+    # 外面补一圈墙: distanceTransform 不把图像边界当墙, 一张没有任何墙像素的图
+    # 会得到 float 上限当净空; 补一圈之后"图边 = 墙"也更符合游戏里的事实.
+    walkable = np.pad((binary_map == 255).astype(np.uint8), 1)
+    clearance = cv2.distanceTransform(walkable, cv2.DIST_L2, 3)[1:-1, 1:-1]
+    base = float(clearance[y, x])
+
+    parent = {(x, y): None}
+    steps = {(x, y): 0}
+    queue = [(x, y)]
+    head = 0
+    candidates = []
+    while head < len(queue):
+        cx, cy = queue[head]
+        head += 1
+        s = steps[(cx, cy)]
+        if s > 0:
+            score = float(clearance[cy, cx]) - MAP_ESCAPE_STEP_PENALTY * s
+            if score >= base + MAP_ESCAPE_MIN_GAIN:
+                candidates.append((score, (cx, cy)))
+        if s >= MAP_ESCAPE_SEARCH_STEPS:
+            continue
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = cx + dx, cy + dy
+                if (0 <= nx < w and 0 <= ny < h and binary_map[ny, nx] == 255
+                        and (nx, ny) not in steps):
+                    steps[(nx, ny)] = s + 1
+                    parent[(nx, ny)] = (cx, cy)
+                    queue.append((nx, ny))
+
+    if not candidates:
+        return None
+    best = max(score for score, _ in candidates)
+    pool = [pt for score, pt in candidates if score >= best - MAP_ESCAPE_TIE_BAND]
+    target = random.choice(pool)
+
+    path = []
+    node = target
+    while node is not None:
+        path.append(node)
+        node = parent[node]
+    path.reverse()          # path[0] 就是 pos 本身
+    return path[min(MAP_ESCAPE_LOOKAHEAD, len(path) - 1)]
+
+
+def _map_aware_escape(duration):
+    """没标定墙壁色的图上的脱困: 读可走图找出路, 朝那个点转向走 duration 秒.
+    真的推了一下返回 True; 读不到地图 / 玩家位置 / 找不到更好的地方 -> False, 调用方
+    退回随机方向."""
+    binary_map = load_binary_map()
+    pos = get_player_position()
+    if binary_map is None or pos is None:
+        return False
+    target = map_escape_step(binary_map, pos)
+    if target is None:
+        return False
+    print(f"🧭 地图脱困: {pos} 沿通道朝 {target} 走(找净空更大的地方)")
+    deadline = time.time() + duration
+    pushed = False
+    while time.time() < deadline:
+        pos = get_player_position()
+        if pos is None:
+            break
+        dx, dy = target[0] - pos[0], target[1] - pos[1]
+        dist = math.hypot(dx, dy)
+        if dist == 0 or (pushed and dist < 1.5):   # 至少推一下, 再谈"到了"
+            break
+        pushed = True
+        extend = round(500 * mouse_scale())
+        cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+        pyautogui.moveTo(*clamp_to_screen(cx + extend * dx / dist, cy + extend * dy / dist))
+        time.sleep(0.1)
+    keyup("w")   # keyup 不看方向, 就是把鼠标归位到屏幕中心 = 停下
+    return pushed
+
+
 def execute_anti_stuck(duration=1.5):
     """卡住脱困: 优先用画面里的墙壁色算排斥方向, 排斥力太弱/没有就退化成随机方向硬闯.
 
@@ -246,6 +351,10 @@ def execute_anti_stuck(duration=1.5):
     delta = suggested_position - screen_center
     max_delta = np.max(np.abs(delta))
     if max_delta < 5:
+        # 没标定墙壁色的图(蚁穴/花园): 先试地图感知脱困, 动不了才随机蒙. 标定过的
+        # 图(沙漠/海洋)行为不变 —— 它们是开阔地图, 随机蒙也能蒙出来.
+        if MAP not in _MAP_BORDER_COLOR and _map_aware_escape(duration):
+            return
         direction = random.choice(["w", "a", "s", "d", "wa", "wd", "sa", "sd"])
         print(f"⚠️ 附近没找到足够强的墙壁排斥力(力度{max_delta:.1f}), 退化成随机方向脱困: {direction}")
         keydown(direction)

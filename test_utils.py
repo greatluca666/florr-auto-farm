@@ -781,3 +781,104 @@ def test_preprocess_map_opens_multiple_shortcut_rects_independently():
     assert (out[0:2, 0:2] == 255).all()
     assert (out[10:13, 10:13] == 255).all()
     assert out[5, 5] == 0   # 两个矩形之间没被带着开
+
+
+# ---- 地图感知脱困(没标定墙壁色的图: 蚁穴/花园) ----
+
+def _room_and_corridor():
+    """一条 2 像素宽的横走廊(y=10..11, x=2..19)通向右边一个大房间(x=20..44, y=2..20)."""
+    m = np.zeros((25, 50), dtype=np.uint8)
+    m[10:12, 2:20] = 255
+    m[2:21, 20:45] = 255
+    return m
+
+
+def test_map_escape_step_moves_away_from_the_wall_toward_open_space():
+    # 贴着大房间左墙站着(x=21), 净空最小 —— 该往房间里面(x 变大)走, 不是往墙里.
+    m = np.zeros((25, 50), dtype=np.uint8)
+    m[2:21, 20:45] = 255
+    utils.random.seed(0)
+    step = utils.map_escape_step(m, (20, 11))
+    assert step is not None and step[0] > 20
+
+
+def test_map_escape_step_follows_the_corridor_not_a_straight_line_through_walls():
+    # 走廊里的角色, 净空更大的地方(房间)在右边 —— 第一步必须还在走廊里(可走),
+    # 不能是穿墙直线上的墙像素.
+    m = _room_and_corridor()
+    utils.random.seed(0)
+    step = utils.map_escape_step(m, (4, 10))
+    assert step is not None
+    assert m[step[1], step[0]] == 255
+    assert step[0] > 4
+
+
+def test_map_escape_step_returns_none_when_already_at_the_widest_spot():
+    # 全图都是同样宽的空地, 挑不出"明显更好"的地方 -> None(调用方退回随机).
+    m = np.full((11, 11), 255, dtype=np.uint8)
+    assert utils.map_escape_step(m, (5, 5)) is None
+
+
+def test_map_escape_step_returns_none_for_wall_or_out_of_bounds_position():
+    m = _room_and_corridor()
+    assert utils.map_escape_step(m, (0, 0)) is None        # 墙
+    assert utils.map_escape_step(m, (999, 999)) is None    # 越界
+    assert utils.map_escape_step(None, (5, 5)) is None     # 没地图
+
+
+def test_map_escape_step_picks_among_near_equal_candidates_not_always_the_same():
+    # 走廊中间两头各有一个一样大的房间 —— 多次调用不该永远选同一头(被挡住时会死循环).
+    m = np.zeros((25, 62), dtype=np.uint8)
+    m[10:12, 20:42] = 255
+    m[2:21, 2:20] = 255
+    m[2:21, 42:60] = 255
+    seen = set()
+    for seed in range(20):
+        utils.random.seed(seed)
+        step = utils.map_escape_step(m, (30, 10))
+        seen.add(step[0] < 30)
+    assert seen == {True, False}
+
+
+def _stub_escape_env(monkeypatch, *, map_name, binary_map, pos):
+    monkeypatch.setattr(utils, "MAP", map_name)
+    monkeypatch.setattr(utils.pyautogui, "screenshot",
+                        lambda **k: Image.new("RGB", (64, 64)))
+    monkeypatch.setattr(utils, "SCREEN_WIDTH", 64)
+    monkeypatch.setattr(utils, "SCREEN_HEIGHT", 64)
+    monkeypatch.setattr(utils, "get_player_position", lambda *a, **k: pos)
+    monkeypatch.setattr(utils, "load_binary_map", lambda: binary_map)
+    monkeypatch.setattr(utils.time, "sleep", lambda *a, **k: None)
+    moves = []
+    monkeypatch.setattr(utils.pyautogui, "moveTo", lambda *a, **k: moves.append(a))
+    randoms = []
+    monkeypatch.setattr(utils, "keydown", lambda d, *a, **k: randoms.append(d))
+    monkeypatch.setattr(utils, "keyup", lambda d, *a, **k: None)
+    return moves, randoms
+
+
+def test_execute_anti_stuck_uses_the_map_on_an_uncalibrated_map(monkeypatch):
+    # 蚁穴没标定墙壁色 -> borders 空 -> 以前恒随机蒙方向; 现在走地图脱困.
+    moves, randoms = _stub_escape_env(monkeypatch, map_name="anthell",
+                                      binary_map=_room_and_corridor(), pos=(4, 10))
+    utils.random.seed(0)
+    utils.execute_anti_stuck(duration=0.5)
+    assert randoms == []          # 没走随机方向
+    assert len(moves) >= 1        # 真的转向推了
+
+
+def test_execute_anti_stuck_falls_back_to_random_when_the_map_is_unavailable(monkeypatch):
+    moves, randoms = _stub_escape_env(monkeypatch, map_name="anthell",
+                                      binary_map=None, pos=(4, 10))
+    utils.execute_anti_stuck(duration=0.5)
+    assert len(randoms) == 1      # 读不到地图 -> 退回原来的随机方向
+
+
+def test_execute_anti_stuck_leaves_calibrated_maps_on_the_old_path(monkeypatch):
+    # 沙漠有标定墙壁色: 行为不变, 就算力度弱落进随机分支也不去碰地图脱困.
+    moves, randoms = _stub_escape_env(monkeypatch, map_name="desert",
+                                      binary_map=_room_and_corridor(), pos=(4, 10))
+    monkeypatch.setattr(utils, "_map_aware_escape",
+                        lambda d: pytest.fail("沙漠不该走地图脱困"))
+    utils.execute_anti_stuck(duration=0.5)
+    assert len(randoms) == 1
