@@ -1,7 +1,7 @@
 @echo off
 REM Build florr-auto-pathing.exe on Windows. Run from the repo root, in a venv
 REM that has requirements.txt installed (pip install -r requirements.txt).
-REM PyInstaller does not cross-compile — this MUST run on Windows, not on
+REM PyInstaller does not cross-compile - this MUST run on Windows, not on
 REM a Mac or Linux machine.
 
 setlocal

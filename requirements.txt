@@ -10,7 +10,7 @@ python-xlib; sys_platform == "linux"   # pyautogui's Linux backend (mouse/keyboa
 websocket-client       # cdp_bridge.py's Chrome DevTools Protocol client
 certifi                # server_lookup.py's explicit SSLContext (needed on Windows: urllib does not read the system cert chain)
 customtkinter          # gui_app.py dark-theme GUI (pure Python; pulls darkdetect, packaging)
-flask                  # webctl.py 的 Web 控制面板后端
+flask                  # webctl.py: web control panel backend
 
 # --- packaging only, not needed to just run main.py ---
 pyinstaller
