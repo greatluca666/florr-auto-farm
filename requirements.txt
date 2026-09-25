@@ -1,0 +1,19 @@
+# florr-auto-pathing runtime deps.
+# Pin rationale is in the per-line comments below; keep them in sync if you touch this file.
+opencv-python<5        # <5 pinned: opencv-python 5.x demands numpy>=2; utils.py's maze recognition
+numpy<2                # held with opencv-python<5 above (revisit together if that unpins)
+pyautogui
+pillow                 # pyautogui's screenshot() silently needs this via pyscreeze
+pyobjc-framework-Cocoa; sys_platform == "darwin"   # overlay.py's macOS PyObjC window (unused on Windows)
+python-xlib; sys_platform == "linux"   # pyautogui's Linux backend (mouse/keyboard via X11);
+                                       # headless servers run it against Xvfb, see deploy/ubuntu/
+websocket-client       # cdp_bridge.py's Chrome DevTools Protocol client
+certifi                # server_lookup.py's explicit SSLContext (needed on Windows: urllib does not read the system cert chain)
+customtkinter          # gui_app.py dark-theme GUI (pure Python; pulls darkdetect, packaging)
+flask                  # webctl.py 的 Web 控制面板后端
+
+# --- packaging only, not needed to just run main.py ---
+pyinstaller
+
+# --- dev only ---
+pytest

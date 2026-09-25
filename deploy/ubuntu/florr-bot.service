@@ -1,0 +1,33 @@
+[Unit]
+Description=florr-auto-pathing 刷怪 worker
+Requires=florr-wm.service
+After=florr-wm.service
+Documentation=file:/opt/florr-auto-pathing/deploy/ubuntu/README.md
+
+[Service]
+User=florr
+WorkingDirectory=/opt/florr-auto-pathing
+Environment=DISPLAY=:99
+# PYTHONUNBUFFERED: 不设的话 print() 攒在缓冲区里, journalctl -f 看着像卡死了.
+Environment=PYTHONUNBUFFERED=1
+
+# 先把专用 Chrome 拉起来并等到 florr.io 标签页 —— worker 自己不拉 Chrome,
+# 没就绪时它会直接 exit(1). 这一步失败(没登录过 / Chrome 没装 / Xvfb 不通)
+# 整个 unit 就起不来, 原因在 journalctl 里写得很清楚.
+ExecStartPre=/opt/florr-auto-pathing/venv/bin/python main.py --launch-chrome --tab-timeout 60
+ExecStart=/opt/florr-auto-pathing/venv/bin/python main.py --worker
+
+# stdin 必须是 null 或 tty, 不能是管道: worker 把"stdin 管道被关"当成 GUI 发来的
+# 停止信号. main._install_worker_stdin_watcher() 已经做了"只有真管道才装监视线程"
+# 的判断, 所以这里接 /dev/null 是安全的.
+StandardInput=null
+
+Restart=always
+RestartSec=10
+# 崩溃重启时把 Chrome 也重新拉一遍(ExecStartPre 会重跑), 不然重连到一个可能已经
+# 死掉的 CDP 端口上.
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

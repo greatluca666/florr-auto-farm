@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # The suite was written on macOS and has never run on Windows: report failures,
+      # but do not let them stop the build from producing the zip to smoke-test.
+      - name: Run tests
+        continue-on-error: true
+        timeout-minutes: 15
+        run: python -m pytest -q
+
+      - name: Build the exe
+        shell: cmd
+        run: build_windows.bat
+
+      - name: Package
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $dir = "dist\florr-auto-pathing"
+          if (-not (Test-Path "$dir\florr-auto-pathing.exe")) { throw "exe is missing" }
+          if (-not (Test-Path "$dir\_internal")) { throw "_internal is missing" }
+          if (-not (Test-Path "$dir\maps")) { throw "maps is missing" }
+          Copy-Item README.md, LICENSE -Destination $dir
+          $name = "florr-auto-farm-$($env:TAG)-win64.zip"
+          Compress-Archive -Path $dir -DestinationPath $name
+          # Inspect what actually went into the zip: nothing the app writes beside the exe may be in it.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $name).Path)
+          try {
+            $bad = $zip.Entries | Where-Object { $_.FullName -match '^florr-auto-pathing[\\/](chrome-profiles([\\/]|$)|config\.json$)' }
+            $exe = $zip.Entries | Where-Object { $_.FullName -match '^florr-auto-pathing[\\/]florr-auto-pathing\.exe$' }
+          } finally { $zip.Dispose() }
+          if (-not $exe) { throw "unexpected zip layout: florr-auto-pathing/florr-auto-pathing.exe not found in $name" }
+          if ($bad) { throw "the zip must never contain chrome-profiles or config.json: $(@($bad)[0].FullName)" }
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Draft the release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: ${{ env.ZIP_NAME }}
+          body_path: RELEASE_NOTES.md

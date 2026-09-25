@@ -1,0 +1,16 @@
+[Unit]
+Description=florr-auto-pathing 的虚拟 X 显示 (Xvfb :99)
+Documentation=file:/opt/florr-auto-pathing/deploy/ubuntu/README.md
+
+[Service]
+User=florr
+# 1920x1080x24: utils.py 里所有坐标常量(_REF_WIDTH/_REF_HEIGHT)都是照这个分辨率
+# 量的. 改这里等于让 scale_point() 去做一次缩放换算, 而 biome 选择格 (977,596)
+# 之类的点是在真客户端上一像素一像素标出来的, 缩放后不保证还落在格子里.
+# -nolisten tcp: 不开 6000 端口, X 只走 unix socket.
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

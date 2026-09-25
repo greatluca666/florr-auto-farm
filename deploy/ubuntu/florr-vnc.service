@@ -1,0 +1,18 @@
+[Unit]
+Description=florr-auto-pathing 虚拟屏的 VNC 观察口 (可选, 调试用)
+Requires=florr-xvfb.service
+BindsTo=florr-xvfb.service
+After=florr-xvfb.service
+
+[Service]
+User=florr
+Environment=DISPLAY=:99
+# -localhost: 只监听 127.0.0.1. 这个口是完全无认证的, 绝不能直接暴露到公网 ——
+# 要从外面看请走 SSH 隧道: ssh -L 5900:127.0.0.1:5900 你@这台机
+# -shared: 允许多个观察者同时连, 省得互相踢掉.
+ExecStart=/usr/bin/x11vnc -display :99 -localhost -shared -forever -nopw -quiet
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

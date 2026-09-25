@@ -1,0 +1,21 @@
+[Unit]
+Description=florr-auto-pathing Web 控制面板
+After=network.target
+Documentation=file:/opt/florr-auto-pathing/deploy/ubuntu/README.md
+
+[Service]
+User=florr
+WorkingDirectory=/opt/florr-auto-pathing
+# FLORR_WEBCTL_PEER_URL 留空: setup.sh 跑的时候还不知道另一台机器的 nip.io
+# 域名(可能还没跑过 setup.sh). 两台都装完后手动编辑这里, 填对方的地址, 然后
+# systemctl daemon-reload && systemctl restart florr-webctl —— 见 README.
+Environment=FLORR_WEBCTL_PASSWORD_FILE=/etc/florr-webctl/password
+Environment=FLORR_WEBCTL_PEER_URL=
+Environment=FLORR_WEBCTL_PORT=8765
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/florr-auto-pathing/venv/bin/python webctl.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

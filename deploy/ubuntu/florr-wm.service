@@ -1,0 +1,20 @@
+[Unit]
+Description=florr-auto-pathing 虚拟屏上的窗口管理器 (openbox)
+# Xvfb 没起来时 openbox 连不上 DISPLAY, 直接退. BindsTo 保证 Xvfb 挂了它跟着停,
+# 起来了跟着重启 —— 光 After 只管启动顺序, 不管运行期联动.
+Requires=florr-xvfb.service
+BindsTo=florr-xvfb.service
+After=florr-xvfb.service
+
+[Service]
+User=florr
+Environment=DISPLAY=:99
+# 要 WM 的唯一理由: 没有 WM 时 Chrome 的 --start-fullscreen 不生效(全屏是 WM 的
+# 职责), 窗口会以默认尺寸落在角落 —— 游戏画面尺寸对不上, 所有写死的坐标全偏.
+# --sm-disable: 不连会话管理器(headless 上根本没有), 省掉启动时那次超时等待.
+ExecStart=/usr/bin/openbox --sm-disable
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
