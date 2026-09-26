@@ -222,30 +222,66 @@ def test_anthell_portals_stay_walls():
 
 
 def test_anthell_shortcuts_are_the_calibrated_rects():
-    # 每个元素是密道瓦片形状里的一格(来自 ant_hell.tmj 的 "shortcut" tilelayer,
-    # 不是 objectgroup 给的外接矩形 —— 用户反馈2026-09-21外接矩形整块打通跟网页
-    # 上看到的弯曲密道形状不一样, 换成精确到瓦片的形状), 38格拼起来是3条密道的
-    # 真实拐弯形状。改这些数字等于改密道打通的形状/位置 —— 数据来源见
-    # map_routes.ANTHELL_SHORTCUTS 上面那段注释。
+    # 每个元素是同一行的一段像素, 90 个像素拼出 3 条 2~3 像素宽的弯通道 —— 按
+    # florr 自己的 ant_hell.tmj 瓦片形状算出来的, 推导见 map_routes.ANTHELL_SHORTCUTS
+    # 上面的注释. 改这些数字等于改密道打通的位置/形状.
     assert map_routes.ANTHELL_SHORTCUTS == [
-        (82, 82, 85, 85), (84, 82, 87, 85), (86, 82, 90, 85),
-        (82, 84, 85, 87), (84, 84, 87, 87), (86, 84, 90, 87), (89, 84, 92, 87), (91, 84, 94, 87),
-        (84, 86, 87, 90), (86, 86, 90, 90), (89, 86, 92, 90), (91, 86, 94, 90),
-        (89, 89, 92, 92), (91, 89, 94, 92),
-        (98, 105, 102, 109), (101, 105, 104, 109), (103, 105, 106, 109),
-        (98, 108, 102, 111), (101, 108, 104, 111), (103, 108, 106, 111), (105, 108, 109, 111), (108, 108, 111, 111),
-        (101, 110, 104, 113), (103, 110, 106, 113), (105, 110, 109, 113), (108, 110, 111, 113),
-        (82, 176, 85, 180), (84, 176, 87, 180),
-        (75, 179, 78, 182), (77, 179, 80, 182), (79, 179, 83, 182), (82, 179, 85, 182), (84, 179, 87, 182),
-        (75, 181, 78, 184), (77, 181, 80, 184), (79, 181, 83, 184), (82, 181, 85, 184), (84, 181, 87, 184),
+        (83, 84, 87, 84), (83, 85, 87, 85), (86, 86, 93, 86), (86, 87, 93, 87),
+        (89, 88, 89, 88), (91, 88, 93, 88), (91, 89, 93, 89), (91, 90, 93, 90),
+        (100, 107, 100, 107), (100, 108, 104, 108), (100, 109, 104, 109),
+        (103, 110, 109, 110), (103, 111, 109, 111),
+        (85, 178, 86, 178), (84, 179, 86, 179), (76, 180, 76, 180), (84, 180, 86, 180),
+        (76, 181, 85, 181), (76, 182, 85, 182),
     ]
 
 
 def test_anthell_shortcuts_are_valid_rects():
-    assert len(map_routes.ANTHELL_SHORTCUTS) == 38   # 3条密道拼出来的瓦片总数
+    total = 0
     for x0, y0, x1, y1 in map_routes.ANTHELL_SHORTCUTS:
-        assert 0 <= x0 < x1 < 300
-        assert 0 <= y0 < y1 < 300
+        assert 0 <= x0 <= x1 < 300
+        assert 0 <= y0 <= y1 < 300
+        total += (x1 - x0 + 1) * (y1 - y0 + 1)
+    # 上一版按"整格 + 取整外扩"打通了 274 个像素, 其中 169 个按 florr 地图数据是真墙.
+    assert total == 90
+
+
+# 3 条密道各自两头的通道口(maps/anthell.png 坐标, 密道外侧紧挨着的可走像素).
+_ANTHELL_SHORTCUT_MOUTHS = [((82, 83), (94, 91)), ((99, 106), (110, 112)), ((87, 177), (75, 183))]
+
+
+def _bfs_steps(binary, start, goal):
+    from collections import deque
+    h, w = binary.shape
+    seen = {start: 0}
+    q = deque([start])
+    while q:
+        x, y = q.popleft()
+        if (x, y) == goal:
+            return seen[(x, y)]
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                n = (x + dx, y + dy)
+                if 0 <= n[0] < w and 0 <= n[1] < h and binary[n[1], n[0]] == 255 and n not in seen:
+                    seen[n] = seen[(x, y)] + 1
+                    q.append(n)
+    return None
+
+
+def test_anthell_shortcuts_are_real_short_passages_on_the_shipped_map():
+    """每条密道都得是一条真的能穿过去的近路: 打通后两头之间十几步就到, 不打通
+    要绕 100 多步. 密道形状要是算歪了(没接上某一头、或者中间断了), 打通后的距离
+    会跟没打通一样长. "不打通"= 把已发布地图上的密道像素抹回墙 —— 这些像素在小地图
+    截图里本来就是墙(推导时就是按"小地图画成墙"筛的), 不用依赖调试截图."""
+    import cv2
+
+    shipped = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    minimap_only = shipped.copy()
+    for x0, y0, x1, y1 in map_routes.ANTHELL_SHORTCUTS:
+        minimap_only[y0:y1 + 1, x0:x1 + 1] = 0
+    for a, b in _ANTHELL_SHORTCUT_MOUTHS:
+        assert shipped[a[1], a[0]] == 255 and shipped[b[1], b[0]] == 255
+        assert _bfs_steps(shipped, a, b) <= 15, f"密道 {a}<->{b} 没打通"
+        assert _bfs_steps(minimap_only, a, b) >= 100, f"{a}<->{b} 本来就近, 不是密道"
 
 
 def test_anthell_shortcuts_are_walkable_and_connected_on_the_shipped_map():
