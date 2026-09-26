@@ -28,6 +28,7 @@ SPECIES_RANK = {
     "soldier_ant": 1,
     "worm": 1,
     "queen_ant": 1,
+    "ant_egg": 1,
 }
 
 _AVOID_PAIRS = {("scorpion", "Ultra"), ("beetle", "Ultra")}
@@ -322,6 +323,12 @@ CHASE_MIN_CONF = 0.55  # 只有置信度到这个数的检测框才够格当"追
 # 一直贴着目标挪, 太大 = 够不着; 先取小值, 实机按花瓣够得着的距离调。
 ANTHELL_ENGAGE_HOLD_PX = 120
 
+# 最近优先模式只追这个屏幕像素半径内的怪, 再远的交回漫游。未标定(先取 300, 实机调)。
+# 2026-09-27 实机: 蚁穴刷怪区是一条 y 86~93 的窄带, 直线最近的怪常常隔着墙或在带外,
+# 追过去顶墙 -> "索敌中途中卡住", 出带 -> "离开刷怪区域" 拉回来, 来回空转; 规避途中
+# 卡住还直接死了一次。限制半径 = 只处理够得着的, 不追远处的。
+ANTHELL_CHASE_MAX_PX = 300
+
 # 每张图的选目标策略: "priority" = 按稀有度/物种优先级挑, 只追 Mythic+ (沙漠);
 # "nearest" = 谁离玩家最近追谁, 不看稀有度 (蚁穴: 一帧 25+ 只神话兵蚁, 按稀有度
 # 挑会每 tick 都在追, 跟沙漠那个"密集刷怪区死循环"是同一个坑)。
@@ -334,7 +341,8 @@ def target_policy_for(map_name):
 
 def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
                   center=SCREEN_CENTER, chase_min_conf=CHASE_MIN_CONF,
-                  target_policy="priority", engage_hold_px=ANTHELL_ENGAGE_HOLD_PX):
+                  target_policy="priority", engage_hold_px=ANTHELL_ENGAGE_HOLD_PX,
+                  chase_max_px=ANTHELL_CHASE_MAX_PX):
     """每tick的索敌决策入口. detections是scan_enemies()给的检测列表(或测试里
     手搭的同结构字典列表). 返回三选一:
       ("flee", avoid_positions)             —— 触发半径内有AVOID怪, 优先规避
@@ -380,13 +388,18 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
         if in_range:
             return ("flee", in_range)
 
-    if candidates and target_policy == "nearest":
+    if target_policy == "nearest":
         # 最近优先: 不看稀有度, 不设 Mythic 门槛 —— AVOID 怪早在上面被挡在候选池外。
+        # 只追 chase_max_px 内的; 没有 -> 漫游(不能掉进下面按稀有度那套去追远处的神话)。
         cx, cy = center
-        best, best_bucket = min(
-            candidates,
-            key=lambda pair: math.hypot(pair[0]["screen_pos"][0] - cx,
-                                        pair[0]["screen_pos"][1] - cy))
+
+        def _dist(pair):
+            return math.hypot(pair[0]["screen_pos"][0] - cx, pair[0]["screen_pos"][1] - cy)
+
+        reachable = [pair for pair in candidates if _dist(pair) <= chase_max_px]
+        if not reachable:
+            return ("wander", None)
+        best, best_bucket = min(reachable, key=_dist)
         hold_px = cautious_hold_px if best_bucket == "CAUTIOUS" else engage_hold_px
         repel = list(avoid_positions)
         repel += [d["screen_pos"] for d in cautious_dets if d is not best]
@@ -420,8 +433,9 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
 MAP_SPECIES = {
     "desert": frozenset({"scorpion", "beetle", "cactus", "sandstorm",
                          "sand_centipede", "soldier_fire_ant"}),
-    # 蚁穴 (2026-09-27 实机抓帧): 幼蚁/工蚁/兵蚁/蠕虫; queen_ant 是没抓到过的假设。
-    "anthell": frozenset({"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant"}),
+    # 蚁穴 (2026-09-27 实机): 幼蚁/工蚁/兵蚁/蠕虫/蚁卵; queen_ant 是没抓到过的假设。
+    "anthell": frozenset({"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant",
+                          "ant_egg"}),
     "garden": frozenset(),
     "ocean": frozenset(),
 }
@@ -448,6 +462,7 @@ _SPECIES_ALIASES = {
     "工蚁": "worker_ant",
     "兵蚁": "soldier_ant",
     "蠕虫": "worm",
+    "蚁卵": "ant_egg",               # 2026-09-27 实机日志里出现, 用户确认也算怪物
     "蚁后": "queen_ant",             # 未验证: 没抓到过蚁后, 名字是按中文客户端译名猜的
     "瓢虫": "sandstorm",             # Ladybug: 沙漠里极罕见的乱入怪, 高价值 —— 借
                                      # SPECIES_RANK 最高档(sandstorm=5), 同稀有度时优先

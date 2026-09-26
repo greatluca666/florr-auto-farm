@@ -770,9 +770,10 @@ def test_current_center_is_reset_when_a_scan_fails(monkeypatch):
 
 def test_anthell_species_table_and_aliases():
     assert _ed.MAP_SPECIES["anthell"] == frozenset(
-        {"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant"})
+        {"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant", "ant_egg"})
     for name, slug in (("幼蚁", "baby_ant"), ("工蚁", "worker_ant"),
-                       ("兵蚁", "soldier_ant"), ("蠕虫", "worm"), ("蚁后", "queen_ant")):
+                       ("兵蚁", "soldier_ant"), ("蠕虫", "worm"), ("蚁后", "queen_ant"),
+                       ("蚁卵", "ant_egg")):
         assert _ed._species_from_name(name, map_name="anthell") == slug
 
 
@@ -783,7 +784,7 @@ def test_anthell_ant_names_do_not_leak_into_desert():
 
 
 def test_anthell_ultra_and_above_are_avoid():
-    for species in ("baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant"):
+    for species in ("baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant", "ant_egg"):
         for rarity in ("Ultra", "Super", "Eternal", "Unique"):
             assert classify_action(species, rarity) == "AVOID"
         for rarity in _BELOW_ULTRA:
@@ -869,3 +870,39 @@ def test_priority_policy_is_still_the_default():
     action, payload = select_action([_det("sandstorm", "Common", (1000, 540))],
                                     center=(960, 540))
     assert action == "wander" and payload is None
+
+
+def test_nearest_policy_targets_ant_eggs_like_any_other_mob():
+    # 蚁卵也算怪物(用户 2026-09-27): 最近的是卵就打卵.
+    detections = [
+        _det("ant_egg", "Common", (1000, 540)),
+        _det("soldier_ant", "Mythic", (1200, 540)),
+    ]
+    action, target, _, _ = _nearest(detections)
+    assert action == "chase" and target["species"] == "ant_egg"
+
+
+def test_nearest_policy_ignores_targets_beyond_chase_radius():
+    # 只有一堆远处的怪(隔着墙/出了刷怪带) -> 不追, 交回漫游. 不能退回按稀有度那套去追远处的神话.
+    far = _ed.ANTHELL_CHASE_MAX_PX + 50
+    action, payload = _nearest([_det("soldier_ant", "Mythic", (960 + far, 540))])
+    assert action == "wander" and payload is None
+
+
+def test_nearest_policy_chase_radius_is_inclusive_and_picks_nearest_inside():
+    inside = _ed.ANTHELL_CHASE_MAX_PX
+    detections = [
+        _det("worker_ant", "Common", (960 + inside, 540)),          # 刚好在半径上
+        _det("soldier_ant", "Mythic", (960 + inside + 200, 540)),   # 半径外
+    ]
+    action, target, _, _ = _nearest(detections)
+    assert action == "chase" and target["species"] == "worker_ant"
+
+
+def test_nearest_policy_far_ultra_still_repels_while_chasing_near_target():
+    detections = [
+        _det("worker_ant", "Mythic", (1060, 540)),
+        _det("soldier_ant", "Ultra", (960 - 700, 540)),   # 半径和 flee 触发都之外, 但要绕开
+    ]
+    action, target, _, repel = _nearest(detections, avoid_trigger_px=400)
+    assert action == "chase" and (260, 540) in repel

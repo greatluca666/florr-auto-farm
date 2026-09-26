@@ -1486,6 +1486,7 @@ def _quiet_entry_env(monkeypatch):
     monkeypatch.setattr(main, "get_player_position", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(main.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(main, "execute_anti_stuck", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: None, raising=False)
 
 
 def test_maybe_scan_enemies_passes_target_policy_for_current_map(monkeypatch):
@@ -2830,3 +2831,72 @@ def test_drive_defaults_to_enemy_detect_current_center(monkeypatch):
     history = []
     main._drive_and_check_stall((100.0, 200.0), (5, 5), history, "清青怪", "保持距离")
     assert history == []
+
+# ── 死在蚁穴 -> 重生还在蚁穴, 但阶段猜测回到花园 (2026-09-27 实机: 3 轮各白烧 180 秒) ──
+
+def test_stage_state_sync_to():
+    route = map_routes.route_for("anthell")
+    st = main._StageState(route)
+    st.sync_to("anthell")
+    assert st.map_name == "anthell"
+    st.sync_to("garden")
+    assert st.map_name == "garden"
+    st.sync_to("desert")               # 不在路线上 -> 不动
+    assert st.map_name == "garden"
+
+
+def test_entry_route_trusts_canvas_zone_label_over_stage_guess(monkeypatch):
+    """人其实在蚁穴、状态变量却在花园: 不能拿花园的路线去走蚁穴的墙."""
+    _quiet_entry_env(monkeypatch)
+    route = _anthell_route(monkeypatch)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: "anthell")
+    walked, applied = [], []
+    monkeypatch.setattr(main, "apply_map", lambda n: applied.append(n))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    assert main._run_entry_route(route, st, timeout=5) == "arrived"
+    assert walked == []                # 一步花园路线都不该走
+    assert applied == ["anthell"]
+    assert st.map_name == "anthell"
+
+
+def test_entry_route_canvas_zone_label_beats_a_garden_server_id(monkeypatch):
+    # 服务器号(读得到时是"权威")说花园, 画布区域名说蚁穴 —— 以画布为准.
+    _quiet_entry_env(monkeypatch)
+    route = _anthell_route(monkeypatch)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: "anthell")
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    walked = []
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    assert main._run_entry_route(route, main._StageState(route), timeout=5) == "arrived"
+    assert walked == []
+
+
+def test_entry_route_still_walks_when_canvas_zone_is_unknown(monkeypatch):
+    # 读不到区域名(None) = 行为跟以前一字不差: 按阶段猜测走花园路线.
+    _quiet_entry_env(monkeypatch)
+    route = _anthell_route(monkeypatch)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: None)
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    walked = []
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    main._run_entry_route(route, main._StageState(route), timeout=5)
+    assert len(walked) == 1
+
+
+def test_entry_route_never_reads_the_canvas_on_single_stage_routes(monkeypatch):
+    # 单图路线(沙漠/海洋)压根没有"我在哪一段"的问题 —— 连画布都不该碰.
+    _quiet_entry_env(monkeypatch)
+    reads = []
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: reads.append(1) or "anthell")
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
+    route = map_routes.route_for("desert")
+    assert main._run_entry_route(route, main._StageState(route)) == "arrived"
+    assert reads == []

@@ -86,6 +86,36 @@ def _is_summon_block(texts):
     return any(str(t) in SUMMON_LABELS for t in texts)
 
 
+# HUD 上的区域名 -> 寻路图名。只收实机帧里核对过的: 蚁穴的抓帧里一直有 "蚂蚁地狱",
+# 沙漠的抓帧里一直有 "沙漠" (2026-09-27)。花园/海洋的字样没见过, 不猜。
+ZONE_LABELS = {"蚂蚁地狱": "anthell", "沙漠": "desert"}
+
+
+def zone_map_from_frame(records):
+    """从 HUD 上的区域名读出"人现在在哪张图". 认不出 -> None.
+
+    为什么要它: 死在蚁穴后重生还在蚁穴, 但服务器号 / 阶段猜测都会说"花园"(蚁穴走的是
+    花园那台服务器), 进场路线就拿花园的路线去走蚁穴的墙, 一轮白烧 180 秒。区域名是游戏
+    自己画在 HUD 上的, 跟服务器号无关。
+    名牌文字画在世界缩放(zoom)下, HUD 是 UI 缩放 —— 跳过跟 zoom 同缩放的文本, 玩家/怪
+    起名叫"蚂蚁地狱"也骗不了它。"""
+    zoom = None
+    for r in records:
+        if r["op"] == "stroke" and r.get("stroke") == HEALTHBAR_BG and not _is_minimap(r):
+            zoom = r["m"][0]
+            break
+    for r in records:
+        if r["op"] != "text":
+            continue
+        zone = ZONE_LABELS.get(str(r.get("text", "")))
+        if zone is None:
+            continue
+        if zoom is not None and r.get("m") is not None and abs(_scale(r) - zoom) < 1e-6:
+            continue
+        return zone
+    return None
+
+
 def _is_player_block(texts):
     """这个名牌块属于玩家(而不是怪)吗 —— 块里**任意一条**文本是 "37级" 就算。
 

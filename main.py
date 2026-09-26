@@ -1003,6 +1003,14 @@ def _drain_second_newest_frame(drain_seconds=CANVAS_VERIFY_DRAIN_SECONDS):
     return frames[keys[-2]]
 
 
+def _canvas_zone_map(drain_seconds=CANVAS_VERIFY_DRAIN_SECONDS):
+    """画布 HUD 上的区域名 -> 寻路图名; 钩子没装上 / 读不到 / 认不出 -> None."""
+    recs = _drain_second_newest_frame(drain_seconds)
+    if recs is None:
+        return None
+    return canvas_decode.zone_map_from_frame(recs)
+
+
 def _canvas_portal_world_offset(drain_seconds=CANVAS_VERIFY_DRAIN_SECONDS):
     """尝试用 canvas 钩子读一帧, 拿洞口光效相对玩家的世界坐标偏移量 —— 给
     _walk_toward_visible_portal 逐步逼近用, 也给 _run_entry_route 的 settle
@@ -1217,6 +1225,13 @@ class _StageState:
     def advance(self):
         self._index = min(self._index + 1, len(self._route.stages) - 1)
 
+    def sync_to(self, map_name):
+        """人实际在 map_name 上(画布区域名读出来的) —— 把猜测对齐过去. 不在路线上就不动."""
+        for i, stage in enumerate(self._route.stages):
+            if stage.map_name == map_name:
+                self._index = i
+                return
+
     def reset(self):
         self._index = 0
 
@@ -1295,6 +1310,15 @@ def _run_entry_route(route, stage_state, timeout=ENTRY_ROUTE_TIMEOUT, want_defen
             # 路线零影响"。
             current = (florr_server.current_map_name(cdp_bridge.eval_js)
                        if len(route.stages) > 1 else None) or stage_state.map_name
+            if len(route.stages) > 1:
+                # 画布区域名比服务器号 / 阶段猜测都可靠: 死在蚁穴后重生还在蚁穴, 但那两个
+                # 都会说"花园"(蚁穴走花园那台服务器) —— 2026-09-27 实机, 3 轮各拿花园的
+                # 路线去走蚁穴的墙, 白烧 180 秒。同样只对多阶段路线读, 单图路线零影响。
+                zone = _canvas_zone_map()
+                if zone is not None and zone != current and route.stage_for(zone) is not None:
+                    print(f"🗺️ 画布区域名显示人在 {zone}, 不是 {current} —— 按 {zone} 走")
+                    current = zone
+                    stage_state.sync_to(zone)
             if current == route.final_map:
                 apply_map(current)
                 return "arrived"

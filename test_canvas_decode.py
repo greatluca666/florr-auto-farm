@@ -471,3 +471,30 @@ def test_hook_label_gate_matches_python_side():
     dy = float(re.search(r"var LABEL_MAX_DY = ([\d.]+)", js).group(1))
     assert dx >= canvas_decode.LABEL_MAX_DX
     assert dy >= canvas_decode.LABEL_MAX_DY
+
+
+# ── 区域名 (2026-09-27 实机: 蚁穴帧里一直有 "蚂蚁地狱", 沙漠帧里一直有 "沙漠") ──────────
+
+def test_zone_map_reads_the_zone_label():
+    from canvas_decode import zone_map_from_frame
+    recs = gameplay_frame(0)
+    recs += [text_rec(0, 960.0, 40.0, "蚂蚁地狱", scale=1.0)] * 2
+    assert zone_map_from_frame(recs) == "anthell"
+    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "沙漠", scale=1.0)] * 2
+    assert zone_map_from_frame(recs) == "desert"
+
+
+def test_zone_map_is_none_without_a_known_label():
+    from canvas_decode import zone_map_from_frame
+    assert zone_map_from_frame(gameplay_frame(0)) is None
+    assert zone_map_from_frame([]) is None
+    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "花园", scale=1.0)] * 2
+    assert zone_map_from_frame(recs) is None    # 花园的字样没在实机上核对过, 不猜
+
+
+def test_zone_map_ignores_a_mob_or_player_named_like_a_zone():
+    # 名牌文字画在世界缩放(zoom)下, HUD 区域名是 UI 缩放 —— 玩家起名"蚂蚁地狱"不能骗过它.
+    from canvas_decode import zone_map_from_frame
+    recs = (gameplay_frame(0) + healthbar_recs(0, 400.0, 300.0)
+            + [text_rec(0, 400.0, 330.0, "蚂蚁地狱")] * 2)   # scale=ZOOM = 名牌那个缩放
+    assert zone_map_from_frame(recs) is None
