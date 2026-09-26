@@ -2974,3 +2974,22 @@ def test_entry_route_never_reads_the_canvas_on_single_stage_routes(monkeypatch):
     route = map_routes.route_for("desert")
     assert main._run_entry_route(route, main._StageState(route)) == "arrived"
     assert reads == []
+
+
+def test_force_utf8_stdio_lets_a_gbk_stream_print_emoji(monkeypatch):
+    # 中文 Windows 上 stdout 是管道时按 GBK 编码, print("❌ ...") 直接 UnicodeEncodeError。
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="gbk")
+    monkeypatch.setattr(main.sys, "stdout", out)
+    monkeypatch.setattr(main.sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="gbk"))
+    main._force_utf8_stdio()
+    print("❌ 失败", file=out)
+    out.flush()
+    assert raw.getvalue() == "❌ 失败\n".encode("utf-8")
+
+
+def test_force_utf8_stdio_survives_missing_streams(monkeypatch):
+    # pythonw 没有控制台时 sys.stdout 是 None: 不能因此启动失败
+    monkeypatch.setattr(main.sys, "stdout", None)
+    monkeypatch.setattr(main.sys, "stderr", None)
+    main._force_utf8_stdio()

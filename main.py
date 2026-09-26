@@ -1960,7 +1960,19 @@ def _install_worker_stdin_watcher():
     t.start()
 
 
+def _force_utf8_stdio():
+    """日志里有 ❌ ⚠️ 这类字符。中文 Windows 的 stdout 一旦不是控制台(管道 / 重定向 /
+    IDE), Python 就按系统代码页 GBK 编码, 一 print 这些字符就 UnicodeEncodeError 崩掉。
+    入口处统一改成 UTF-8, 编不出来的字符替换掉而不是抛异常。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass  # stream 为 None(无控制台的 pythonw)或不支持 reconfigure: 不影响运行
+
+
 if __name__ == "__main__":
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(description="florr-auto-pathing")
     parser.add_argument("--worker", action="store_true",
                         help="内部用: 跑刷怪循环子进程(由 GUI 拉起, 不要手动加)")
