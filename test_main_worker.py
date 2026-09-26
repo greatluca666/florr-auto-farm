@@ -1488,12 +1488,24 @@ def _quiet_entry_env(monkeypatch):
     monkeypatch.setattr(main, "execute_anti_stuck", lambda *a, **k: None, raising=False)
 
 
+def test_maybe_scan_enemies_passes_target_policy_for_current_map(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [])
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda dets, **k: seen.update(k) or ("wander", None))
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    for map_name, want in (("anthell", "nearest"), ("desert", "priority")):
+        monkeypatch.setattr(main.utils, "MAP", map_name)
+        main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
+        assert seen["target_policy"] == want
+
+
 def test_apply_worker_config_force_disables_enemy_ai_on_unsupported_map(monkeypatch):
-    # 蚁穴没做索敌(MAP_SPECIES["anthell"] 是空集), config 里写 true 也得关掉 ——
+    # 海洋没做索敌(MAP_SPECIES["ocean"] 是空集), config 里写 true 也得关掉 ——
     # priority_score() 对表外 slug 会 KeyError.
     monkeypatch.setattr(main, "apply_map", lambda name: None)
     w = main._apply_worker_config(
-        {"version": 2, "active": {"map": "anthell", "enemy_ai_enabled": True}})
+        {"version": 2, "active": {"map": "ocean", "enemy_ai_enabled": True}})
     assert w["enemy_ai_enabled"] is False
     w2 = main._apply_worker_config(
         {"version": 2, "active": {"map": "desert", "enemy_ai_enabled": True}})

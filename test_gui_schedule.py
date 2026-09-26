@@ -52,7 +52,8 @@ def test_enemy_switch_is_only_enabled_where_species_are_known(monkeypatch):
     # GUI 得跟 worker 一致: main._apply_worker_config 会在没做索敌的图上把
     # enemy_ai_enabled 强制关掉, 界面上就不该让人以为开了能生效.
     assert enemy_detect.species_supported("desert") is True
-    assert enemy_detect.species_supported("anthell") is False
+    assert enemy_detect.species_supported("anthell") is True
+    assert enemy_detect.species_supported("garden") is False
 
     # 光测 species_supported 测不出 _sync_enemy_enabled 布线断没断(开关真
     # configure(state=...) 了吗? _on_map_change 真调它了吗?) —— 这里真造一个
@@ -76,6 +77,11 @@ def test_enemy_switch_is_only_enabled_where_species_are_known(monkeypatch):
         assert ed._enemy_hint.cget("text") == "本图支持索敌"
 
         ed._map.set("anthell")
+        ed._on_map_change()
+        assert ed._enemy.cget("state") == "normal"
+        assert ed._enemy_hint.cget("text") == "本图支持索敌"
+
+        ed._map.set("ocean")
         ed._on_map_change()
         assert ed._enemy.cget("state") == "disabled"
         assert ed._enemy_hint.cget("text").startswith("本图暂不支持索敌")

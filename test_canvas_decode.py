@@ -432,6 +432,34 @@ def test_text_above_the_bar_is_not_claimed():
     assert [m for m in mobs_from_frame(recs, cam) if m["name"] == "上面的字"] == []
 
 
+def _summon_nameplate(frame, ax, ay, name, rarity, rarity_color, hp=1.0):
+    """玩家召唤物的名牌: [名字, "召唤"(金色 #FFE763), 稀有度词] —— 2026-09-25 实机帧的排布."""
+    return (healthbar_recs(frame, ax, ay, hp)
+            + [text_rec(frame, ax - 27.0, ay + 42.0, name)] * 2
+            + [text_rec(frame, ax - 27.0, ay + 53.0, "召唤", "#FFE763")] * 2
+            + [text_rec(frame, ax + 14.0, ay + 53.0, rarity, rarity_color)] * 2)
+
+
+def test_player_summoned_mob_is_ignored():
+    """玩家放出来的召唤物不是野怪, 不能进 mobs_from_frame —— 否则会去追别人的宠物."""
+    recs = gameplay_frame(0)
+    recs += _summon_nameplate(0, 400.0, 300.0, "沙尘暴", "究极", "#FF2B75")
+    cam = camera_from_frame(recs)
+    assert [m for m in mobs_from_frame(recs, cam) if m["name"] == "沙尘暴"] == []
+
+
+def test_wild_mob_next_to_summon_is_still_detected():
+    """只丢带"召唤"的那块; 同物种的野怪照常识别, 而且名字/稀有度不能被召唤物串味."""
+    recs = gameplay_frame(0)
+    recs += _summon_nameplate(0, 400.0, 300.0, "沙尘暴", "究极", "#FF2B75")
+    recs += _big_mob_nameplate(0, 900.0, 200.0, "沙尘暴", "神话", "#1FDBDE", dy_name=59.0)
+    cam = camera_from_frame(recs)
+    mobs = [m for m in mobs_from_frame(recs, cam) if m["name"] == "沙尘暴"]
+    assert len(mobs) == 1
+    assert mobs[0]["rarity"] == "神话"
+    assert abs(mobs[0]["sx"] - 900.0) < 1.0
+
+
 def test_hook_label_gate_matches_python_side():
     """canvas_hook.js 在**记录期**就按同一道门丢文本 —— 两边不同步的话, Python 这边
     放得再宽也没用, 数据在页面里就已经没了。这条钉住两个常量一致。"""

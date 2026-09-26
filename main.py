@@ -13,6 +13,7 @@ import time
 import random
 import afk_watch
 import enemy_detect
+import utils
 import app_config
 import florr_settings
 import os
@@ -30,7 +31,7 @@ ENEMY_SCAN_INTERVAL = 0.12  # 秒, 索敌扫描节流间隔. 这是"决策新鲜
                               # 大间隔更差. 漫游时每腿路另受move_to_position的
                               # max_attempts限制(见下方wander分支).
 AVOID_TRIGGER_PX = 400      # 屏幕像素半径, AVOID怪进入此半径触发逃离
-CAUTIOUS_HOLD_PX = 250      # 屏幕像素, CAUTIOUS怪保持的最小距离(不继续贴近)
+CAUTIOUS_HOLD_PX = 500      # 屏幕像素, CAUTIOUS怪(U沙尘暴等)保持的最小距离(不继续贴近). 250 实测太近, 等于直接撞上去
 CHASE_MIN_CONF = 0.55      # 追击目标的最低置信度(幻影框过滤; 危险怪不受此限)
 MYTHIC_LATCH_ENABLED  = True   # 贴脸有 Mythic 怪 → 锁定优先清掉再继续刷 (总开关)
 MYTHIC_ENGAGE_PX      = 650    # Mythic 怪进此半径 → 锁定. 实测 --watch: 玩家眼里"贴脸"
@@ -654,6 +655,7 @@ def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, p
             cautious_hold_px=CAUTIOUS_HOLD_PX,
             center=enemy_detect.current_center(),
             chase_min_conf=CHASE_MIN_CONF,
+            target_policy=enemy_detect.target_policy_for(utils.MAP),
         )
     except Exception as e:
         print(f"⚠️ 索敌出错, 本轮当漫游处理: {e}")

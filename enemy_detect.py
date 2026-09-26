@@ -21,6 +21,13 @@ SPECIES_RANK = {
     "scorpion": 2,
     "sand_centipede": 1,
     "soldier_fire_ant": 1,
+    # 蚁穴: 走"最近优先"(TARGET_POLICY), 不看这张表 —— 放这儿只为满足
+    # MAP_SPECIES ⊆ SPECIES_RANK 这条不变量(priority_score 不会 KeyError)。
+    "baby_ant": 1,
+    "worker_ant": 1,
+    "soldier_ant": 1,
+    "worm": 1,
+    "queen_ant": 1,
 }
 
 _AVOID_PAIRS = {("scorpion", "Ultra"), ("beetle", "Ultra")}
@@ -310,8 +317,24 @@ CHASE_MIN_CONF = 0.55  # 只有置信度到这个数的检测框才够格当"追
                         # 一个可能不存在的强怪多绕一下, 不能漏躲。
 
 
+# 蚁穴"最近优先"模式下, 目标进到这个屏幕像素半径内就原地不动(鼠标回中心)打它。
+# 停住的 tick 不会往卡住检测里记样本, 所以不会在怪堆里被误判"卡住"。未标定: 太小 =
+# 一直贴着目标挪, 太大 = 够不着; 先取小值, 实机按花瓣够得着的距离调。
+ANTHELL_ENGAGE_HOLD_PX = 120
+
+# 每张图的选目标策略: "priority" = 按稀有度/物种优先级挑, 只追 Mythic+ (沙漠);
+# "nearest" = 谁离玩家最近追谁, 不看稀有度 (蚁穴: 一帧 25+ 只神话兵蚁, 按稀有度
+# 挑会每 tick 都在追, 跟沙漠那个"密集刷怪区死循环"是同一个坑)。
+TARGET_POLICY = {"anthell": "nearest"}
+
+
+def target_policy_for(map_name):
+    return TARGET_POLICY.get(map_name, "priority")
+
+
 def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
-                  center=SCREEN_CENTER, chase_min_conf=CHASE_MIN_CONF):
+                  center=SCREEN_CENTER, chase_min_conf=CHASE_MIN_CONF,
+                  target_policy="priority", engage_hold_px=ANTHELL_ENGAGE_HOLD_PX):
     """每tick的索敌决策入口. detections是scan_enemies()给的检测列表(或测试里
     手搭的同结构字典列表). 返回三选一:
       ("flee", avoid_positions)             —— 触发半径内有AVOID怪, 优先规避
@@ -321,6 +344,9 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
                                                的CAUTIOUS), 传给aim_mouse_target当
                                                排斥源
       ("wander", None)                      —— 没有到Mythic档的目标, 交回随机漫游
+    target_policy="nearest"(蚁穴): 候选池里离center最近的直接当目标, 不看稀有度、
+    不设Mythic门槛, 返回的hold_px是engage_hold_px(CAUTIOUS怪仍用cautious_hold_px)。
+    flee优先、AVOID不进候选池这两条两种模式都一样。
     AVOID怪永远进不了"chase"候选池, 哪怕它稀有度算下来优先级最高。追击目标还要
     过chase_min_conf置信度关; 没过关的ENGAGE直接丢, 没过关的AVOID/CAUTIOUS仍算
     危险源(进flee判定/repel), 只是不当追击目标。
@@ -354,6 +380,18 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
         if in_range:
             return ("flee", in_range)
 
+    if candidates and target_policy == "nearest":
+        # 最近优先: 不看稀有度, 不设 Mythic 门槛 —— AVOID 怪早在上面被挡在候选池外。
+        cx, cy = center
+        best, best_bucket = min(
+            candidates,
+            key=lambda pair: math.hypot(pair[0]["screen_pos"][0] - cx,
+                                        pair[0]["screen_pos"][1] - cy))
+        hold_px = cautious_hold_px if best_bucket == "CAUTIOUS" else engage_hold_px
+        repel = list(avoid_positions)
+        repel += [d["screen_pos"] for d in cautious_dets if d is not best]
+        return ("chase", best, hold_px, repel)
+
     if candidates:
         best, best_bucket = max(
             candidates,
@@ -374,15 +412,16 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
 
 # 每张图上认得的怪物 slug。值必须全部落在 SPECIES_RANK 里, 否则 priority_score()
 # 会 KeyError。空集合 = 这张图还没做索敌 —— _species_from_name() 一律返回 None
-# 且**不刷"未识别"日志**(蚁穴每帧几十只蚂蚁, 刷了会把日志淹掉), main 那边也会
+# 且**不刷"未识别"日志**(花园/海洋每帧几十只怪, 刷了会把日志淹掉), main 那边也会
 # 把 enemy_ai_enabled 强制关掉(见 species_supported)。
 #
-# 以后做蚁穴索敌: 往 "anthell" 这个集合里填蚂蚁类 slug, 再给它们补 SPECIES_RANK
-# 和 _SPECIES_ALIASES(中文客户端)条目 —— 不用再动这里的结构。
+# 给一张新图做索敌: 往它的集合里填 slug, 再补 SPECIES_RANK、_SPECIES_ALIASES(中文
+# 客户端)条目, 需要"最近优先"的话再加进 TARGET_POLICY —— 不用再动这里的结构。
 MAP_SPECIES = {
     "desert": frozenset({"scorpion", "beetle", "cactus", "sandstorm",
                          "sand_centipede", "soldier_fire_ant"}),
-    "anthell": frozenset(),
+    # 蚁穴 (2026-09-27 实机抓帧): 幼蚁/工蚁/兵蚁/蠕虫; queen_ant 是没抓到过的假设。
+    "anthell": frozenset({"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant"}),
     "garden": frozenset(),
     "ocean": frozenset(),
 }
@@ -404,6 +443,12 @@ _SPECIES_ALIASES = {
     "蜈蚣": "sand_centipede",
     "火兵蚁": "soldier_fire_ant",
     "火蚁": "soldier_fire_ant",       # 工蚁; 本项目不分工/兵, 都归 soldier_fire_ant
+    # 蚁穴。"兵蚁"跟沙漠的"火兵蚁"是两种怪, 各归各图(别名折出来的 slug 必须属于当前图)。
+    "幼蚁": "baby_ant",
+    "工蚁": "worker_ant",
+    "兵蚁": "soldier_ant",
+    "蠕虫": "worm",
+    "蚁后": "queen_ant",             # 未验证: 没抓到过蚁后, 名字是按中文客户端译名猜的
     "瓢虫": "sandstorm",             # Ladybug: 沙漠里极罕见的乱入怪, 高价值 —— 借
                                      # SPECIES_RANK 最高档(sandstorm=5), 同稀有度时优先
                                      # 被挑; 不危险, 走普通追击(sandstorm 非 kite 物种)

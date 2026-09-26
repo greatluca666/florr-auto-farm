@@ -74,6 +74,18 @@ RARITY_TEXT_COLORS = frozenset({
 })
 
 
+# 玩家生成的召唤物(2026-09-25 实机确认): 名牌是 [名字, "召唤", 稀有度词] 三行, 多出来的
+# "召唤" 用的是金色 #FFE763。它们是别的玩家放出来的, 不是野怪 —— 从不主动打人, 追它们纯属
+# 白费时间(实测一帧里围着玩家有 30 多只"神话/究极沙尘暴"召唤物, 全是这种)。
+# 目前只认中文客户端的写法; 英文客户端这个词长什么样没在实机上见过。
+SUMMON_LABELS = frozenset({"召唤"})
+
+
+def _is_summon_block(texts):
+    """名牌块里有"召唤"这一行 = 玩家生成的召唤物, 不是野怪."""
+    return any(str(t) in SUMMON_LABELS for t in texts)
+
+
 def _is_player_block(texts):
     """这个名牌块属于玩家(而不是怪)吗 —— 块里**任意一条**文本是 "37级" 就算。
 
@@ -521,12 +533,15 @@ def mobs_from_frame(records, camera, label_radius=100.0):
     text is only claimed within `label_radius` of the bar anchor, so a banner drawn straight
     after a nameplate is not mistaken for that mob's name, and a bar with no nameplate reports
     no name. The block at the player's own anchor is excluded — see `player_from_frame`.
+    Blocks carrying a "召唤" line are player-summoned minions, not wild mobs, and are dropped.
     """
     mobs = []
     for block in _bar_blocks(records, label_radius):
         if _is_player_anchor(block["anchor"], camera):
             continue
         if _is_player_block(block["texts"]):
+            continue
+        if _is_summon_block(block["texts"]):
             continue
         ax, ay = block["anchor"]
         wx, wy = screen_to_world(ax, ay, camera)

@@ -610,9 +610,9 @@ def test_every_mapped_species_has_a_rank():
             assert slug in _ed.SPECIES_RANK, f"{map_name}: {slug} 没有 SPECIES_RANK"
 
 
-def test_species_supported_only_desert_for_now():
+def test_species_supported_desert_and_anthell_only():
     assert _ed.species_supported("desert") is True
-    assert _ed.species_supported("anthell") is False
+    assert _ed.species_supported("anthell") is True
     assert _ed.species_supported("garden") is False
     assert _ed.species_supported("ocean") is False
     assert _ed.species_supported("nope") is False
@@ -626,17 +626,17 @@ def test_species_from_name_still_works_on_desert():
 
 
 def test_species_from_name_returns_none_on_unsupported_map():
-    # 蚁穴还没做索敌: 蚂蚁类怪一律不认.
-    assert _ed._species_from_name("Scorpion", map_name="anthell") is None
-    assert _ed._species_from_name("Worker Ant", map_name="anthell") is None
+    # 花园还没做索敌: 蚂蚁类怪一律不认.
+    assert _ed._species_from_name("Scorpion", map_name="garden") is None
+    assert _ed._species_from_name("Worker Ant", map_name="garden") is None
 
 
 def test_species_from_name_is_silent_on_unsupported_map(capsys):
-    # 关键: 空表图上绝不能走"未识别怪物名"那条日志 —— 蚁穴每帧几十只蚂蚁,
+    # 关键: 空表图上绝不能走"未识别怪物名"那条日志 —— 花园每帧几十只怪,
     # 会把日志刷爆.
     _ed._seen_unknown_names.clear()
     for _ in range(3):
-        _ed._species_from_name("Worker Ant", map_name="anthell")
+        _ed._species_from_name("Worker Ant", map_name="garden")
     assert capsys.readouterr().out == ""
     assert _ed._seen_unknown_names == set()
 
@@ -644,20 +644,20 @@ def test_species_from_name_is_silent_on_unsupported_map(capsys):
 def test_species_from_name_defaults_to_utils_MAP(monkeypatch):
     monkeypatch.setattr(_ed.utils, "MAP", "desert")
     assert _ed._species_from_name("Cactus") == "cactus"
-    monkeypatch.setattr(_ed.utils, "MAP", "anthell")
+    monkeypatch.setattr(_ed.utils, "MAP", "garden")
     assert _ed._species_from_name("Cactus") is None
 
 
 def test_alias_not_in_this_maps_species_is_rejected(monkeypatch):
     # 别名表是全局共用的, 但折出来的 slug 必须属于当前图, 否则等于把沙漠怪
-    # 混进别的图. 蚁穴目前是空集合, `if not known` 那层 guard 会先一步拦下,
+    # 混进别的图. 花园是空集合, `if not known` 那层 guard 会先一步拦下,
     # 根本轮不到别名判断那行(`_SPECIES_ALIASES[slug] in known`)—— 这行
     # 才是"折出来的 slug 必须属于当前图"真正的守门人. 所以额外借用
-    # "anthell" 造一张非空、但不含 cactus 的物种表, 才能真正跑到那行去测.
-    assert _ed._species_from_name("仙人掌", map_name="anthell") is None   # 空表: guard 先拦下
+    # "garden" 造一张非空、但不含 cactus 的物种表, 才能真正跑到那行去测.
+    assert _ed._species_from_name("仙人掌", map_name="garden") is None   # 空表: guard 先拦下
 
-    monkeypatch.setitem(_ed.MAP_SPECIES, "anthell", frozenset({"scorpion"}))
-    assert _ed._species_from_name("仙人掌", map_name="anthell") is None   # 非空但没 cactus: 别名判断本身拦下
+    monkeypatch.setitem(_ed.MAP_SPECIES, "garden", frozenset({"scorpion"}))
+    assert _ed._species_from_name("仙人掌", map_name="garden") is None   # 非空但没 cactus: 别名判断本身拦下
 
     # 同一个别名在沙漠(cactus 就在沙漠的物种表里)必须照常命中 —— 不然就是
     # 把别名解析本身也测坏了.
@@ -764,3 +764,108 @@ def test_current_center_is_reset_when_a_scan_fails(monkeypatch):
     enemy_detect._frame_buffer[:] = []
     assert enemy_detect.scan_enemies() == []
     assert enemy_detect.current_center() == enemy_detect.SCREEN_CENTER
+
+
+# ── 蚁穴 (2026-09-27 实机抓帧) ───────────────────────────────────────────────
+
+def test_anthell_species_table_and_aliases():
+    assert _ed.MAP_SPECIES["anthell"] == frozenset(
+        {"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant"})
+    for name, slug in (("幼蚁", "baby_ant"), ("工蚁", "worker_ant"),
+                       ("兵蚁", "soldier_ant"), ("蠕虫", "worm"), ("蚁后", "queen_ant")):
+        assert _ed._species_from_name(name, map_name="anthell") == slug
+
+
+def test_anthell_ant_names_do_not_leak_into_desert():
+    # 蚁穴的兵蚁不是沙漠的火兵蚁 —— 沙漠那张表里没有它们, 不能被认成沙漠怪.
+    assert _ed._species_from_name("兵蚁", map_name="desert") is None
+    assert _ed._species_from_name("火兵蚁", map_name="anthell") is None
+
+
+def test_anthell_ultra_and_above_are_avoid():
+    for species in ("baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant"):
+        for rarity in ("Ultra", "Super", "Eternal", "Unique"):
+            assert classify_action(species, rarity) == "AVOID"
+        for rarity in _BELOW_ULTRA:
+            assert classify_action(species, rarity) == "ENGAGE"
+
+
+def test_target_policy_for_map():
+    assert _ed.target_policy_for("anthell") == "nearest"
+    assert _ed.target_policy_for("desert") == "priority"
+    assert _ed.target_policy_for("garden") == "priority"
+    assert _ed.target_policy_for("") == "priority"
+    assert _ed.target_policy_for(None) == "priority"
+
+
+def _nearest(detections, **kw):
+    kw.setdefault("center", (960, 540))
+    return select_action(detections, target_policy="nearest", **kw)
+
+
+def test_nearest_policy_picks_closest_regardless_of_rarity():
+    # 神话兵蚁 300px, 传奇幼蚁 100px, 普通工蚁 200px —— 最近的传奇幼蚁先打.
+    detections = [
+        _det("soldier_ant", "Mythic", (1260, 540)),
+        _det("baby_ant", "Legendary", (1060, 540)),
+        _det("worker_ant", "Common", (760, 540)),
+    ]
+    action, target, hold_px, repel = _nearest(detections)
+    assert action == "chase"
+    assert target["species"] == "baby_ant"
+    assert repel == []
+
+
+def test_nearest_policy_chases_even_common_mobs():
+    # 优先级模式下 Common 交回 wander; 最近优先模式下有怪就追.
+    action, target, _, _ = _nearest([_det("worker_ant", "Common", (1200, 540))])
+    assert action == "chase" and target["species"] == "worker_ant"
+
+
+def test_nearest_policy_holds_when_target_is_close():
+    action, target, hold_px, _ = _nearest([_det("soldier_ant", "Mythic", (1000, 540))])
+    assert action == "chase"
+    assert hold_px == _ed.ANTHELL_ENGAGE_HOLD_PX
+
+
+def test_nearest_policy_ultra_ant_is_never_the_target():
+    # 究极兵蚁最近(50px), 神话工蚁 500px 外 —— 究极的不能当目标, 而且进了 400px 要先躲.
+    detections = [
+        _det("soldier_ant", "Ultra", (1010, 540)),
+        _det("worker_ant", "Mythic", (1460, 540)),
+    ]
+    action, avoid_positions = _nearest(detections, avoid_trigger_px=400)
+    assert action == "flee"
+    assert avoid_positions == [(1010, 540)]
+
+
+def test_nearest_policy_far_ultra_ant_is_repelled_not_targeted():
+    detections = [
+        _det("soldier_ant", "Ultra", (1660, 540)),      # 700px, 不触发 flee
+        _det("worker_ant", "Mythic", (1160, 540)),
+    ]
+    action, target, _, repel = _nearest(detections, avoid_trigger_px=400)
+    assert action == "chase"
+    assert target["species"] == "worker_ant"
+    assert (1660, 540) in repel
+
+
+def test_nearest_policy_wanders_with_nothing_to_chase():
+    action, payload = _nearest([])
+    assert action == "wander" and payload is None
+    action, payload = _nearest([_det("soldier_ant", "Ultra", (1900, 540))],
+                               avoid_trigger_px=400)
+    assert action == "wander" and payload is None
+
+
+def test_nearest_policy_ignores_low_confidence_targets():
+    action, payload = _nearest([_det("worker_ant", "Mythic", (1000, 540), conf=0.2)],
+                               chase_min_conf=0.55)
+    assert action == "wander" and payload is None
+
+
+def test_priority_policy_is_still_the_default():
+    # 沙漠行为不能变: 默认参数下 Common 交回 wander.
+    action, payload = select_action([_det("sandstorm", "Common", (1000, 540))],
+                                    center=(960, 540))
+    assert action == "wander" and payload is None
