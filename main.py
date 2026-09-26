@@ -452,9 +452,11 @@ def move_to_position(current_pos, target_pos, max_attempts=200, stall_limit=13,
     return "stuck"
 
 
-def execute_path(path, binary_map=None):
+def execute_path(path, stop_when=None, binary_map=None):
     """执行路径。
 
+    stop_when: 每走一段之前问一下"够了没", 回 True 就不走剩下的了(返回 True)。
+    寻路回刷怪区用它: 进了区就停, 不用非得走到路径终点(用户 2026-09-25)。
     binary_map: 规划用的可走图. 给了才会等看得到下一跳再转向(_can_turn_to_next)、
         看不到目标时顺着可走格子绕过去(_steer_point); 窄密道全靠这两条.
     """
@@ -464,6 +466,9 @@ def execute_path(path, binary_map=None):
     print(f"🗺️  执行路径，共 {len(path)} 个节点...")
     
     for i in range(len(path) - 1):
+        if i > 0 and stop_when is not None and stop_when():
+            print("   ✅ 已进入目标区域, 剩下的路不走了")
+            return True
         current = path[i]
         next_point = path[i + 1]
         
@@ -540,6 +545,12 @@ def lazy_theta_pathing(location, area=[], deadline=None):
             continue
 
         retry_count = 0
+        if area and if_in_area(area, pos):
+            # 已经在目标区域里 —— 不用非得走到 location 那个点(用户 2026-09-25: 实机
+            # 每轮开局人本来就在刷怪区里, 却照样往配置点走, 走到了还判卡住)。
+            print(f"✅ 已在目标区域内, 位置: {pos}\n")
+            overlay.update(state="完成", pos=pos, message="已在目标区域内")
+            return True
         print(f"\n📍 寻路: {pos} -> {location}")
         overlay.update(state="寻路中", pos=pos, target=location, message="规划路径...")
         time_now = time.time()
@@ -560,7 +571,11 @@ def lazy_theta_pathing(location, area=[], deadline=None):
 
         print(f"✅ 找到路径，共 {len(path)} 个点")
         overlay.update(message=f"找到路径, 共{len(path)}个点")
-        stat = execute_path(path, binary_map=binary_map)
+        def _inside():
+            here = get_player_position()
+            return bool(area) and here is not None and if_in_area(area, here)
+
+        stat = execute_path(path, stop_when=_inside, binary_map=binary_map)
 
         # 检查是否到达目标区域
         current_pos = get_player_position()
@@ -708,6 +723,38 @@ def _drive_and_check_stall(mouse_target, current_pos, chase_pos_history, state, 
     return "moved"
 
 
+def _nearest_inside(farming_area, pos, binary_map, inset=ARRIVE_RADIUS + 3):
+    """把一个区域外的位置夹回区域里, 取**离它最近**的那个可走点。
+
+    实机(2026-09-24): 花朵飘到 (20, 62) —— 区域下边界(y=61)外**一格** —— 就被寻路
+    拽回区域中心 (29, 32), 30 格的路走 20 秒, 一局里来回三次。回到最近的边内点只要
+    走一两格。
+
+    **inset 不能小于 ARRIVE_RADIUS**, 这是这个函数唯一不能凭直觉调的参数:
+      - 比它小 -> 目标点落进 move_to_position 的到达半径里, 一个 moveTo 都不发就
+        "到了"。人还在区外, 上层于是重新规划、再"到达"一次 …… 实机第一版 inset=2
+        就是这样空转了 90 次/118 秒(2026-09-24)。
+      - 等于它 -> 会动, 但 move_to_position 在离目标 ARRIVE_RADIUS 处收手, 收手点
+        恰好落回边界上, 下一次飘动立刻又出区。多给 3 格当迟滞。
+
+    区域窄到放不下 inset 时按轴退化成取中线(而不是夹出一个区外的点)。夹出来的点
+    落在墙上(区域不一定是实心矩形)就回 None, 调用方退回配置的目标点。
+    """
+    (ax, ay), (bx, by) = farming_area
+    x1, x2 = min(ax, bx), max(ax, bx)
+    y1, y2 = min(ay, by), max(ay, by)
+    ix = min(inset, (x2 - x1) // 2)
+    iy = min(inset, (y2 - y1) // 2)
+    x = int(min(max(pos[0], x1 + ix), x2 - ix))
+    y = int(min(max(pos[1], y1 + iy), y2 - iy))
+    if binary_map is None:
+        return (x, y)
+    if 0 <= y < binary_map.shape[0] and 0 <= x < binary_map.shape[1] \
+            and binary_map[y][x] == 255:
+        return (x, y)
+    return None
+
+
 def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
                  ):
     """自动刷怪逻辑（依赖一直攻击按钮）—— 在区域内连续走动, 不停下站桩.
@@ -789,9 +836,12 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
         if not if_in_area([farming_area], current_pos):
             print(f"⚠️ 离开刷怪区域 (当前: {current_pos})，重新寻路回去")
             overlay.update(state="离开刷怪区域", pos=current_pos, message="重新寻路回去")
-            target_x = (farming_area[0][0] + farming_area[1][0]) // 2
-            target_y = (farming_area[0][1] + farming_area[1][1]) // 2
-            if not lazy_theta_pathing((target_x, target_y), [farming_area]):
+            # 回**最近的边内点**, 不是区域中心 —— 飘出一格也要横穿半张区域(用户
+            # 2026-09-25)。落在墙上时退回中心。
+            target = _nearest_inside(farming_area, current_pos, binary_map) or (
+                (farming_area[0][0] + farming_area[1][0]) // 2,
+                (farming_area[0][1] + farming_area[1][1]) // 2)
+            if not lazy_theta_pathing(target, [farming_area]):
                 print("❌ 无法回到刷怪区域")
                 overlay.update(state="出错", message="无法回到刷怪区域")
                 exit_reason = "break"

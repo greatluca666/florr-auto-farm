@@ -208,3 +208,43 @@ def test_self_is_still_found_while_the_body_flashes(name):
 ])
 def test_what_counts_as_our_body_color(color, ok):
     assert cd._is_self_body_color(color) is ok
+
+
+# ── 状态染色: 头像和花身跟着中毒/受伤等状态变色 ──────────────────────────────
+#
+# 实机(2026-09-25)存下的 41 帧 no_hp: 左上角头像卡其实都在, 血条也在, 但
+# 头像是 #CE76DA(紫, 中毒)、#F9D970、#E2658C、#FFE2B5 …… 几十种色 —— 按颜色认头像,
+# 整张卡被跳过; 世界里的花身同色, 相机也找不到自己, 脚下血条那条备用路也跟着断。
+# 颜色靠不住, 靠几何: 头像 = 血条左边同一行、同缩放的"描边圈 + 身体圈"(半径比 1.128)。
+# 然后头像的颜色就是这一帧花身的颜色, 拿它去世界里找自己。
+
+TINTED = ["self_tint_poison.json", "self_tint_dimgold.json", "self_tint_red.json",
+          "self_tint_pale.json"]
+
+
+@pytest.mark.parametrize("name", TINTED)
+def test_the_camera_finds_our_tinted_body(name):
+    cam = cd.camera_from_frame(load(name), best_effort=True)
+    assert not cam["approx"]
+    assert math.hypot(cam["player_screen"][0] - 960, cam["player_screen"][1] - 540) < 5
+
+
+@pytest.mark.parametrize("name", TINTED)
+def test_the_hud_avatar_colour_is_reported(name):
+    raw = load(name)
+    body = [r for r in raw if r["op"] == "fill" and r.get("m") and abs((r.get("r") or 0) - 29.375) < 0.01
+            and abs(r["m"][4] - 60) < 1]
+    assert cd.hud_self_colour(raw) == body[0]["fill"]
+
+
+# 花身会整体旋转(矩阵带旋转分量, 缩放不变; 头像卡上的头像跟着一起转)。原来"不许旋转"
+# 是为了挡掉转着画的怪, 顺手把转着的自己也挡了。另一种: 怪全挤在屏幕一边, 宽松模式的
+# "离怪群中位数太远 = 别人的花身"判据把自己扔了(严格模式明明找到了)。
+# 跟头像**同色**是独立佐证 —— 这两道闸对它放行。
+
+@pytest.mark.parametrize("name", ["self_rotated_tinted.json", "self_rotated_gold.json",
+                                  "self_off_cluster.json"])
+def test_the_camera_trusts_a_body_that_matches_the_hud_avatar(name):
+    cam = cd.camera_from_frame(load(name), best_effort=True)
+    assert not cam["approx"]
+    assert math.hypot(cam["player_screen"][0] - 960, cam["player_screen"][1] - 540) < 5

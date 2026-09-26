@@ -601,6 +601,30 @@ def test_lazy_theta_pathing_stops_replanning_when_nothing_moves(monkeypatch, cap
     assert "没挪窝" in capsys.readouterr().out
 
 
+def _pathing_env(monkeypatch):
+    import numpy as np
+
+    monkeypatch.setattr(main, "overlay", _StubOverlay(), raising=False)
+    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "load_binary_map",
+                        lambda: np.full((120, 120), 255, dtype=np.uint8))
+
+
+AREA = [(2, 5), (44, 73)]
+
+
+def test_lazy_theta_pathing_does_nothing_when_already_inside(monkeypatch):
+    """用户(2026-09-25): 不用每次都走到一个特定的点。实机每一轮开局人本来就在刷怪区
+    里, 却照样往配置的 (13,68) 走, 走到那儿还"原地打转14次, 判定卡住"。"""
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    monkeypatch.setattr(main, "lazy_theta_star",
+                        lambda *a: pytest.fail("已经在区域里了还去规划路径"))
+    assert main.lazy_theta_pathing((13, 68), [AREA]) is True
+
+
 def test_path_walk_hands_each_hop_the_next_one_and_the_planning_map(monkeypatch):
     hops = []
     monkeypatch.setattr(main, "move_to_position",
@@ -609,12 +633,7 @@ def test_path_walk_hands_each_hop_the_next_one_and_the_planning_map(monkeypatch)
     assert main.execute_path([(0, 0), (1, 1), (2, 2), (3, 3)], binary_map=marker) is True
     assert hops == [((1, 1), (2, 2), marker), ((2, 2), (3, 3), marker), ((3, 3), None, marker)]
 
-    monkeypatch.setattr(main, "overlay", _StubOverlay(), raising=False)
-    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
-    monkeypatch.setattr(main, "on_death_screen", lambda: False)
-    monkeypatch.setattr(main, "on_start_screen", lambda: False)
-    monkeypatch.setattr(main, "load_binary_map",
-                        lambda: np.full((120, 120), 255, dtype=np.uint8))
+    _pathing_env(monkeypatch)
     pos = {"p": (20, 80)}
     maps = []
 
@@ -626,8 +645,63 @@ def test_path_walk_hands_each_hop_the_next_one_and_the_planning_map(monkeypatch)
     monkeypatch.setattr(main, "execute_path", execute)
     monkeypatch.setattr(main, "get_player_position", lambda: pos["p"])
     monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
-    assert main.lazy_theta_pathing((13, 40), [[(2, 5), (44, 73)]]) is True
+    assert main.lazy_theta_pathing((13, 40), [AREA]) is True
     assert len(maps) == 1 and maps[0].shape == (120, 120)
+
+
+def test_execute_path_stops_as_soon_as_the_goal_is_reached():
+    moves = []
+    orig = main.move_to_position
+    main.move_to_position = lambda a, b, **kw: moves.append(b) or "arrived"
+    try:
+        # 第一段之前不问(lazy_theta_pathing 规划前已经查过一次, 再截一次屏是浪费);
+        # 之后每段之前问一次 —— 走完第一段就到了。
+        assert main.execute_path([(0, 0), (1, 1), (2, 2), (3, 3)],
+                                 stop_when=lambda: True) is True
+    finally:
+        main.move_to_position = orig
+    assert moves == [(1, 1)]
+
+
+def test_walking_back_stops_the_moment_the_flower_is_inside(monkeypatch):
+    """出区之后回到**最近的**区内就行 —— 原来要把整条路走完(走到边内点/区域中心/
+    配置点), 一边走一边还在区里乱窜。"""
+    _pathing_env(monkeypatch)
+    pos = {"p": (20, 80)}
+    moves = []
+
+    def move(a, b, **kw):
+        moves.append(b)
+        pos["p"] = b
+        return "arrived"
+
+    monkeypatch.setattr(main, "move_to_position", move)
+    monkeypatch.setattr(main, "get_player_position", lambda: pos["p"])
+    monkeypatch.setattr(main, "lazy_theta_star",
+                        lambda m, a, b: [a, (20, 72), (20, 60), (13, 40)])
+    assert main.lazy_theta_pathing((13, 40), [AREA]) is True
+    assert moves == [(20, 72)]
+
+
+def test_rules_farming_walks_back_to_the_nearest_edge_not_the_centre(monkeypatch):
+    """规则刷怪出区原来一律回区域中心 —— 飘出一格也要横穿半张区域。"""
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 80))
+    targets = []
+
+    class Done(Exception):
+        pass
+
+    def pathing(target, areas, **kw):
+        targets.append(target)
+        raise Done
+
+    monkeypatch.setattr(main, "lazy_theta_pathing", pathing)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=False)
+    (x, y), = targets
+    assert x == 20 and 60 <= y <= 73           # 正下方的边内点, 不是中心 (23, 39)
+
 
 
 def test_lazy_theta_pathing_does_not_cry_stuck_while_it_is_actually_walking(monkeypatch):

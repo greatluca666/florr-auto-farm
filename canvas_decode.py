@@ -288,11 +288,17 @@ def camera_from_frame(records, best_effort=False):
             break
 
     player_screen = None
+    self_confirmed = False      # 选中的花身跟左上角头像同色 —— 独立佐证, 离群判定对它放行
     if zoom is not None:
+        # 花身跟着状态变色(中毒紫等几十种), 光靠 _is_self_body_color 认不全; 头像卡上的
+        # 头像跟花身同色, 先从那里读出这一帧的颜色。
+        tint = hud_self_colour(records)
         candidates = [r for r in records
                       if (r["op"] == "fill" and r.get("r") is not None
-                          and _is_self_body_color(r.get("fill"))
-                          and not _is_minimap(r) and not _is_rotated(r)
+                          and (r.get("fill") == tint or _is_self_body_color(r.get("fill")))
+                          # 花身会整体旋转(缩放不变, 头像跟着转)。"不许旋转"本是为了挡掉
+                          # 转着画的怪 —— 跟头像同色的是自己, 放行。
+                          and not _is_minimap(r) and (r.get("fill") == tint or not _is_rotated(r))
                           and abs(_scale(r) - zoom) < 1e-6)]   # excludes the larger UI-card avatar
         if candidates:
             max_r = max(c["r"] for c in candidates)
@@ -334,8 +340,11 @@ def camera_from_frame(records, best_effort=False):
             # happen for self) can't be broken -- fail loud rather than pick by draw order.
             if len(largest) == 1:
                 player_screen = _anchor(largest[0])
+                self_confirmed = largest[0].get("fill") == tint
 
-    if best_effort and player_screen is not None:
+    if best_effort and player_screen is not None and not self_confirmed:
+        # 同色确认过的不做这道判定: 实机(2026-09-25)怪全挤在屏幕一边时, 中位数离自己
+        # 老远, 严格模式明明找到了自己, 这里反而扔掉。
         med = _median_bar_anchor(records)
         if (med is not None
                 and math.hypot(player_screen[0] - med[0],
@@ -606,3 +615,64 @@ def _split_mob_texts(texts, colors):
     return (texts[0],
             texts[1] if len(texts) > 1 else None,
             colors[1] if len(colors) > 1 else None)
+
+
+_AVATAR_RING_RATIO = (1.10, 1.16)   # 头像/花身: 描边圈半径 ÷ 身体圈半径, 实测 1.128
+
+
+def _hud_avatar(records, scale, row_y, left_of_x, row_tol=2.0):
+    """头像卡上自己的头像(身体圈那条 fill 记录); 没有返回 None。
+
+    **按几何认, 不按颜色**: 头像跟花身一起随状态变色(中毒紫 #CE76DA、#F9D970、
+    #E2658C …… 实机里几十种), 按色认会整张卡跳过。认法: 血条左边、同一行、
+    同缩放, 同一锚点上一对"描边圈 + 身体圈", 半径比 1.128。
+    """
+    by_anchor = {}
+    for a in records:
+        if (a["op"] == "fill" and a.get("r") and a.get("m") and not _is_minimap(a)
+                and abs(_scale(a) - scale) < 1e-6 and abs(a["m"][5] - row_y) <= row_tol
+                and a["m"][4] < left_of_x):
+            by_anchor.setdefault(_anchor(a), []).append(a)
+    lo, hi = _AVATAR_RING_RATIO
+    for fills in by_anchor.values():
+        fills = sorted(fills, key=lambda f: -f["r"])
+        for outer, inner in zip(fills, fills[1:]):
+            if lo <= outer["r"] / inner["r"] <= hi:
+                return inner
+    return None
+
+
+def _hud_bar(records, row_tol=2.0):
+    """头像卡上的血条: (当前血量那条描边, 头像那条 fill); 认不出返回 None。
+
+    一条 #DD3434 红色残影描边, 紧跟着同锚点的一条描边(当前血量); **前面没有 #222222
+    底色**(世界名牌血条都有底色 —— 标题页的卡片也有, 而且宽度是 0, 当真了等于"死了");
+    同一行左边画着头像(见 _hud_avatar)。
+    """
+    for i, r in enumerate(records):
+        if not (r["op"] == "stroke" and r.get("stroke") == HEALTHBAR_DAMAGE
+                and r.get("m") and not _is_minimap(r)):
+            continue
+        anchor, scale = _anchor(r), _scale(r)
+        if i > 0:
+            prev = records[i - 1]
+            if (prev["op"] == "stroke" and prev.get("stroke") == HEALTHBAR_BG
+                    and prev.get("m") and _anchor(prev) == anchor):
+                continue
+        if i + 1 >= len(records):
+            continue
+        value = records[i + 1]
+        if not (value["op"] == "stroke" and value.get("m") and _anchor(value) == anchor
+                and value.get("bbox")):
+            continue
+        avatar = _hud_avatar(records, scale, anchor[1], value["bbox"][0], row_tol)
+        if avatar is not None:
+            return value, avatar
+    return None
+
+
+def hud_self_colour(records):
+    """这一帧自己花身的颜色 —— 从左上角头像读。头像和世界里的花身同色(实机
+    60 帧逐帧对得上), 相机拿它去世界里找自己。认不出返回 None。"""
+    found = _hud_bar(records)
+    return found[1].get("fill") if found else None

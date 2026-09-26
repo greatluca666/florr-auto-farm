@@ -14,6 +14,7 @@
   3. mobs_from_frame 的结果: name / rarity / rarity_color / hp / 屏幕坐标
   4. 每个 mob 过 _species_from_name / _tier_from_color 之后变成什么
   5. scan_enemies() 最终返回的检测列表
+  6. 找自己花身的证据 (候选花身 / HUD tint / NNN级 牌 / 裸血条周围的圆) —— 相机认错自己时看
 不改游戏, 只读。
 """
 import sys
@@ -59,6 +60,70 @@ def _drain_for(seconds=3.0):
             break
         time.sleep(0.1)
     return buf
+
+
+def _dump_self_evidence(recs):
+    """相机认错自己(2026-09-27 蚁穴: 严格模式返回了另一个玩家的位置)时用的证据:
+    camera_from_frame 找自己花身时看到的候选、HUD 头像色、每个候选近旁有没有别人的
+    "NNN级" 牌, 以及没有名牌的裸血条(自己的血条)周围到底画着什么圆。"""
+    zoom = next((r["m"][0] for r in recs
+                 if r["op"] == "stroke" and r.get("stroke") == canvas_decode.HEALTHBAR_BG
+                 and not canvas_decode._is_minimap(r)), None)
+    tint = canvas_decode.hud_self_colour(recs)
+    print(f"  zoom={zoom}  HUD 头像色 tint={tint!r}")
+
+    lvl = [canvas_decode._anchor(r) for r in recs
+           if r["op"] == "text"
+           and canvas_decode.PLAYER_RARITY_PATTERN.match(str(r.get("text", "")))]
+    print(f"  屏幕上的 NNN级 牌锚点 ({len(lvl)}): "
+          f"{[(round(x), round(y)) for x, y in lvl]}")
+
+    bare = [b for b in canvas_decode._bar_blocks(recs) if not b["texts"]]
+    print(f"  无名牌文字的裸血条 ({len(bare)}): "
+          f"{[(round(b['anchor'][0]), round(b['anchor'][1]), 'shield' if b['secondary'] else '-') for b in bare]}")
+
+    if zoom is None:
+        print("  没有 zoom, 后面的候选筛选跑不了")
+        return
+    print("  候选花身 (跟 camera_from_frame 同一套筛选: 金色/同 tint 的圆, 缩放==zoom):")
+    n = 0
+    for r in recs:
+        if not (r["op"] == "fill" and r.get("r") is not None
+                and (r.get("fill") == tint or canvas_decode._is_self_body_color(r.get("fill")))
+                and not canvas_decode._is_minimap(r)
+                and (r.get("fill") == tint or not canvas_decode._is_rotated(r))
+                and abs(canvas_decode._scale(r) - zoom) < 1e-6):
+            continue
+        n += 1
+        ax, ay = canvas_decode._anchor(r)
+        near = [round(((lx - ax) ** 2 + (ly - ay) ** 2) ** 0.5)
+                for lx, ly in lvl
+                if ((lx - ax) ** 2 + (ly - ay) ** 2) ** 0.5 <= canvas_decode.SELF_DISAMBIGUATION_RADIUS]
+        print(f"    #{n}: anchor=({ax:.0f},{ay:.0f}) r={r['r']:.1f} fill={r.get('fill')!r} "
+              f"同tint={r.get('fill') == tint}  近旁NNN级牌距离={near or '无'}")
+    if n == 0:
+        print("    (一个都没有)")
+
+    # 自己的裸血条在画布中心附近 (窗口化 y=472.5, 全屏 y=540), 优先看离中心最近的几条。
+    def _center_dist(b):
+        return min(((b["anchor"][0] - 960) ** 2 + (b["anchor"][1] - cy) ** 2) ** 0.5
+                   for cy in (472.5, 540.0))
+    for b in sorted(bare, key=_center_dist)[:3]:
+        bx, by = b["anchor"]
+        print(f"  裸血条 ({bx:.0f},{by:.0f}) 60px 内的圆形填充:")
+        seen = 0
+        for r in recs:
+            if r["op"] != "fill" or r.get("r") is None or canvas_decode._is_minimap(r):
+                continue
+            ax, ay = canvas_decode._anchor(r)
+            if ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5 > 60:
+                continue
+            seen += 1
+            if seen > 12:
+                print("      ...")
+                break
+            print(f"      fill={r.get('fill')!r:10} r={r['r']:.1f} scale={canvas_decode._scale(r):.4f} "
+                  f"rotated={canvas_decode._is_rotated(r)}  anchor=({ax:.0f},{ay:.0f})")
 
 
 def main():
@@ -142,6 +207,9 @@ def main():
                                                   "反转攻击控制", "使用键盘移动")]
         if "player_screen" in str(e) and menu_hits:
             print("  ★ 画面里有设置菜单文本", menu_hits, "—— 设置面板打开时 florr 不画花本体。关掉再跑。")
+
+    print("\n=== 找自己花身的证据 ===")
+    _dump_self_evidence(recs)
 
     # scan_enemies 走的是 best_effort —— 严格解不出也能兜底. 用这个跑后面的映射.
     try:
