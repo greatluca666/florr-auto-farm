@@ -376,6 +376,112 @@ def test_move_to_position_prints_when_progress_stalls(monkeypatch, capsys):
     assert "移动中丢失玩家位置" not in out   # 两条路径互斥, 日志不该把它们混在一起
 
 
+# ── 走路径: 窄道/拐角里别提前转向、别顶着墙推 ─────────────────────────────
+# 蚁穴密道 2 像素宽带弯, 路点间隔 1~5 格。老判据"离路点 <5 就算到"在弯道里还没拐
+# 过去就直奔下一跳, 顶着墙原地打转判卡住 —— 出生点到刷怪区必经两条密道, 次次卡.
+
+def _l_corridor():
+    m = np.zeros((20, 20), np.uint8)
+    m[5, 2:11] = 255        # 横: (2..10, 5)
+    m[5:16, 10] = 255       # 竖: (10, 5..15)
+    return m
+
+
+def test_waypoint_is_not_left_while_the_next_hop_is_round_the_corner(monkeypatch):
+    m = _l_corridor()
+    _stub_move_env(monkeypatch, pos=(7, 5))
+    # 不给地图 = 老判据: 离拐角 (10,5) 3 格就算到
+    assert main.move_to_position((7, 5), (10, 5), max_attempts=5) is True
+    # 从 (7,5) 看不到拐角那头的 (10,15): 继续往拐角走
+    assert main.move_to_position((7, 5), (10, 5), max_attempts=5,
+                                 next_pos=(10, 15), binary_map=m) == "stuck"
+    # 下一跳看得到: 照常提前转向
+    assert main.move_to_position((7, 5), (10, 5), max_attempts=5,
+                                 next_pos=(2, 5), binary_map=m) is True
+    # 差 1 格就到拐角(读数抖动), 从这格直线看不到 (10,15) 也算到
+    _stub_move_env(monkeypatch, pos=(9, 5))
+    assert main.move_to_position((9, 5), (10, 5), max_attempts=5,
+                                 next_pos=(10, 15), binary_map=m) is True
+
+
+def test_overshooting_a_corner_is_not_arriving_while_the_next_hop_is_hidden(monkeypatch):
+    m = _l_corridor()
+    _stub_move_env(monkeypatch)
+
+    def walk(**kw):
+        seq = iter([(4, 5), (2, 5), (2, 5)])
+        monkeypatch.setattr(main, "get_player_position", lambda *a, **k: next(seq))
+        return main.move_to_position((4, 5), (10, 5), max_attempts=3, **kw)
+
+    assert walk() is True               # 老判据: 6 -> 8 离远了 = 冲过头算到
+    assert walk(next_pos=(10, 15), binary_map=m) == "stuck"
+
+
+def test_unseen_target_is_approached_along_the_corridor_not_through_the_wall(monkeypatch):
+    m = _l_corridor()
+    assert main._steer_point(m, (4, 5), (10, 5)) == (10, 5)
+    assert main._steer_point(m, (4, 5), (10, 12)) == (9, 5)
+    assert main._steer_point(None, (4, 5), (10, 12)) == (10, 12)
+
+    _stub_move_env(monkeypatch, pos=(4, 5))
+    mouse = []
+    monkeypatch.setattr(main, "_move_mouse_safely", mouse.append)
+    main.move_to_position((4, 5), (10, 12), max_attempts=1, binary_map=m)
+    x, y = mouse[0]
+    assert x > main.SCREEN_WIDTH // 2 and abs(y - main.SCREEN_HEIGHT // 2) <= 1
+
+
+class _SlidingFlower:
+    """离线物理: 朝鼠标方向走(鼠标离中心越远越快, 封顶 vmax 格/跳), 撞墙沿轴滑."""
+
+    def __init__(self, walk, start, vmax):
+        self.walk, self.p, self.vmax, self.mouse = walk, [float(start[0]), float(start[1])], vmax, None
+
+    def _wall(self, x, y):
+        xi, yi = int(round(x)), int(round(y))
+        h, w = self.walk.shape
+        return not (0 <= xi < w and 0 <= yi < h) or self.walk[yi, xi] == 0
+
+    def position(self, *a, **k):
+        if self.mouse is not None:
+            ox = self.mouse[0] - main.SCREEN_WIDTH // 2
+            oy = self.mouse[1] - main.SCREEN_HEIGHT // 2
+            d = (ox * ox + oy * oy) ** 0.5
+            if d >= 1:
+                speed = self.vmax * min(d / (250 * main.mouse_scale()), 1.0)
+                n = max(1, int(speed / 0.2) + 1)
+                vx, vy = speed * ox / d / n, speed * oy / d / n
+                for _ in range(n):
+                    x, y = self.p
+                    for tx, ty in ((x + vx, y + vy), (x + vx, y), (x, y + vy)):
+                        if not self._wall(tx, ty):
+                            self.p = [tx, ty]
+                            break
+        return (int(round(self.p[0])), int(round(self.p[1])))
+
+
+@pytest.mark.parametrize("start, goal, vmax", [
+    ((117, 102), (23, 89), 3.0),    # 实机出生点 -> 刷怪区, 连穿两条密道
+    ((72, 91), (109, 110), 2.0),    # 反着穿回来
+])
+def test_anthell_routes_through_the_shortcut_tunnels_get_walked(monkeypatch, start, goal, vmax):
+    import cv2
+    walk = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    _stub_move_env(monkeypatch)
+    path = main.lazy_theta_star(walk, start, goal)
+    assert path is not None
+
+    def walk_it(binary_map):
+        flower = _SlidingFlower(walk, start, vmax)
+        monkeypatch.setattr(main, "get_player_position", flower.position)
+        monkeypatch.setattr(main, "_move_mouse_safely", lambda p: setattr(flower, "mouse", p))
+        monkeypatch.setattr(main, "reset_keyboard", lambda: setattr(flower, "mouse", None))
+        return main.execute_path(path, binary_map=binary_map)
+
+    assert walk_it(None) == "stuck"      # 老判据: 卡在密道里
+    assert walk_it(walk) is True
+
+
 # ── _move_mouse_safely: pyautogui FailSafe 恢复(2026-09-20实机复盘) ─────────
 
 def test_move_mouse_safely_passes_through_on_the_normal_path(monkeypatch):
@@ -475,7 +581,7 @@ def test_lazy_theta_pathing_stops_replanning_when_nothing_moves(monkeypatch, cap
     monkeypatch.setattr(main, "load_binary_map",
                         lambda: np.full((70, 60), 255, dtype=np.uint8))
     monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
-    monkeypatch.setattr(main, "execute_path", lambda path: True)  # "跑完了", 但人没动
+    monkeypatch.setattr(main, "execute_path", lambda path, **kw: True)  # "跑完了", 但人没动
 
     seen = {"pos": 0, "unstick": 0}
 
@@ -495,6 +601,35 @@ def test_lazy_theta_pathing_stops_replanning_when_nothing_moves(monkeypatch, cap
     assert "没挪窝" in capsys.readouterr().out
 
 
+def test_path_walk_hands_each_hop_the_next_one_and_the_planning_map(monkeypatch):
+    hops = []
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda a, b, **kw: hops.append((b, kw["next_pos"], kw["binary_map"])) or True)
+    marker = object()
+    assert main.execute_path([(0, 0), (1, 1), (2, 2), (3, 3)], binary_map=marker) is True
+    assert hops == [((1, 1), (2, 2), marker), ((2, 2), (3, 3), marker), ((3, 3), None, marker)]
+
+    monkeypatch.setattr(main, "overlay", _StubOverlay(), raising=False)
+    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "load_binary_map",
+                        lambda: np.full((120, 120), 255, dtype=np.uint8))
+    pos = {"p": (20, 80)}
+    maps = []
+
+    def execute(path, **kw):
+        maps.append(kw.get("binary_map"))
+        pos["p"] = (20, 40)
+        return True
+
+    monkeypatch.setattr(main, "execute_path", execute)
+    monkeypatch.setattr(main, "get_player_position", lambda: pos["p"])
+    monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
+    assert main.lazy_theta_pathing((13, 40), [[(2, 5), (44, 73)]]) is True
+    assert len(maps) == 1 and maps[0].shape == (120, 120)
+
+
 def test_lazy_theta_pathing_does_not_cry_stuck_while_it_is_actually_walking(monkeypatch):
     """"没挪窝"判据不能把正常长途赶路误判成卡住 —— 那会在每条长路上插脱困动作。"""
     import numpy as np
@@ -506,7 +641,7 @@ def test_lazy_theta_pathing_does_not_cry_stuck_while_it_is_actually_walking(monk
     monkeypatch.setattr(main, "load_binary_map",
                         lambda: np.full((70, 60), 255, dtype=np.uint8))
     monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
-    monkeypatch.setattr(main, "execute_path", lambda path: True)
+    monkeypatch.setattr(main, "execute_path", lambda path, **kw: True)
     monkeypatch.setattr(main, "execute_anti_stuck",
                         lambda: pytest.fail("走得好好的却去脱困了"))
 
@@ -1300,7 +1435,7 @@ def test_lazy_theta_pathing_does_not_start_another_anti_stuck_past_the_deadline(
     monkeypatch.setattr(main, "execute_anti_stuck",
                         lambda *a, **k: escapes.append(clock[0]), raising=False)
 
-    def execute(path):
+    def execute(path, **kw):
         clock[0] += 10          # 这一趟路就把预算走完了
         return "stuck"
 

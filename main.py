@@ -1,6 +1,7 @@
 from utils import *
 from overlay import create_overlay
 import argparse
+import collections
 import os
 import signal
 import stat
@@ -44,6 +45,11 @@ MYTHIC_STRAFE_K_RADIAL = 0.8   # 甲虫/火蚁环绕: 径向修正强度 (d 偏�
 
 def lazy_heuristic(node1, node2):
     return math.sqrt((node1.x - node2.x) ** 2 + (node1.y - node2.y) ** 2)
+
+
+class _Pt:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
 
 
 def line_of_sight(map, node1, node2):
@@ -257,10 +263,68 @@ ARRIVE_RADIUS = 5
 NO_PROGRESS_EPSILON = 2.0
 NO_PROGRESS_LIMIT = 3
 
+# 离路点这么近(同一格或相邻格)就直接算到, 不再要求直线看得到下一个路点 —— 站在
+# 路点上时规划器已经保证了两点之间直线可走, 剩下的只是位置读数的 1 格抖动.
+WAYPOINT_SNAP_RADIUS = 1.5
+
+
+def _can_turn_to_next(binary_map, current_pos, next_pos, dist):
+    """离当前路点已经 <ARRIVE_RADIUS 了, 能不能现在就转向下一个路点.
+
+    蚁穴密道只有 2 像素宽、还带弯, 路点之间只隔 1~5 格。只看"离路点 <5"的话, 还没
+    拐过弯就转头直奔下一个路点, 直线穿墙, 原地打转判卡住(离线模拟: 出生点→刷怪区
+    必经两条密道, 次次卡在里面)。所以提前转向的前提是从这里直线能看到下一个路点.
+    """
+    if next_pos is None or binary_map is None or dist < WAYPOINT_SNAP_RADIUS:
+        return True
+    return line_of_sight(binary_map, _Pt(*current_pos), _Pt(*next_pos))
+
+
+STEER_SEARCH_LIMIT = 3000
+
+
+def _steer_point(binary_map, current_pos, target_pos):
+    """鼠标该朝哪个点推. 直线看得到目标就朝目标; 看不到(被挤偏了半格, 或者冲过头
+    拐进了墙角)就在可走图上 BFS 一条到目标的格子路, 朝路上最远、从这里直线看得到的
+    那个点推 —— 不然照直线顶着墙推, 原地打转直到判卡住.
+    """
+    if binary_map is None or current_pos == target_pos:
+        return target_pos
+    here, goal = _Pt(*current_pos), _Pt(*target_pos)
+    if line_of_sight(binary_map, here, goal):
+        return target_pos
+    h, w = binary_map.shape[:2]
+    parent = {current_pos: None}
+    queue = collections.deque([current_pos])
+    while queue and len(parent) < STEER_SEARCH_LIMIT:
+        cx, cy = queue.popleft()
+        if (cx, cy) == target_pos:
+            break
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)):
+            nxt = (cx + dx, cy + dy)
+            if nxt not in parent and 0 <= nxt[0] < w and 0 <= nxt[1] < h \
+                    and binary_map[nxt[1]][nxt[0]] == 255:
+                parent[nxt] = (cx, cy)
+                queue.append(nxt)
+    if target_pos not in parent:
+        return target_pos
+    route = []
+    node = target_pos
+    while node is not None:
+        route.append(node)
+        node = parent[node]
+    for node in route:
+        if line_of_sight(binary_map, here, _Pt(*node)):
+            return node
+    return target_pos
+
 
 def move_to_position(current_pos, target_pos, max_attempts=200, stall_limit=13,
-                     progress_epsilon=1.5, on_tick=None):
+                     progress_epsilon=1.5, on_tick=None, next_pos=None, binary_map=None):
     """移动到目标位置.
+
+    next_pos / binary_map: 走路径时的下一个路点和可走图. 给了的话, "到了"(离目标
+    <ARRIVE_RADIUS 或冲过头)还要满足 _can_turn_to_next, 否则继续往目标本身走.
 
     on_tick: 可选回调, 每个内循环 tick(moveTo 之后、sleep 之前)调一次, 传入当前
     minimap 坐标. 返回真值 → 立刻收手, move_to_position 把那个真值原样返回给调用方
@@ -316,13 +380,15 @@ def move_to_position(current_pos, target_pos, max_attempts=200, stall_limit=13,
 
         overlay.update(state="移动中", pos=current_pos, target=target_pos)
 
+        can_turn = _can_turn_to_next(binary_map, current_pos, next_pos, dist)
+
         # 如果已到达目标
-        if dist < ARRIVE_RADIUS:
+        if dist < ARRIVE_RADIUS and can_turn:
             reset_keyboard()
             return True
 
         if last_dist is not None:
-            if dist > last_dist + progress_epsilon:
+            if dist > last_dist + progress_epsilon and can_turn:
                 # 明显冲过头了, 已经足够接近, 当作到达, 不继续死磕这一段.
                 reset_keyboard()
                 return True
@@ -340,11 +406,14 @@ def move_to_position(current_pos, target_pos, max_attempts=200, stall_limit=13,
             overlay.update(state="卡住", message=f"原地打转{stall_count}次")
             return "stuck"
 
-        # 移动鼠标指向目标
-        extend = max(min(dist * 45, 500), 50) * mouse_scale()
-        if dist > 0:
-            extend_x = extend * dx / dist
-            extend_y = extend * dy / dist
+        # 移动鼠标指向目标(看不到目标时指向绕行点, 见 _steer_point)
+        aim = _steer_point(binary_map, current_pos, target_pos)
+        adx, ady = aim[0] - current_pos[0], aim[1] - current_pos[1]
+        aim_dist = math.hypot(adx, ady)
+        extend = max(min(aim_dist * 45, 500), 50) * mouse_scale()
+        if aim_dist > 0:
+            extend_x = extend * adx / aim_dist
+            extend_y = extend * ady / aim_dist
         else:
             extend_x = extend_y = 0
 
@@ -382,8 +451,12 @@ def move_to_position(current_pos, target_pos, max_attempts=200, stall_limit=13,
     return "stuck"
 
 
-def execute_path(path):
-    """执行路径"""
+def execute_path(path, binary_map=None):
+    """执行路径。
+
+    binary_map: 规划用的可走图. 给了才会等看得到下一跳再转向(_can_turn_to_next)、
+        看不到目标时顺着可走格子绕过去(_steer_point); 窄密道全靠这两条.
+    """
     if path is None or len(path) == 0:
         return "stuck"
     
@@ -394,7 +467,8 @@ def execute_path(path):
         next_point = path[i + 1]
         
         print(f"   [{i+1}/{len(path)-1}] 移动到 {next_point}")
-        result = move_to_position(current, next_point)
+        after = path[i + 2] if i + 2 < len(path) else None
+        result = move_to_position(current, next_point, next_pos=after, binary_map=binary_map)
         
         if result == "stuck":
             print(f"   ⚠️ 在 {next_point} 卡住了")
@@ -485,7 +559,7 @@ def lazy_theta_pathing(location, area=[], deadline=None):
 
         print(f"✅ 找到路径，共 {len(path)} 个点")
         overlay.update(message=f"找到路径, 共{len(path)}个点")
-        stat = execute_path(path)
+        stat = execute_path(path, binary_map=binary_map)
 
         # 检查是否到达目标区域
         current_pos = get_player_position()
