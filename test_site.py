@@ -97,6 +97,23 @@ def test_changelog_section_exists_and_js_can_fill_it():
         assert field in js, field
 
 
+def test_changelog_notes_render_markdown_with_collapsible_long_entries_and_per_version_download():
+    js = _js()
+    # Release 正文是 markdown, 不能再整段塞进 textContent(那样 "##"/"-" 会原样显示出来)
+    assert "renderMarkdown" in js
+    assert "body.textContent = h.notes" not in js
+    # 长的更新说明默认折叠, 短的直接展开
+    assert "changelog-details" in js and "changelog-summary" in js
+    # 每个版本自己的一键下载, 不只是最新版那一个
+    assert "changelog-dl" in js and "h.win64" in js
+
+
+def test_changelog_has_a_feedback_link_to_github():
+    html = _html()
+    changelog = html[html.index('id="changelog"'):html.index("</section>", html.index('id="changelog"'))]
+    assert "github.com/greatluca666/florr-auto-farm/issues" in changelog
+
+
 def test_feature_explorer_buttons_match_panels():
     html = _html()
     buttons = re.findall(r'class="feat-item[^"]*"\s+data-demo="(\d)"', html)

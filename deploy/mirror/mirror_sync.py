@@ -155,6 +155,17 @@ def sync_packages(chosen, download_dir, download=download_file, fetch_sig=fetch_
     return entries
 
 
+def _win64_of(entry, public_base):
+    return {
+        "file": entry["file"],
+        "url": f"{public_base}/download/{entry['file']}",
+        "github_url": entry["zip"]["browser_download_url"],
+        "size": entry["size"],
+        "sha256": entry["sha256"],
+        "signature": entry["signature"],
+    }
+
+
 def build_manifest(entries, public_base=PUBLIC_BASE):
     cur = entries[0]
     return {
@@ -162,16 +173,11 @@ def build_manifest(entries, public_base=PUBLIC_BASE):
         "version": cur["version"],
         "published_at": cur["published_at"],
         "notes": cur["notes"],
-        "win64": {
-            "file": cur["file"],
-            "url": f"{public_base}/download/{cur['file']}",
-            "github_url": cur["zip"]["browser_download_url"],
-            "size": cur["size"],
-            "sha256": cur["sha256"],
-            "signature": cur["signature"],
-        },
+        "win64": _win64_of(cur, public_base),
+        # 每条历史都带自己的 win64(不只是最新版), 网站的更新记录才能给每个版本自己的
+        # 一键下载链接, 跟 GitHub Release 页面每条 Release 自带下载链接一样.
         "history": [{"version": e["version"], "published_at": e["published_at"],
-                     "notes": e["notes"]} for e in entries],
+                     "notes": e["notes"], "win64": _win64_of(e, public_base)} for e in entries],
     }
 
 

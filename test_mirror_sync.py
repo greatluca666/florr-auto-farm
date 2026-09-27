@@ -82,6 +82,12 @@ def test_run_once_mirrors_latest_three_and_writes_manifest(tmp_path):
     assert w["signature"] == "sig-florr-auto-farm-v1.3.0-win64.zip.sig"
     assert [h["version"] for h in m["history"]] == ["1.3.0", "1.2.0", "1.1.0"]
     assert m["history"][0]["notes"] == "notes 1.3.0"
+    for h in m["history"]:
+        hw = h["win64"]
+        assert hw["file"] == f"florr-auto-farm-v{h['version']}-win64.zip"
+        assert hw["url"] == f"https://site/download/{hw['file']}"
+        assert hw["sha256"] == _sha(h["version"])
+        assert hw["size"] == len(_data(h["version"]))
     zips = sorted(p.name for p in (tmp_path / "download").glob("*.zip"))
     assert zips == [f"florr-auto-farm-v{v}-win64.zip" for v in ("1.1.0", "1.2.0", "1.3.0")]
 

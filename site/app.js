@@ -44,6 +44,7 @@
 
   // ---- 下载 / 更新记录 ----
   var MB = 1024 * 1024;
+  var LONG_NOTES = 240; // 更新说明超过这个字符数就折叠, 点「展开」才看全文
 
   function formatSize(bytes) {
     return (bytes / MB).toFixed(1) + " MB";
@@ -55,6 +56,75 @@
     var mm = String(d.getMonth() + 1).padStart(2, "0");
     var dd = String(d.getDate()).padStart(2, "0");
     return d.getFullYear() + "-" + mm + "-" + dd;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // Release 正文里用到的行内写法(粗体/行内代码/链接) -> 安全的行内 HTML. 输入先转义,
+  // 再在转义后的文本上替换成固定的标签, 不会有原始 HTML 混进来.
+  function inlineMd(text) {
+    var html = escapeHtml(text);
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, function (m, label, url) {
+      return '<a href="' + url + '" target="_blank" rel="noopener">' + label + "</a>";
+    });
+    return html;
+  }
+
+  // GitHub Release 正文是 markdown(标题/列表/粗体/行内代码/链接/段落这个子集) -> 真正的
+  // 富文本节点, 不再当纯文本塞进 textContent —— 否则 "## 本版更新" 这种标题符号会原样显示.
+  function renderMarkdown(md) {
+    var frag = document.createDocumentFragment();
+    var lines = (md || "").replace(/\r\n/g, "\n").split("\n");
+    var i = 0;
+    var para = [];
+
+    function flushPara() {
+      if (!para.length) return;
+      var p = document.createElement("p");
+      p.innerHTML = inlineMd(para.join(" "));
+      frag.appendChild(p);
+      para = [];
+    }
+
+    while (i < lines.length) {
+      var line = lines[i];
+      var heading = /^(#{1,6})\s+(.*)$/.exec(line);
+      var bullet = /^[-*]\s+(.*)$/.exec(line);
+      if (heading) {
+        flushPara();
+        var h = document.createElement("h" + Math.min(heading[1].length + 2, 6));
+        h.innerHTML = inlineMd(heading[2]);
+        frag.appendChild(h);
+        i++;
+      } else if (bullet) {
+        flushPara();
+        var ul = document.createElement("ul");
+        while (i < lines.length && (bullet = /^[-*]\s+(.*)$/.exec(lines[i]))) {
+          var li = document.createElement("li");
+          li.innerHTML = inlineMd(bullet[1]);
+          ul.appendChild(li);
+          i++;
+        }
+        frag.appendChild(ul);
+      } else if (!line.trim()) {
+        flushPara();
+        i++;
+      } else {
+        para.push(line.trim());
+        i++;
+      }
+    }
+    flushPara();
+    if (!frag.childNodes.length) {
+      var empty = document.createElement("p");
+      empty.textContent = "(这个版本没有写更新说明)";
+      frag.appendChild(empty);
+    }
+    return frag;
   }
 
   function renderDownload(m) {
@@ -82,15 +152,50 @@
     (m.history || []).forEach(function (h) {
       var li = document.createElement("li");
       li.className = "changelog-row";
+
       var head = document.createElement("div");
       head.className = "changelog-version mono";
       var when = formatDate(h.published_at);
       head.textContent = "v" + h.version + (when ? " · " + when : "");
-      var body = document.createElement("div");
-      body.className = "changelog-notes";
-      body.textContent = h.notes || "(这个版本没有写更新说明)"; // Release 正文是 markdown 原文, 按纯文本显示
       li.appendChild(head);
-      li.appendChild(body);
+
+      var notes = document.createElement("div");
+      notes.className = "changelog-notes";
+      notes.appendChild(renderMarkdown(h.notes));
+
+      // 短的更新说明直接展开显示; 长的默认折叠, 点「展开」才看全文 —— 免得列表被一条
+      // 长说明撑爆, 又不丢内容.
+      if ((h.notes || "").length > LONG_NOTES) {
+        var details = document.createElement("details");
+        details.className = "changelog-details";
+        var summary = document.createElement("summary");
+        summary.className = "changelog-summary";
+        var closed = document.createElement("span");
+        closed.className = "cs-closed";
+        closed.textContent = "展开更新说明 ▾";
+        var open = document.createElement("span");
+        open.className = "cs-open";
+        open.textContent = "收起 ▴";
+        summary.appendChild(closed);
+        summary.appendChild(open);
+        details.appendChild(summary);
+        details.appendChild(notes);
+        li.appendChild(details);
+      } else {
+        li.appendChild(notes);
+      }
+
+      // 每个版本自己的一键下载, 跟 GitHub Release 页面每条 Release 自带下载链接一样;
+      // 服务器还没把这个版本的下载信息写进 latest.json 时(镜像脚本刚升级、还没跑过一轮
+      // 同步)就不显示, 不给一个点了没反应的按钮.
+      if (h.win64 && h.win64.url) {
+        var dl = document.createElement("a");
+        dl.className = "changelog-dl";
+        dl.href = h.win64.url;
+        dl.textContent = "↓ 下载 v" + h.version + " · " + formatSize(h.win64.size);
+        li.appendChild(dl);
+      }
+
       list.appendChild(li);
     });
     if (!list.children.length && $("changelog-empty")) $("changelog-empty").hidden = false;

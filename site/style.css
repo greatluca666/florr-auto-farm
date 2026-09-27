@@ -381,8 +381,43 @@ a:focus-visible, button:focus-visible{
   padding:16px 20px;
 }
 .changelog-version{font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:700; color:var(--ink);}
-.changelog-notes{margin-top:8px; font-size:14px; color:var(--ink-dim); white-space:pre-wrap; overflow-wrap:anywhere;}
 .changelog-empty{color:var(--ink-faint); font-size:14px;}
+
+.changelog-notes{margin-top:8px; font-size:14px; color:var(--ink-dim); overflow-wrap:anywhere;}
+.changelog-notes>*{margin:0 0 8px;}
+.changelog-notes>*:last-child{margin-bottom:0;}
+.changelog-notes h4,.changelog-notes h5{margin-top:12px; font-size:14px; font-weight:700; color:var(--ink);}
+.changelog-notes h4:first-child,.changelog-notes h5:first-child{margin-top:0;}
+.changelog-notes ul{padding-left:20px;}
+.changelog-notes li{margin-bottom:4px;}
+.changelog-notes code{
+  font-family:'IBM Plex Mono',monospace; font-size:.9em; color:var(--ink);
+  background:var(--panel-2); border:1px solid var(--line); border-radius:4px; padding:1px 5px;
+}
+.changelog-notes strong{color:var(--ink); font-weight:700;}
+.changelog-notes a{color:var(--yellow); border-bottom:1px solid rgba(248,222,96,0.35);}
+
+.changelog-details{margin-top:8px;}
+.changelog-details .changelog-notes{margin-top:10px;}
+.changelog-summary{
+  cursor:pointer; font-size:13.5px; font-weight:600; color:var(--ink-dim); list-style:none;
+  display:inline-flex; align-items:center; gap:4px; font-family:'IBM Plex Mono',monospace;
+}
+.changelog-summary:hover{color:var(--yellow);}
+.changelog-summary::-webkit-details-marker{display:none;}
+.changelog-summary .cs-open{display:none;}
+.changelog-details[open] .changelog-summary .cs-open{display:inline;}
+.changelog-details[open] .changelog-summary .cs-closed{display:none;}
+
+.changelog-dl{
+  display:inline-block; margin-top:12px; font-size:13.5px; font-weight:600;
+  font-family:'IBM Plex Mono',monospace; color:var(--yellow);
+  border-bottom:1px solid rgba(248,222,96,0.35);
+}
+.changelog-dl:hover{border-bottom-color:var(--yellow);}
+
+.changelog-feedback{margin-top:16px; font-size:14px; color:var(--ink-faint);}
+.changelog-feedback a{color:var(--yellow); border-bottom:1px solid rgba(248,222,96,0.35);}
 
 /* ---------- limits ---------- */
 .limits-list{display:flex; flex-direction:column; gap:0;}
