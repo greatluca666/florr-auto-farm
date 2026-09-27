@@ -23,6 +23,8 @@ import gui_accounts
 import gui_chrome_flow
 import gui_schedule
 import gui_theme as theme
+import gui_update
+import version
 
 _IS_WINDOWS = sys.platform == "win32"
 _LOG_MAX_LINES = 2000  # 日志框最多留这么多行, 再多就从头截掉
@@ -181,6 +183,13 @@ class App(ctk.CTk):
         self._page_sub = theme.hint(head)
         self._page_sub.pack(anchor="w")
 
+        # 「发现新版本」横幅(默认隐藏), 显示时插到页面标题上方
+        self._update_banner = gui_update.UpdateBanner(
+            head, before=self._page_title,
+            on_update=lambda: self._updates.start_update(),
+            on_notes=lambda: self._updates.show_notes(),
+            on_retry=lambda: self._updates.retry())
+
         # 页面宿主: 时间表 / 账号 两页叠在同一格, 切页 = grid / grid_remove.
         self.content = ctk.CTkFrame(main, fg_color="transparent")
         self.content.grid(row=1, column=0, sticky="nsew")
@@ -239,6 +248,14 @@ class App(ctk.CTk):
         # 覆盖掉它 App 自己 .after() 的回调一抛异常就变成 TypeError, 真错误被吞掉.
         self.report_callback_exception = self._on_callback_exception
 
+        self._updates = gui_update.UpdateController(
+            self, self._update_banner, log=self._log_line,
+            is_busy=lambda: self._sched_running or self.proc is not None,
+            stop_all=self._stop_for_update, quit_app=self.on_closing,
+            is_closing=lambda: self._closing)
+        # 检查线程里会先读上次更新的结果、清掉 *.old-update / .update/(见 UpdateController)
+        self.after(1_500, self._updates.check)
+
     def _build_sidebar(self):
         side = ctk.CTkFrame(self, width=190, corner_radius=0, fg_color=theme.SIDEBAR)
         side.grid(row=0, column=0, sticky="nsew")
@@ -277,6 +294,12 @@ class App(ctk.CTk):
             self.after(400, self._ensure_afk)
         if not _IS_WINDOWS:
             self.afk_switch.configure(state="disabled")
+
+        ver = ctk.CTkFrame(side, fg_color="transparent")
+        ver.grid(row=5, column=0, padx=18, pady=(0, 14), sticky="ew")
+        theme.hint(ver, gui_update.version_label(version.__version__)).pack(side="left")
+        theme.ghost_button(ver, "检查更新", lambda: self._updates.check(manual=True),
+                           width=72, height=24).pack(side="right")
 
     def _build_login_guide(self, main):
         self._guide_frame = theme.card(main, border_color=theme.ACCENT)
@@ -648,6 +671,13 @@ class App(ctk.CTk):
         self._persist_afk(enabled)
 
     # ---- 杂项 ----
+    def _stop_for_update(self):
+        """更新前停掉会占用安装目录文件的东西: 调度 + worker 子进程(worker 就是同一个 exe)."""
+        if self._sched_running:
+            self._on_start_stop()          # 停调度, 里面会同步收掉 worker
+        else:
+            self._stop_worker_sync()
+
     def _on_callback_exception(self, exc_type, exc_value, exc_tb):
         self._log_line(f"❌ {exc_type.__name__}: {exc_value}\n")
         traceback.print_exception(exc_type, exc_value, exc_tb)
@@ -667,6 +697,10 @@ class App(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def on_closing(self):
+        updates = getattr(self, "_updates", None)
+        if updates is not None and updates.is_updating() and not messagebox.askyesno(
+                "退出", "正在下载更新, 现在退出会取消这次更新。确定退出?", parent=self):
+            return
         self._closing = True
         if self._tick_job is not None:
             try:

@@ -178,10 +178,15 @@ chown "$SERVICE_USER:$SERVICE_USER" "$PASSWORD_FILE"
 echo "==> 配 Caddy(nip.io 自动 HTTPS, 反代到 127.0.0.1:8765)"
 PUBLIC_IP="$(curl -s -4 ifconfig.me || curl -s -4 icanhazip.com)"
 NIP_HOST="${PUBLIC_IP//./-}.nip.io"
+# 这份 Caddyfile 每次跑 setup.sh 都整个重写; 别的站点(比如 deploy/mirror/install.sh 装的
+# 官网 florrfarm.cc.cd)放在 sites.d/ 里, 靠最后那行 import 带进来, 重跑 setup.sh 不会被冲掉.
+install -d -m 755 /etc/caddy/sites.d
 cat > /etc/caddy/Caddyfile <<CADDYEOF
 ${NIP_HOST} {
     reverse_proxy 127.0.0.1:8765
 }
+
+import /etc/caddy/sites.d/*.caddy
 CADDYEOF
 systemctl enable --now caddy
 systemctl restart caddy

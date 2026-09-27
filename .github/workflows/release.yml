@@ -14,6 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check the tag is vX.Y.Z
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "tag must look like v1.2.3, got $env:TAG" }
+          "VERSION=$($env:TAG.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -22,12 +30,25 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      # The exe learns its own version from version.py; the updater compares it with latest.json.
+      - name: Stamp the version
+        shell: python
+        run: |
+          import os
+          with open("version.py", "w", encoding="utf-8") as f:
+              f.write('__version__ = "%s"\n' % os.environ["VERSION"])
+
       # The suite was written on macOS and has never run on Windows: report failures,
       # but do not let them stop the build from producing the zip to smoke-test.
       - name: Run tests
         continue-on-error: true
         timeout-minutes: 15
         run: python -m pytest -q
+
+      # The self-updater's file swap only runs on Windows. Unlike the suite above, a failure here stops the release.
+      - name: Test the updater's file swap
+        timeout-minutes: 10
+        run: python -m pytest -v test_updater.py test_updater_windows.py
 
       - name: Build the exe
         shell: cmd
@@ -42,6 +63,7 @@ jobs:
           if (-not (Test-Path "$dir\florr-auto-pathing.exe")) { throw "exe is missing" }
           if (-not (Test-Path "$dir\_internal")) { throw "_internal is missing" }
           if (-not (Test-Path "$dir\maps")) { throw "maps is missing" }
+          if (-not (Get-ChildItem "$dir\_internal" -Recurse -Directory -Filter "cryptography" | Select-Object -First 1)) { throw "cryptography is missing from _internal (the updater cannot verify signatures)" }
           Copy-Item README.md, LICENSE -Destination $dir
           $name = "florr-auto-farm-$($env:TAG)-win64.zip"
           Compress-Archive -Path $dir -DestinationPath $name
@@ -56,9 +78,18 @@ jobs:
           if ($bad) { throw "the zip must never contain chrome-profiles or config.json: $(@($bad)[0].FullName)" }
           "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      # Signs with the UPDATE_SIGNING_KEY secret and checks the signature against the public key
+      # built into updater.py, so a release the installed apps cannot verify never gets drafted.
+      - name: Sign
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: python deploy/release/sign_release.py ${{ env.ZIP_NAME }} --version ${{ env.VERSION }}
+
       - name: Draft the release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: ${{ env.ZIP_NAME }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sig
           body_path: RELEASE_NOTES.md

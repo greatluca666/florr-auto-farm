@@ -1,0 +1,29 @@
+# florrfarm.cc.cd 官网 + 安装包镜像. deploy/mirror/install.sh 把它装到 /etc/caddy/sites.d/.
+# 前面是 Cloudflare 代理(SSL 模式 Full (strict)). 证书由 Caddy 经 HTTP-01 自动签, 所以
+# Cloudflare 的「Always Use HTTPS」要保持关闭, 否则证书续期会失败(跳转由 Caddy 自己做).
+florrfarm.cc.cd {
+	encode gzip
+
+	# 版本清单: 不缓存, 新版本一发布就能看到
+	handle /latest.json {
+		root * /var/lib/florrfarm
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	# 安装包: 文件名带版本号, 内容永远不变, 可以永久缓存. 只给真存在的文件加 ——
+	# 404 也永久缓存的话, 还没同步到的包在 Cloudflare / 浏览器里会一直是 404
+	handle /download/* {
+		root * /var/lib/florrfarm
+		@found file
+		header @found Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# 网站本体: mirror_sync.py 从公开仓库拉下来的 site/
+	handle {
+		root * /var/lib/florrfarm/site-repo/site
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+}

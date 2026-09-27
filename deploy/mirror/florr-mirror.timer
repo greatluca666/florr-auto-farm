@@ -1,0 +1,10 @@
+[Unit]
+Description=每 10 分钟同步一次 florrfarm.cc.cd 镜像
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Unit=florr-mirror.service
+
+[Install]
+WantedBy=timers.target

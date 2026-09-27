@@ -1,0 +1,18 @@
+[Unit]
+Description=florrfarm.cc.cd 安装包镜像同步(从 GitHub Releases 拉包, 写 latest.json, 更新网站)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=florrfarm
+Group=florrfarm
+UMask=0022
+Environment=FLORR_MIRROR_REPO=greatluca666/florr-auto-farm
+Environment=FLORR_MIRROR_DATA=/var/lib/florrfarm
+Environment=FLORR_MIRROR_SITE_REPO=/var/lib/florrfarm/site-repo
+Environment=FLORR_MIRROR_PUBLIC_BASE=https://florrfarm.cc.cd
+Environment=HOME=/var/lib/florrfarm
+ExecStart=/usr/bin/python3 /opt/florrfarm-mirror/mirror_sync.py
+TimeoutStartSec=30min
+Nice=10

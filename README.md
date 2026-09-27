@@ -36,7 +36,7 @@ florr.io 的自动寻路 + 自动刷怪脚本。跑在你自己的电脑上:截�
 
 ## 下载与运行(Windows)
 
-> **目前还没有发布 exe**(Windows 打包还没在真机上验证过),请先用下面的「从源码运行」。以下是有了 exe 之后的用法。
+> 打包版从 v1.0.0 开始发布,在 [Releases](../../releases) 下载;也可以用下面的「从源码运行」。
 
 1. 需要 Windows 10/11 和 **Google Chrome**(程序靠它的调试接口读取页面、换服务器,Edge / Firefox 不行)。
 2. 到 [Releases](../../releases) 下载最新的 `florr-auto-farm-vX.Y.Z-win64.zip`,把**整个文件夹**解压出来(别只拿出 exe,它要和 `_internal\` 放在一起)。解压路径别带中文,也别放在 OneDrive / 网盘同步目录里。
