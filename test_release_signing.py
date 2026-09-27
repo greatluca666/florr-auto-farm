@@ -1,10 +1,12 @@
 import base64
+import io
 import sys
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "deploy" / "release"))
+import _stdio  # noqa: E402
 import gen_signing_key  # noqa: E402
 import sign_release  # noqa: E402
 
@@ -85,3 +87,39 @@ def test_gen_signing_key_pipes_private_key_to_gh_and_prints_only_the_public_key(
     out = capsys.readouterr().out
     assert seed not in out
     assert out.strip().splitlines()[-1] == sign_release.public_key_b64(seed)
+
+
+def _cp1252_stdout():
+    """模拟 GitHub Actions windows-latest 上 pwsh 的 stdout: 不是交互式控制台, 按系统
+    代码页 cp1252 编码 —— print() 里的中文字符本来会直接 UnicodeEncodeError."""
+    buf = io.BytesIO()
+    return buf, io.TextIOWrapper(buf, encoding="cp1252")
+
+
+def test_stdio_force_utf8_tolerates_a_stream_without_reconfigure(monkeypatch):
+    # pythonw(无控制台)下 sys.stdout/stderr 可能是 None; reconfigure() 也可能不存在.
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", object())
+    _stdio.force_utf8_stdio()  # 不应该抛异常
+
+
+def test_sign_release_main_does_not_crash_on_a_cp1252_console(tmp_path, monkeypatch):
+    # 2026-09-27 v1.0.0 发版时真的这样崩过 —— print(f"已签名: ...") 在这种 stdout 上直接
+    # UnicodeEncodeError, 整个 GitHub Actions job 失败, 没有生成 Release.
+    seed, pub = gen_signing_key.make_keypair()
+    monkeypatch.setattr(updater, "PUBLIC_KEY_B64", pub)
+    monkeypatch.setenv("UPDATE_SIGNING_KEY", seed)
+    z = _pkg(tmp_path)
+    buf, fake_stdout = _cp1252_stdout()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+    assert sign_release.main([str(z), "--version", "1.2.0"]) == 0
+    fake_stdout.flush()
+    assert "已签名" in buf.getvalue().decode("utf-8")
+
+
+def test_gen_signing_key_main_does_not_crash_on_a_cp1252_console(monkeypatch):
+    buf, fake_stdout = _cp1252_stdout()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+    assert gen_signing_key.main(["--repo", "o/r"], run=lambda cmd, **kw: None) == 0
+    fake_stdout.flush()
+    assert "私钥已存进" in buf.getvalue().decode("utf-8")

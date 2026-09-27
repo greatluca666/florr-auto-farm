@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import updater  # noqa: E402
+from _stdio import force_utf8_stdio  # noqa: E402
 
 
 def make_keypair():
@@ -31,6 +32,7 @@ def make_keypair():
 
 
 def main(argv=None, run=subprocess.run):
+    force_utf8_stdio()
     p = argparse.ArgumentParser(description="生成更新签名密钥, 私钥直接存进 GitHub secret")
     p.add_argument("--repo", default=updater.GITHUB_REPO)
     a = p.parse_args(argv)

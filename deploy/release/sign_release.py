@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import updater  # noqa: E402
+from _stdio import force_utf8_stdio  # noqa: E402
 
 
 def sha256_file(path):
@@ -49,6 +50,7 @@ def sign(zip_path, ver, private_seed_b64, expected_public_key_b64=None):
 
 
 def main(argv=None):
+    force_utf8_stdio()
     p = argparse.ArgumentParser(description="给安装包签名, 写出 <zip>.sig")
     p.add_argument("zip")
     p.add_argument("--version", required=True, help="X.Y.Z, 不带 v")
