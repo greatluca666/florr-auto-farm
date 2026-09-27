@@ -329,8 +329,78 @@ ANTHELL_ENGAGE_HOLD_PX = 120
 # 卡住还直接死了一次。限制半径 = 只处理够得着的, 不追远处的。
 ANTHELL_CHASE_MAX_PX = 300
 
+# 蚁群 = 一堆挤在一起的蚂蚁(用户 2026-09-27): 有就先打蚁群, 不直接冲进去, 保持距离、
+# 近了就退(蚂蚁追上来撞在花瓣圈上)。以下全是**未标定**的初值, 实机调:
+SWARM_MIN_COUNT = 5         # 至少这么多只(非 AVOID)挤在一起才算蚁群
+SWARM_RADIUS_PX = 250       # "挤在一起" = 都在某一只的这个屏幕半径内
+SWARM_CHASE_MAX_PX = 600    # 蚁群中心离玩家这么远以内才去; 比单只的 ANTHELL_CHASE_MAX_PX
+                            # 放宽(用户要"率先"打蚁群), 但仍设上限 —— 太远的多半隔着墙
+SWARM_KEEP_PX = 80          # 跟蚁群里最近那只保持的距离。2026-09-27 蚁穴帧(zoom 0.315)里
+                            # 正在掉血的兵蚁离玩家 36~82px, 所以花瓣够得着的大约在这以内
+SWARM_KEEP_BAND = 0.15      # 距离在 KEEP×(1±BAND) 之间就停着打, 出了这个带才进/退
+
+# 每张图的 AVOID 怪规避触发半径(屏幕像素)。不在表里的用 main.AVOID_TRIGGER_PX(400)。
+# 蚁穴: 用户 2026-09-27 嫌 400 太远(究极兵蚁一出现就跑, 刷不了怪), 改 200。
+AVOID_TRIGGER_PX_BY_MAP = {"anthell": 200}
+
+
+def avoid_trigger_px_for(map_name, default):
+    return AVOID_TRIGGER_PX_BY_MAP.get(map_name, default)
+
+
+def find_swarm(dets, center, radius_px=SWARM_RADIUS_PX, min_count=SWARM_MIN_COUNT):
+    """一堆挤在一起的怪: {"center", "nearest", "count"}; 凑不够 min_count 只 -> None.
+
+    以每只为圆心数 radius_px 内有几只, 取最多的那堆(同样多取离玩家近的)。center 是
+    那堆的平均位置, nearest 是那堆里离玩家(center 参数)最近的那只的屏幕坐标。"""
+    cx, cy = center
+    best = None
+    for d in dets:
+        px, py = d["screen_pos"]
+        members = [m["screen_pos"] for m in dets
+                   if math.hypot(m["screen_pos"][0] - px, m["screen_pos"][1] - py) <= radius_px]
+        if len(members) < min_count:
+            continue
+        mx = sum(p[0] for p in members) / len(members)
+        my = sum(p[1] for p in members) / len(members)
+        key = (len(members), -math.hypot(mx - cx, my - cy))
+        if best is None or key > best[0]:
+            nearest = min(members, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
+            best = (key, {"center": (mx, my), "nearest": nearest, "count": len(members)})
+    return best[1] if best else None
+
+
+def swarm_move_target(swarm, center=SCREEN_CENTER, *, keep_px=SWARM_KEEP_PX,
+                      band=SWARM_KEEP_BAND, max_extend=None, repel_positions=None):
+    """打蚁群时这一 tick 鼠标该移到哪: 保持距离, 近了就退.
+
+    看的是蚁群里**离玩家最近那只**的距离 d:
+      d > keep×(1+band)  朝蚁群中心靠过去(不是朝最近那只 —— 往中间收, 而不是被边上一只带跑)
+      d < keep×(1-band)  往远离蚁群中心的方向退; 人正站在中心上时, 往远离最近那只的方向退
+      中间               停着(返回 center), 让追上来的蚂蚁撞花瓣
+    停着的 tick 返回 center, _drive_and_check_stall 不记卡住样本。"""
+    cx, cy = center
+    nx, ny = swarm["nearest"]
+    d = math.hypot(nx - cx, ny - cy)
+    if d > keep_px * (1 + band):
+        return aim_mouse_target(swarm["center"], hold_px=None, center=center,
+                                max_extend=max_extend, repel_positions=repel_positions)
+    if d >= keep_px * (1 - band):
+        return center
+    sx, sy = swarm["center"]
+    vx, vy = cx - sx, cy - sy
+    if math.hypot(vx, vy) < 1e-6:
+        vx, vy = cx - nx, cy - ny
+    m = math.hypot(vx, vy)
+    if m < 1e-6:
+        return center
+    far = 10000.0      # 反方向上取个远点当"目标", 步长由 aim_mouse_target 的 max_extend 限住
+    return aim_mouse_target((cx + vx / m * far, cy + vy / m * far), hold_px=None, center=center,
+                            max_extend=max_extend, repel_positions=repel_positions)
+
+
 # 每张图的选目标策略: "priority" = 按稀有度/物种优先级挑, 只追 Mythic+ (沙漠);
-# "nearest" = 谁离玩家最近追谁, 不看稀有度 (蚁穴: 一帧 25+ 只神话兵蚁, 按稀有度
+# "nearest" = 有蚁群先打蚁群, 否则谁离玩家最近追谁, 不看稀有度 (蚁穴: 一帧 25+ 只神话兵蚁, 按稀有度
 # 挑会每 tick 都在追, 跟沙漠那个"密集刷怪区死循环"是同一个坑)。
 TARGET_POLICY = {"anthell": "nearest"}
 
@@ -342,7 +412,8 @@ def target_policy_for(map_name):
 def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
                   center=SCREEN_CENTER, chase_min_conf=CHASE_MIN_CONF,
                   target_policy="priority", engage_hold_px=ANTHELL_ENGAGE_HOLD_PX,
-                  chase_max_px=ANTHELL_CHASE_MAX_PX):
+                  chase_max_px=ANTHELL_CHASE_MAX_PX, swarm_min_count=SWARM_MIN_COUNT,
+                  swarm_radius_px=SWARM_RADIUS_PX, swarm_chase_max_px=SWARM_CHASE_MAX_PX):
     """每tick的索敌决策入口. detections是scan_enemies()给的检测列表(或测试里
     手搭的同结构字典列表). 返回三选一:
       ("flee", avoid_positions)             —— 触发半径内有AVOID怪, 优先规避
@@ -352,7 +423,10 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
                                                的CAUTIOUS), 传给aim_mouse_target当
                                                排斥源
       ("wander", None)                      —— 没有到Mythic档的目标, 交回随机漫游
-    target_policy="nearest"(蚁穴): 候选池里离center最近的直接当目标, 不看稀有度、
+      ("swarm", swarm, repel)               —— 只在 target_policy="nearest": 有蚁群
+                                               (find_swarm), 交给 swarm_move_target 遛
+    target_policy="nearest"(蚁穴): 先看蚁群(swarm_chase_max_px 内, 只数 ENGAGE 怪);
+    没有蚁群时候选池里离center最近的直接当目标, 不看稀有度、
     不设Mythic门槛, 返回的hold_px是engage_hold_px(CAUTIOUS怪仍用cautious_hold_px)。
     flee优先、AVOID不进候选池这两条两种模式都一样。
     AVOID怪永远进不了"chase"候选池, 哪怕它稀有度算下来优先级最高。追击目标还要
@@ -392,6 +466,12 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
         # 最近优先: 不看稀有度, 不设 Mythic 门槛 —— AVOID 怪早在上面被挡在候选池外。
         # 只追 chase_max_px 内的; 没有 -> 漫游(不能掉进下面按稀有度那套去追远处的神话)。
         cx, cy = center
+        repel = list(avoid_positions) + [d["screen_pos"] for d in cautious_dets]
+        swarm = find_swarm([d for d, b in candidates if b == "ENGAGE"], center,
+                           swarm_radius_px, swarm_min_count)
+        if (swarm is not None and math.hypot(swarm["center"][0] - cx,
+                                             swarm["center"][1] - cy) <= swarm_chase_max_px):
+            return ("swarm", swarm, repel)
 
         def _dist(pair):
             return math.hypot(pair[0]["screen_pos"][0] - cx, pair[0]["screen_pos"][1] - cy)

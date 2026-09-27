@@ -1,3 +1,4 @@
+import math
 from enemy_detect import (
     classify_action, priority_score, aim_mouse_target, flee_mouse_target,
 )
@@ -906,3 +907,102 @@ def test_nearest_policy_far_ultra_still_repels_while_chasing_near_target():
     ]
     action, target, _, repel = _nearest(detections, avoid_trigger_px=400)
     assert action == "chase" and (260, 540) in repel
+
+
+# ── 蚁群 (用户 2026-09-27): 一堆蚂蚁挤在一起 -> 先打蚁群, 保持距离、近了就退 ──────────
+
+def _swarm_at(cx, cy, n, species="soldier_ant", rarity="Mythic", spread=40):
+    """n 只蚂蚁围着 (cx, cy) 摆一圈, 两两距离都在蚁群半径内."""
+    return [_det(species, rarity, (cx + spread * math.cos(2 * math.pi * i / n),
+                                   cy + spread * math.sin(2 * math.pi * i / n)))
+            for i in range(n)]
+
+
+def test_swarm_is_preferred_over_a_closer_single_ant():
+    members = _swarm_at(1300, 540, _ed.SWARM_MIN_COUNT)
+    detections = members + [
+        _det("worker_ant", "Common", (1010, 540)),          # 单只, 更近
+    ]
+    action, swarm, repel = _nearest(detections)
+    assert action == "swarm"
+    assert swarm["count"] == _ed.SWARM_MIN_COUNT
+    assert math.hypot(swarm["center"][0] - 1300, swarm["center"][1] - 540) < 1
+    # nearest 是蚁群里离玩家最近的那只, 不是那只单独的工蚁
+    want = min((d["screen_pos"] for d in members),
+               key=lambda p: math.hypot(p[0] - 960, p[1] - 540))
+    assert swarm["nearest"] == want
+    assert repel == []
+
+
+def test_too_few_ants_is_not_a_swarm():
+    detections = _swarm_at(1200, 540, _ed.SWARM_MIN_COUNT - 1)
+    action, target, _, _ = _nearest(detections)
+    assert action == "chase"
+
+
+def test_ultra_ants_do_not_count_toward_a_swarm():
+    # 4 只神话 + 1 只究极挤一起: 究极是 AVOID, 不算进蚁群 -> 凑不够数.
+    dets = _swarm_at(1400, 540, _ed.SWARM_MIN_COUNT)
+    dets[0] = dict(dets[0], rarity="Ultra")
+    action = _nearest(dets, avoid_trigger_px=200)[0]
+    assert action != "swarm"
+
+
+def test_flee_beats_the_swarm():
+    detections = _swarm_at(1300, 540, _ed.SWARM_MIN_COUNT) + [
+        _det("soldier_ant", "Ultra", (1060, 540)),          # 100px, 进了 200 的规避半径
+    ]
+    action, payload = _nearest(detections, avoid_trigger_px=200)
+    assert action == "flee" and payload == [(1060, 540)]
+
+
+def test_far_swarm_is_ignored():
+    far = _ed.SWARM_CHASE_MAX_PX + 100
+    detections = _swarm_at(960 + far, 540, _ed.SWARM_MIN_COUNT) + [
+        _det("worker_ant", "Common", (1060, 540)),
+    ]
+    action, target, _, _ = _nearest(detections)
+    assert action == "chase" and target["species"] == "worker_ant"
+
+
+def test_larger_swarm_wins():
+    detections = (_swarm_at(1200, 300, _ed.SWARM_MIN_COUNT)
+                  + _swarm_at(700, 800, _ed.SWARM_MIN_COUNT + 3))
+    action, swarm, _ = _nearest(detections)
+    assert action == "swarm" and swarm["count"] == _ed.SWARM_MIN_COUNT + 3
+
+
+def test_desert_priority_policy_never_returns_swarm():
+    detections = _swarm_at(1200, 540, 8, species="sandstorm", rarity="Mythic")
+    assert select_action(detections, center=(960, 540))[0] == "chase"
+
+
+def test_swarm_move_approaches_when_far():
+    swarm = {"center": (1400, 540), "nearest": (1360, 540), "count": 5}
+    mx, my = _ed.swarm_move_target(swarm, center=(960, 540), keep_px=80, max_extend=500)
+    assert mx > 960 and abs(my - 540) < 1e-6
+
+
+def test_swarm_move_holds_inside_the_band():
+    swarm = {"center": (1080, 540), "nearest": (1040, 540), "count": 5}   # 最近那只 80px
+    assert _ed.swarm_move_target(swarm, center=(960, 540), keep_px=80,
+                                 max_extend=500) == (960, 540)
+
+
+def test_swarm_move_backs_off_when_too_close():
+    swarm = {"center": (1040, 540), "nearest": (1000, 540), "count": 5}   # 最近那只 40px
+    mx, my = _ed.swarm_move_target(swarm, center=(960, 540), keep_px=80, max_extend=500)
+    assert mx < 960 and abs(my - 540) < 1e-6        # 往远离蚁群中心的方向退
+
+
+def test_swarm_move_backs_off_even_when_standing_in_the_middle():
+    # 人就站在蚁群中心上: 离中心的方向没有定义, 退回"离最近那只远一点".
+    swarm = {"center": (960, 540), "nearest": (1000, 540), "count": 5}
+    mx, my = _ed.swarm_move_target(swarm, center=(960, 540), keep_px=80, max_extend=500)
+    assert mx < 960
+
+
+def test_avoid_trigger_is_per_map():
+    assert _ed.avoid_trigger_px_for("anthell", 400) == 200
+    assert _ed.avoid_trigger_px_for("desert", 400) == 400
+    assert _ed.avoid_trigger_px_for(None, 400) == 400

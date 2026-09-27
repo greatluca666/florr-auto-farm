@@ -2993,3 +2993,46 @@ def test_force_utf8_stdio_survives_missing_streams(monkeypatch):
     monkeypatch.setattr(main.sys, "stdout", None)
     monkeypatch.setattr(main.sys, "stderr", None)
     main._force_utf8_stdio()
+
+
+# ── 蚁群 + 蚁穴 U 怪规避半径 (用户 2026-09-27) ────────────────────────────────
+
+def test_maybe_scan_enemies_uses_per_map_avoid_trigger(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [])
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda dets, **k: seen.update(k) or ("wander", None))
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    for map_name, want in (("anthell", 200), ("desert", main.AVOID_TRIGGER_PX)):
+        monkeypatch.setattr(main.utils, "MAP", map_name)
+        main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
+        assert seen["avoid_trigger_px"] == want
+
+
+def test_auto_farming_kites_a_swarm(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))   # 区内
+    swarm = {"center": (1300, 540), "nearest": (1260, 540), "count": 6}
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("swarm", swarm, [(1, 2)]), [], 0.0, True))
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+    moved = {}
+
+    def swarm_move(sw, center, **kw):
+        moved["swarm"], moved["repel"] = sw, kw.get("repel_positions")
+        return (1234.0, 567.0)
+
+    class Done(Exception):
+        pass
+
+    def drive(mouse_target, *a, **kw):
+        moved["target"] = mouse_target
+        raise Done
+
+    monkeypatch.setattr(main.enemy_detect, "swarm_move_target", swarm_move)
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    monkeypatch.setattr(main, "random_walkable_point",
+                        lambda *a, **k: pytest.fail("有蚁群却交回了漫游"))
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    assert moved == {"swarm": swarm, "repel": [(1, 2)], "target": (1234.0, 567.0)}

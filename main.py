@@ -666,7 +666,7 @@ def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, p
         detections = enemy_detect.scan_enemies()
         decision = enemy_detect.select_action(
             detections,
-            avoid_trigger_px=AVOID_TRIGGER_PX,
+            avoid_trigger_px=enemy_detect.avoid_trigger_px_for(utils.MAP, AVOID_TRIGGER_PX),
             cautious_hold_px=CAUTIOUS_HOLD_PX,
             center=enemy_detect.current_center(),
             chase_min_conf=CHASE_MIN_CONF,
@@ -795,7 +795,7 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
         nonlocal enemy_decision, detections, last_enemy_scan
         enemy_decision, detections, last_enemy_scan, _scanned = _maybe_scan_enemies(
             enemy_ai_enabled, time.time(), last_enemy_scan, enemy_decision, detections)
-        if enemy_decision[0] in ("flee", "chase"):
+        if enemy_decision[0] in ("flee", "chase", "swarm"):
             return "enemy"
         if (MYTHIC_LATCH_ENABLED and enemy_ai_enabled
                 and enemy_detect.pick_mythic_target(
@@ -893,7 +893,17 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
             # 没锁定 / 这 tick 没目标 —— 放掉连续性锚点, 别让下次锁定拿旧坐标.
             mythic_target_pos = None
 
-        # 3) 普通追击 —— 不 fleeing 也没锁定 Mythic.
+        # 3) 蚁群 (蚁穴) —— 保持距离遛, 近了就退, 不冲进去.
+        if enemy_action == "swarm":
+            swarm, repel = enemy_decision[1], enemy_decision[2]
+            center = enemy_detect.current_center()
+            mouse_target = enemy_detect.swarm_move_target(swarm, center, repel_positions=repel)
+            _drive_and_check_stall(mouse_target, current_pos, chase_pos_history,
+                                   "打蚁群", f"蚁群 {swarm['count']} 只, 保持距离遛",
+                                   center=center)
+            continue
+
+        # 4) 普通追击 —— 不 fleeing 也没锁定 Mythic.
         if enemy_action == "chase":
             target, hold_px, repel = enemy_decision[1], enemy_decision[2], enemy_decision[3]
             center = enemy_detect.current_center()
@@ -904,7 +914,7 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
                                    center=center)
             continue
 
-        # 4) enemy_action == "wander": 没有可打/需规避的目标, 随机漫游.
+        # 5) enemy_action == "wander": 没有可打/需规避的目标, 随机漫游.
         chase_pos_history.clear()
         random_x, random_y = random_walkable_point(farming_area, binary_map)
 
