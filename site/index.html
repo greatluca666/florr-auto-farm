@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>florr-auto-farm</title>
+<meta name="description" content="florr.io 的自动寻路 + 自动刷怪脚本。跑在你自己的电脑上, Windows 打包版下载即用, 程序内一键更新。">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="page">
+  <div class="grid-overlay"></div>
+
+  <header class="nav">
+    <div class="container" style="display:flex; align-items:center; justify-content:space-between; width:100%;">
+      <a href="#top" class="nav-word">florr-auto-farm<span class="dim">.git</span></a>
+      <nav class="nav-links">
+        <a href="#download">下载</a>
+        <a href="#what-it-does">它对页面做了什么</a>
+        <a href="#faq">常见问题</a>
+        <a href="#changelog">更新记录</a>
+      </nav>
+      <a class="nav-cta" href="https://github.com/greatluca666/florr-auto-farm" target="_blank" rel="noopener">GitHub →</a>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- HERO: feature demos -->
+    <section class="hero" id="top">
+      <div class="container hero-grid">
+        <div class="hero-left">
+          <div class="hero-copy">
+            <span class="eyebrow"><span class="dot"></span>florr.io 自动寻路 + 自动刷怪 · GPL-3.0 开源</span>
+            <h1 class="hero-h1">挂着不管,<br><span class="accent">它自己刷。</span></h1>
+            <p class="hero-sub">走到刷怪区、刷怪、死了自己起来、按时间表切账号。跑在你自己的电脑上。</p>
+            <div class="btn-row">
+              <a class="btn btn-primary" id="dl-btn" href="https://github.com/greatluca666/florr-auto-farm/releases" target="_blank" rel="noopener">下载 Windows 版</a>
+              <a class="btn btn-ghost" href="https://github.com/greatluca666/florr-auto-farm" target="_blank" rel="noopener">查看源码 →</a>
+            </div>
+            <p class="dl-meta" id="dl-meta">正在读取最新版本…</p>
+            <p class="risk-line">⚠ 自动化脚本有账号被封的风险。<a href="#risk">看风险声明</a></p>
+          </div>
+          <div class="feat-block" id="features">
+            <p class="explore-hint">鼠标移到任意一项看演示,手机上点一下。</p>
+          <div class="feat-list" id="feat-list">
+            <button type="button" class="feat-item is-active" data-demo="1" aria-pressed="true">
+              <span class="feat-title">刷怪不站桩</span>
+              <span class="feat-tag">反转攻击键</span>
+              <span class="feat-short">在框里一直走,花瓣一直张开</span>
+            </button>
+            <button type="button" class="feat-item" data-demo="2" aria-pressed="false">
+              <span class="feat-title">识怪</span>
+              <span class="feat-tag">Canvas 解码</span>
+              <span class="feat-short">位置、血量、稀有度,不用模型</span>
+            </button>
+            <button type="button" class="feat-item" data-demo="3" aria-pressed="false">
+              <span class="feat-title">死亡与换服</span>
+              <span class="feat-tag">自愈</span>
+              <span class="feat-short">死了自己起来,刷不满就换服</span>
+            </button>
+            <button type="button" class="feat-item" data-demo="4" aria-pressed="false">
+              <span class="feat-title">多账号排班</span>
+              <span class="feat-tag">星期 × 时段</span>
+              <span class="feat-short">一张周表,自动切账号</span>
+            </button>
+            <button type="button" class="feat-item" data-demo="0" aria-pressed="false">
+              <span class="feat-title">自动寻路</span>
+              <span class="feat-tag">小地图定位</span>
+              <span class="feat-short">读小地图定位,自己走到刷怪区</span>
+            </button>
+            <button type="button" class="feat-item" data-demo="5" aria-pressed="false">
+              <span class="feat-title">状态悬浮窗</span>
+              <span class="feat-tag">overlay</span>
+              <span class="feat-short">角落写着它正在干什么</span>
+            </button>
+            <button type="button" class="feat-item" data-demo="6" aria-pressed="false">
+              <span class="feat-title">AFK 弹窗</span>
+              <span class="feat-tag">florr-auto-afk</span>
+              <span class="feat-short">弹窗交给配套程序处理</span>
+            </button>
+          </div>
+          </div>
+        </div>
+
+          <div class="stage bracket is-always" id="feature-stage" aria-live="polite">
+            <span class="eyebrow feed-label">它能做什么 · 7 项</span>
+
+              <div class="stage-body is-on" data-demo="1">
+                <div class="demo">
+                  <svg viewBox="0 0 480 260" role="img" aria-label="在刷怪区内持续走动输出的演示">
+                    <rect x="14" y="14" width="136" height="22" rx="5" class="pill-bg"></rect>
+                    <text x="24" y="29" class="svg-label g">反转攻击键 · ON</text>
+                    <rect class="area-rect" x="110" y="52" width="260" height="176"></rect>
+                    <path class="corner-stroke" d="M110,68 L110,52 L126,52 M354,228 L370,228 L370,212"></path>
+                    <text x="296" y="46" class="svg-label">刷怪区</text>
+                    <circle cx="180" cy="178" r="9" fill="#8a8f7d"></circle>
+                    <rect x="168" y="192" width="24" height="3" fill="var(--line)"></rect>
+                    <rect x="168" y="192" width="24" height="3" fill="var(--green)" class="hp"></rect>
+                    <circle cx="300" cy="96" r="9" fill="#8a8f7d"></circle>
+                    <rect x="288" y="110" width="24" height="3" fill="var(--line)"></rect>
+                    <rect x="288" y="110" width="24" height="3" fill="var(--green)" class="hp h2"></rect>
+                    <circle cx="330" cy="190" r="9" fill="#8a8f7d"></circle>
+                    <rect x="318" y="204" width="24" height="3" fill="var(--line)"></rect>
+                    <rect x="318" y="204" width="24" height="3" fill="var(--green)" class="hp h3"></rect>
+                    <g class="d1-player" style="offset-path:path('M170,100 C260,66 340,104 322,152 C302,202 204,206 172,162 C152,132 150,112 170,100');">
+                      <g class="d1-orbit">
+                        <circle cx="0" cy="-24" r="4" fill="var(--ink)"></circle>
+                        <circle cx="20.8" cy="-12" r="4" fill="var(--ink)"></circle>
+                        <circle cx="20.8" cy="12" r="4" fill="var(--ink)"></circle>
+                        <circle cx="0" cy="24" r="4" fill="var(--ink)"></circle>
+                        <circle cx="-20.8" cy="12" r="4" fill="var(--ink)"></circle>
+                        <circle cx="-20.8" cy="-12" r="4" fill="var(--ink)"></circle>
+                      </g>
+                      <circle r="10" fill="var(--yellow)"></circle>
+                    </g>
+                  </svg>
+                </div>
+                <div class="stage-text">
+                  <h3>刷怪不站桩</h3>
+                  <p>到了刷怪区,worker 在你框出来的区域里一直走动。它自己不按攻击键,输出靠 florr 自带的「反转攻击键」,让花瓣一直张开。每轮进游戏后,worker 会把这个设置写成你在时块里配的值。</p>
+                  <ul class="facts">
+                    <li>刷怪区用两个角框出来:左上 + 右下</li>
+                    <li>写设置失败只在日志里提示;这时去 设置 → 控制 手动勾上</li>
+                    <li>可选:进游戏 / 到刷怪区各按一次换装键(按住 k 或 l 再按数字),默认关</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="stage-body" data-demo="2">
+                <div class="demo">
+                  <svg viewBox="0 0 480 260" role="img" aria-label="解码画面识别怪物稀有度并追击或躲避的演示">
+                    <text x="16" y="24" class="svg-label">绘制调用 → 位置 / 血量 / 稀有度</text>
+                    <rect class="d2-sweep" x="0" y="0" width="2" height="260" fill="var(--green)"></rect>
+
+                    <circle class="d2-danger" cx="200" cy="178" r="46"></circle>
+                    <circle cx="200" cy="178" r="18" fill="#ff3c82" opacity="0.9"></circle>
+                    <g class="d2u">
+                      <path class="corner-stroke" style="stroke:var(--red);" d="M174,162 L174,152 L184,152 M226,194 L226,204 L216,204"></path>
+                      <text x="232" y="226" class="svg-label r">Ultra 蝎子 · 躲开</text>
+                    </g>
+
+                    <circle cx="340" cy="84" r="15" fill="#2fd7d7"></circle>
+                    <g class="d2m">
+                      <path class="corner-stroke" d="M318,72 L318,62 L328,62 M362,96 L362,106 L352,106"></path>
+                      <text x="370" y="72" class="svg-label g">Mythic · 追</text>
+                      <rect x="322" y="112" width="36" height="3" fill="var(--green)"></rect>
+                    </g>
+
+                    <circle cx="412" cy="202" r="10" fill="#4d6ee0"></circle>
+                    <g class="d2r">
+                      <path class="corner-stroke" style="stroke:var(--ink-dim);" d="M396,196 L396,188 L404,188 M428,208 L428,216 L420,216"></path>
+                      <text x="352" y="238" class="svg-label">Rare · 顺路打</text>
+                    </g>
+
+                    <circle r="9" fill="var(--yellow)" class="d2-me" style="offset-path:path('M70,140 C130,120 170,108 230,100 C270,94 298,90 318,86');"></circle>
+                  </svg>
+                </div>
+                <div class="stage-text">
+                  <h3>识怪</h3>
+                  <p>直接解码游戏画面的绘制调用(圆形填充、血条、文字),读出每只怪的位置、血量和稀有度。不跑图像模型,也不需要任何模型文件。</p>
+                  <ul class="facts">
+                    <li>Mythic 及以上:专门追击、走位</li>
+                    <li>Ultra 里蝎子、甲虫这类打不过的:主动躲开</li>
+                    <li>普通怪不专门追,靠反转攻击键顺路打</li>
+                    <li>目前只对沙漠图有意义;稀有度按中文客户端实测</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="stage-body" data-demo="3">
+                <div class="demo demo-html">
+                  <span class="flow-label">每次死亡</span>
+                  <div class="flow-row">
+                    <span class="chip red f1">死亡</span><span class="arrow">→</span>
+                    <span class="chip f2">点继续</span><span class="arrow">→</span>
+                    <span class="chip f3">点开始</span><span class="arrow">→</span>
+                    <span class="chip f4">重新寻路</span><span class="arrow">→</span>
+                    <span class="chip f5">回到刷怪</span>
+                  </div>
+                  <span class="flow-label">连续没刷满时长的轮数(阈值 3)</span>
+                  <div class="flow-row">
+                    <span class="kbox k1">1</span>
+                    <span class="kbox k2">2</span>
+                    <span class="kbox k3">3</span>
+                    <span class="arrow">→</span>
+                    <span class="chip yel sw">换服</span>
+                    <span class="code-mini sw">cp6.forceServerID(…)</span>
+                  </div>
+                </div>
+                <div class="stage-text">
+                  <h3>死亡与换服</h3>
+                  <p>死了自动点继续、点开始,再从出生点寻路回刷怪区。连续几轮都没撑够设定的刷怪时长,就试着换一台服务器:从 florr 公开的服务器列表里挑一台同生态区的,调用页面自己的函数重连。</p>
+                  <ul class="facts">
+                    <li>刷怪时长和阈值在时块的「高级选项」里设</li>
+                    <li>换服可以按时块关掉</li>
+                    <li>换完会落在哪个生态区,目前没有确认过</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="stage-body" data-demo="4">
+                <div class="demo demo-html">
+                  <div class="week">
+                    <div class="day"><span class="day-h">一</span><div class="day-track"><span class="blk blk-a" style="top:79.2%; height:20.8%;"></span></div></div>
+                    <div class="day"><span class="day-h">二</span><div class="day-track"><span class="blk blk-a" style="top:0; height:4.2%;"></span><span class="blk blk-a" style="top:79.2%; height:20.8%;"></span></div></div>
+                    <div class="day"><span class="day-h">三</span><div class="day-track"><span class="blk blk-a" style="top:0; height:4.2%;"></span><span class="blk blk-a" style="top:79.2%; height:20.8%;"></span></div></div>
+                    <div class="day"><span class="day-h">四</span><div class="day-track"><span class="blk blk-a" style="top:0; height:4.2%;"></span><span class="blk blk-a" style="top:79.2%; height:20.8%;"></span></div></div>
+                    <div class="day"><span class="day-h">五</span><div class="day-track"><span class="blk blk-a" style="top:0; height:4.2%;"></span><span class="blk blk-a" style="top:79.2%; height:20.8%;"></span></div></div>
+                    <div class="day"><span class="day-h">六</span><div class="day-track"><span class="blk blk-a" style="top:0; height:4.2%;"></span><span class="blk blk-b" style="top:37.5%; height:33.3%;"></span></div></div>
+                    <div class="day"><span class="day-h">日</span><div class="day-track"><span class="blk blk-b" style="top:37.5%; height:33.3%;"></span></div></div>
+                  </div>
+                  <div class="week-status">
+                    <span class="ws ws1">19:00 → 切到「主号」的 Chrome,沙漠</span>
+                    <span class="ws ws2">周六 09:00 → 切到「小号」的 Chrome,蚁穴</span>
+                    <span class="ws ws3">表上空档 → worker 停着</span>
+                  </div>
+                  <div class="week-legend">
+                    <span><span class="sw-a"></span>A 主号 · 周一至五 19:00–次日 01:00</span>
+                    <span><span class="sw-b"></span>B 小号 · 周六日 09:00–17:00</span>
+                  </div>
+                </div>
+                <div class="stage-text">
+                  <h3>多账号排班</h3>
+                  <p>按「星期 + 时段」排一张周表,每个时块单独选账号、地图、目标点、刷怪区、识不识怪、换不换服。点「开始调度」后,到了时块边界它会停掉 worker,切到那个账号的 Chrome,写好参数再重新开始。</p>
+                  <ul class="facts">
+                    <li>时段可以跨午夜;00:00–00:00 表示全天</li>
+                    <li>有重叠的时块,保存时直接拒绝</li>
+                    <li>每个账号一个独立的 Chrome profile,登录一次就行</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="stage-body" data-demo="0">
+                <div class="demo">
+                  <svg viewBox="0 0 480 260" role="img" aria-label="小地图定位后规划路线的演示">
+                    <text x="16" y="24" class="svg-label">小地图 · maps/desert.png</text>
+                    <rect class="wall-rect" x="120" y="90" width="60" height="110" rx="2"></rect>
+                    <rect class="wall-rect" x="240" y="30" width="70" height="95" rx="2"></rect>
+                    <path class="d0-route" d="M70,200 L185,208 L310,128 L410,60"></path>
+                    <path class="corner-stroke" d="M396,52 L396,46 L402,46 M424,68 L424,74 L418,74"></path>
+                    <circle cx="410" cy="60" r="3" fill="var(--ink-dim)"></circle>
+                    <text x="360" y="38" class="svg-label">目标点</text>
+                    <circle class="d0-lock" cx="70" cy="200" r="40"></circle>
+                    <circle cx="70" cy="200" r="7" fill="var(--yellow)"></circle>
+                    <text x="46" y="236" class="svg-label y">#f8de60 → (53, 144)</text>
+                    <circle r="5" fill="var(--green)" class="d0-walker" style="offset-path:path('M70,200 L185,208 L310,128 L410,60');"></circle>
+                  </svg>
+                </div>
+                <div class="stage-text">
+                  <h3>自动寻路</h3>
+                  <p>每一帧截小地图,找你自己那个黄色标记定位,在仓库自带的地图上规划路线,自己走到你点的目标点。路线贴着墙角走,不会卡在墙上蹭。</p>
+                  <ul class="facts">
+                    <li>目标点和刷怪区在控制面板的地图选择器里点出来</li>
+                    <li>走出刷怪区,会自己走回区内最近的位置</li>
+                    <li>蚁穴要先进花园,再踩洞口传送过去</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="stage-body" data-demo="5">
+                <div class="demo">
+                  <div class="game-bg"></div>
+                  <span class="g-mob" style="left:74%; top:36%;"></span>
+                  <span class="g-mob" style="left:58%; top:66%;"></span>
+                  <span class="g-mob" style="left:84%; top:70%;"></span>
+                  <span class="g-player"></span>
+                  <div class="ovl">
+                    <div class="ovl-state ws1"><b>● 寻路中 → 刷怪区</b><span>坐标 (18, 92)</span><span>已持续 00:07</span></div>
+                    <div class="ovl-state ws2"><b>● 刷怪中</b><span>坐标 (53, 144)</span><span>已持续 03:41</span></div>
+                    <div class="ovl-state ws3"><b class="r">● 死亡 · 等待点继续</b><span>坐标 (53, 144)</span><span>已持续 00:02</span></div>
+                  </div>
+                </div>
+                <div class="stage-text">
+                  <h3>状态悬浮窗</h3>
+                  <p>游戏画面角落有个小窗,写着它现在在做什么、坐标、这个状态已经持续多久。持续时间一直涨、状态却不变,多半是卡住了,一眼就能看出来。</p>
+                  <ul class="facts">
+                    <li>三行:状态、坐标、持续时长</li>
+                  </ul>
+                </div>
+              </div>
+
+              <div class="stage-body" data-demo="6">
+                <div class="demo">
+                  <div class="game-bg"></div>
+                  <span class="g-mob" style="left:70%; top:30%;"></span>
+                  <span class="g-mob" style="left:24%; top:40%;"></span>
+                  <span class="a-player"></span>
+                  <span class="afk-pause">寻路已暂停 · florr-auto-afk 处理中</span>
+                  <div class="afk-pop">
+                    <span class="afk-title">AFK Check</span>
+                    <span class="afk-btn">我还在</span>
+                  </div>
+                  <svg class="afk-cursor" viewBox="0 0 16 16" aria-hidden="true"><path d="M2,1 L2,14 L5.5,10.5 L8,15 L10,14 L7.6,9.6 L12.5,9.6 Z" fill="var(--ink)" stroke="var(--bg)" stroke-width="1"></path></svg>
+                </div>
+                <div class="stage-text">
+                  <h3>AFK 弹窗</h3>
+                  <p>florr 挂机久了会弹 AFK 检测。这件事交给独立程序 florr-auto-afk 处理;它处理的时候,本程序自动暂停寻路,处理完再接着走。</p>
+                  <ul class="facts">
+                    <li>仅 Windows,默认关闭</li>
+                    <li>首次启用会问你要不要下载(约 350MB)</li>
+                    <li>从上游 Shiny-Ladybug/florr-auto-afk v1.1.1 分出,只加了自动开始检测</li>
+                    <li><a href="https://github.com/greatluca666/florr-auto-afk" target="_blank" rel="noopener">florr-auto-afk →</a></li>
+                  </ul>
+                </div>
+              </div>
+
+          </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- RISK -->
+    <section class="risk-section" id="risk">
+      <div class="container section" style="padding-block:56px;">
+        <div class="risk-body">
+          <div class="risk-text">
+            <span class="eyebrow is-red"><span class="dot"></span>风险声明</span>
+            <h2>这个风险你要自己担</h2>
+            <p>
+              游戏自动化脚本可能违反 florr.io 的服务条款,使用它有账号被封的风险。
+              是否使用、后果如何,你自己判断、自己承担。本项目按 GPL-3.0 原样提供,不附带任何担保。
+            </p>
+          </div>
+          <div class="risk-side mono">
+            license: GPL-3.0<br>
+            warranty: none<br>
+            status: 玩家个人项目
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DOWNLOAD -->
+    <section class="section" id="download">
+      <div class="container">
+        <div class="section-head">
+          <span class="eyebrow">下载安装 · 三步</span>
+          <h2>打包版解压双击就能用</h2>
+        </div>
+
+        <div class="steps">
+          <div class="step">
+            <span class="step-num mono">01 · 下载</span>
+            <h3>下载,新建账号</h3>
+            <p>下面下载最新版本,把<b>整个文件夹</b>解压出来(别只拿出 exe),双击 florr-auto-pathing.exe 打开控制面板。「账号」页新建账号:会先关闭电脑上所有 Chrome 窗口,拉起一个全新的 Chrome 打开 florr.io,在里面登录。</p>
+          </div>
+          <div class="step">
+            <span class="step-num mono">02 · 时间表</span>
+            <h3>排一个时块</h3>
+            <p>「时间表」页新增时块:选星期、时段、账号、地图,在地图选择器里点出目标点和刷怪区。</p>
+          </div>
+          <div class="step">
+            <span class="step-num mono">03 · 开始调度</span>
+            <h3>▶ 开始调度</h3>
+            <p>之后它按时间表自动切账号、启停 worker,不用再管。死亡、换服都是自己处理。</p>
+          </div>
+        </div>
+
+        <div class="download-row">
+          <a class="btn btn-primary" id="dl-btn-2" href="https://github.com/greatluca666/florr-auto-farm/releases" target="_blank" rel="noopener">↓ 下载最新版本</a>
+          <a class="tag" id="dl-github" href="https://github.com/greatluca666/florr-auto-farm/releases" target="_blank" rel="noopener">或到 GitHub Releases 下载</a>
+        </div>
+        <p class="run-note">
+          需要 <b>Windows 10/11</b> 和 <b>Google Chrome</b>(程序靠它的调试接口读取页面、切服务器,Edge / Firefox 不行)。
+          解压路径别带中文,也别放在 OneDrive / 网盘同步目录里。杀毒软件可能误报(PyInstaller 打包的程序常见),不放心可以到
+          <a href="https://github.com/greatluca666/florr-auto-farm" target="_blank" rel="noopener" style="color:var(--yellow); border-bottom:1px solid rgba(248,222,96,0.35);">GitHub</a> 下载源码运行。
+        </p>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- TRANSPARENCY -->
+    <section class="section" id="what-it-does">
+      <div class="container">
+        <div class="section-head">
+          <span class="eyebrow">它对游戏页面做了什么</span>
+          <h2>请知悉</h2>
+        </div>
+        <p class="audit-intro">
+          本程序不往游戏进程里注入 DLL,也不读取、不改写你和游戏服务器之间收发的消息内容。
+          它靠 Chrome 的调试接口(CDP)对 florr.io 页面做下面这几件事:
+        </p>
+
+        <div class="audit-list">
+          <div class="audit-row">
+            <span class="audit-pill read">读</span>
+            <p>给 Canvas 2D 的绘制函数装只读钩子,记录最近几帧的绘制调用,用来读出怪物、你自己和传送口的位置,以及怪物血量和稀有度。</p>
+          </div>
+          <div class="audit-row">
+            <span class="audit-pill read">读</span>
+            <p>给 WebSocket 构造函数套一层只读代理,只为读出当前服务器的短码,收发的消息本身不动。</p>
+          </div>
+          <div class="audit-row">
+            <span class="audit-pill write">写</span>
+            <p>每轮开局把「反转攻击键 / 反转防御键」这两个设置在页面 WASM 内存里的开关字节,写成你在时块里配置的值。</p>
+          </div>
+          <div class="audit-row">
+            <span class="audit-pill write">写</span>
+            <p>换服务器时调用游戏页面自己的 <span class="mono">cp6.forceServerID(...)</span>,服务器编号取自 florr 公开的服务器列表接口,默认开启,可在时块里关掉。</p>
+          </div>
+        </div>
+
+        <p class="audit-note mono">
+          另外:新建账号、登录、调度器切换账号时,程序会用 <b style="color:var(--ink);">taskkill /IM chrome.exe /F</b> 强制结束电脑上所有 Chrome 进程,再重新拉起——你别的 Chrome 窗口和没保存的标签页会丢,用前先保存好。拉起的 Chrome 带 <b style="color:var(--ink);">--remote-debugging-port</b> 参数,本机会开一个调试端口,别在这个 Chrome 里打开不信任的网站。
+        </p>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- FAQ -->
+    <section class="section" id="faq">
+      <div class="container">
+        <div class="section-head">
+          <span class="eyebrow">常见问题</span>
+          <h2>可能会想先看看这些</h2>
+        </div>
+        <div class="faq-list">
+          <details class="faq-item">
+            <summary>杀毒软件报毒?</summary>
+            <p>PyInstaller 打包的程序常被误报,可以加白名单,不放心就从 GitHub 下载源码运行。</p>
+          </details>
+          <details class="faq-item">
+            <summary>双击没反应 / 闪退?</summary>
+            <p>确认是把整个文件夹解压出来的,exe 旁边要有 <span class="mono">_internal\</span> 文件夹。路径里有中文,或者放在网盘同步目录里,也可能出问题。</p>
+          </details>
+          <details class="faq-item">
+            <summary>能把文件夹直接发给朋友吗?</summary>
+            <p>先删掉 <span class="mono">chrome-profiles\</span> —— 里面是你账号的登录态。</p>
+          </details>
+          <details class="faq-item">
+            <summary>怎么更新?</summary>
+            <p>打包版会自己提示新版本,点「立即更新」就行,你的配置和账号不会动。也可以重新下载解压到新文件夹,把旧文件夹里的 <span class="mono">config.json</span> 和 <span class="mono">chrome-profiles\</span> 拷过去。</p>
+          </details>
+          <details class="faq-item">
+            <summary>florr 更新之后会不会失效?</summary>
+            <p>「反转攻击键 / 反转防御键」的内存地址是按某一个 florr 版本写死的,florr 大版本更新后可能失效。写失败只在日志里提示,不会卡住,这时去 设置 → 控制 手动勾上就行。</p>
+          </details>
+          <details class="faq-item">
+            <summary>运行时电脑还能干别的吗?</summary>
+            <p>不能。它会接管鼠标和键盘、截屏读小地图,游戏要全屏放在最前面,这台电脑同时干不了别的。</p>
+          </details>
+          <details class="faq-item">
+            <summary>屏幕不是 1920×1080 能用吗?</summary>
+            <p>坐标按 1920×1080 标定,启动时按屏幕分辨率自动缩放;非 16:9 的窗口可能有偏差。</p>
+          </details>
+          <details class="faq-item">
+            <summary>有 Mac / Linux 版吗?</summary>
+            <p>没有打包版。源码里有 macOS 和 Ubuntu(Xvfb 无头)的代码路径,但没有在真机上长期验证过。</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <hr class="divider">
+
+    <!-- CHANGELOG -->
+    <section class="section" id="changelog">
+      <div class="container">
+        <div class="section-head">
+          <span class="eyebrow">更新记录</span>
+          <h2>最近几个版本</h2>
+        </div>
+        <ol class="changelog-list" id="changelog-list"></ol>
+        <p class="changelog-empty" id="changelog-empty" hidden>暂时读不到更新记录,去 <a href="https://github.com/greatluca666/florr-auto-farm/releases" target="_blank" rel="noopener" style="color:var(--yellow); border-bottom:1px solid rgba(248,222,96,0.35);">GitHub Releases</a> 看。</p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-row">
+        <div>
+          <div class="footer-word">florr-auto-farm</div>
+          <p class="footer-fine">与 florr.io 官方无关,是玩家个人项目;不保证可用性,也不对使用后果负责。</p>
+        </div>
+        <div class="footer-links">
+          <a href="https://github.com/greatluca666/florr-auto-farm" target="_blank" rel="noopener">GitHub 仓库</a>
+          <a href="https://github.com/greatluca666/florr-auto-farm/releases" target="_blank" rel="noopener">Releases</a>
+          <a href="https://github.com/greatluca666/florr-auto-afk" target="_blank" rel="noopener">florr-auto-afk</a>
+        </div>
+      </div>
+      <p class="footer-license">
+        GPL-3.0,见仓库内 LICENSE。基于
+        <a href="https://github.com/Shiny-Ladybug/florr-auto-pathing" target="_blank" rel="noopener">Shiny-Ladybug/florr-auto-pathing</a>
+        修改、扩充而来。
+      </p>
+      <p class="footer-sha" id="footer-sha"></p>
+    </div>
+  </footer>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
