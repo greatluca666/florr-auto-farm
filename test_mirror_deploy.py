@@ -127,3 +127,32 @@ def test_service_umask_keeps_published_dirs_readable_by_caddy():
     # mirror_sync.py 建目录(download/、site-repo/ 的 git 检出)不单独 chmod, 靠这里的 umask 让
     # Caddy(另一个用户)能进目录读文件; 改严了网站和下载会 403.
     assert "UMask=0022" in _read("deploy/mirror/florr-mirror.service").splitlines()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="没有 bash")
+def test_install_sh_puts_a_deny_all_admin_placeholder_until_stats_sets_a_password(tmp_path):
+    # florrfarm.caddy 的 /admin import 这个文件: 没有它 Caddy 校验不过; 有了也只能是 403, 不能放行
+    r, etc, _ = _run_caddy_section(tmp_path, validate_ok=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    auth = (etc / "florrfarm-admin.auth").read_text(encoding="utf-8")
+    assert auth.startswith("respond ") and auth.rstrip().endswith("403")
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="没有 bash")
+def test_install_sh_keeps_an_existing_admin_password_file(tmp_path):
+    etc = tmp_path / "etc-caddy"
+    real = "basic_auth {\n\tadmin $2a$14$hash\n}\n"
+
+    def run():
+        s = _read("deploy/mirror/install.sh")
+        section = s[s.index('echo "==> 配 Caddy 站点'):s.index('echo "==> 先同步一次"')]
+        script = "\n".join(["set -euo pipefail", f'HERE="{MIRROR}"', "caddy() { :; }",
+                            "systemctl() { :; }", section.replace("/etc/caddy", str(etc))])
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+    etc.mkdir()
+    (etc / "Caddyfile").write_text("{\n}\n", encoding="utf-8")
+    (etc / "florrfarm-admin.auth").write_text(real, encoding="utf-8")
+    r = run()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (etc / "florrfarm-admin.auth").read_text(encoding="utf-8") == real

@@ -4,6 +4,19 @@
 florrfarm.cc.cd {
 	encode gzip
 
+	# 使用统计(deploy/stats): 程序心跳 + 官网下载按钮计数, 转给本机的 florr-stats.
+	# Cloudflare 带来的 CF-Connecting-IP 原样转过去, florr-stats 查完地区就丢
+	handle /api/t {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# 后台面板. 密码文件由 deploy/stats/install.sh 生成; 没装统计时 deploy/mirror/install.sh
+	# 放一个一律 403 的占位 —— 宁可打不开, 也不能不设密码就对外
+	handle /admin* {
+		import /etc/caddy/florrfarm-admin.auth
+		reverse_proxy 127.0.0.1:8787
+	}
+
 	# 版本清单: 不缓存, 新版本一发布就能看到
 	handle /latest.json {
 		root * /var/lib/florrfarm

@@ -127,6 +127,16 @@
     return frag;
   }
 
+  // 官网下载计数(服务器上的统计服务): 只发包名; 发不出去也不影响下载本身
+  function countDownload(url) {
+    try {
+      var file = String(url).split("/").pop();
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon("/api/t", JSON.stringify({ v: 1, type: "dl", file: file }));
+      }
+    } catch (e) { /* 统计失败不管 */ }
+  }
+
   function renderDownload(m) {
     var w = m.win64;
     var label = "v" + m.version;
@@ -135,6 +145,7 @@
       btn.href = w.url;
       btn.removeAttribute("target");
       btn.removeAttribute("rel");
+      btn.addEventListener("click", function () { countDownload(w.url); });
     });
     if ($("dl-btn")) $("dl-btn").textContent = "下载 Windows 版 " + label;
     if ($("dl-btn-2")) $("dl-btn-2").textContent = "↓ 下载最新版本 " + label;
@@ -193,6 +204,7 @@
         dl.className = "changelog-dl";
         dl.href = h.win64.url;
         dl.textContent = "↓ 下载 v" + h.version + " · " + formatSize(h.win64.size);
+        dl.addEventListener("click", countDownload.bind(null, h.win64.url));
         li.appendChild(dl);
       }
 

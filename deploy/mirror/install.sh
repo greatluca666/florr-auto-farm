@@ -42,6 +42,11 @@ install -m 644 "$HERE/florrfarm.caddy" /etc/caddy/sites.d/florrfarm.caddy
 if ! grep -qF 'import /etc/caddy/sites.d/*.caddy' /etc/caddy/Caddyfile; then
   printf '\nimport /etc/caddy/sites.d/*.caddy\n' >> /etc/caddy/Caddyfile
 fi
+# florrfarm.caddy 的 /admin 要 import 后台密码文件(deploy/stats/install.sh 生成). 还没装统计时
+# 先放一个一律 403 的占位, 不然配置校验不过
+if [ ! -f /etc/caddy/florrfarm-admin.auth ]; then
+  printf 'respond "后台还没配密码" 403\n' > /etc/caddy/florrfarm-admin.auth
+fi
 if ! caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
   rm -f /etc/caddy/sites.d/florrfarm.caddy
   cp -p /etc/caddy/Caddyfile.bak-florrfarm /etc/caddy/Caddyfile

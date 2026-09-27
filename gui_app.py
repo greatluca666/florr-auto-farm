@@ -24,6 +24,7 @@ import gui_chrome_flow
 import gui_schedule
 import gui_theme as theme
 import gui_update
+import telemetry
 import version
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -117,6 +118,16 @@ def plan_transition(running_id, new_block, chrome_profile):
     }
 
 
+def heartbeat_block(schedule, running_id, proc):
+    """该报心跳的时块: worker 活着且有时块在跑时返回那个时块, 否则 None. 纯函数."""
+    if running_id is None or proc is None or proc.poll() is not None:
+        return None
+    for blk in schedule:
+        if blk.get("id") == running_id:
+            return blk
+    return None
+
+
 class _GuideHost:
     """把主窗口里一块 CTkFrame 包成 LoginGuide 要的 show()/hide()/detected() 接口。"""
 
@@ -162,6 +173,7 @@ class App(ctk.CTk):
         self._running_block_id = None
         self._chrome_profile = None
         self._tick_job = None
+        self._telemetry_job = None
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -256,6 +268,10 @@ class App(ctk.CTk):
         # 检查线程里会先读上次更新的结果、清掉 *.old-update / .update/(见 UpdateController)
         self.after(1_500, self._updates.check)
 
+        # 匿名使用统计(telemetry.py): 启动报一次, 之后每 5 分钟看 worker 在不在跑
+        telemetry.send(telemetry.start_event)
+        self._telemetry_job = self.after(telemetry.HEARTBEAT_S * 1000, self._telemetry_tick)
+
     def _build_sidebar(self):
         side = ctk.CTkFrame(self, width=190, corner_radius=0, fg_color=theme.SIDEBAR)
         side.grid(row=0, column=0, sticky="nsew")
@@ -344,6 +360,15 @@ class App(ctk.CTk):
     def _set_running_block(self, block_id):
         self._running_block_id = block_id
         self._sched_list.set_running(block_id)
+
+    def _telemetry_tick(self):
+        if self._closing:
+            return
+        blk = heartbeat_block(self._cfg["schedule"], self._running_block_id, self.proc)
+        if blk is not None:
+            snapshot = dict(blk)
+            telemetry.send(lambda: telemetry.heartbeat_event(snapshot))
+        self._telemetry_job = self.after(telemetry.HEARTBEAT_S * 1000, self._telemetry_tick)
 
     # ---- cfg 读写 ----
     def _get_cfg(self):
@@ -702,9 +727,11 @@ class App(ctk.CTk):
                 "退出", "正在下载更新, 现在退出会取消这次更新。确定退出?", parent=self):
             return
         self._closing = True
-        if self._tick_job is not None:
+        for job in (self._tick_job, self._telemetry_job):
+            if job is None:
+                continue
             try:
-                self.after_cancel(self._tick_job)
+                self.after_cancel(job)
             except Exception:
                 pass
         self._stop_worker_sync()

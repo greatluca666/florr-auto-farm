@@ -122,3 +122,12 @@ def test_feature_explorer_buttons_match_panels():
     assert set(buttons) == set(panels)
     assert len(panels) == len(set(panels)), "面板 data-demo 不能重复"
     assert len(buttons) == len(set(buttons)), "按钮 data-demo 不能重复"
+
+
+def test_download_links_report_a_click_to_the_stats_endpoint():
+    # 服务器上的统计服务按 {"type": "dl", "file": 包名} 计官网下载; 包名取下载地址的最后一段
+    js = _js()
+    assert 'navigator.sendBeacon("/api/t", JSON.stringify({ v: 1, type: "dl", file: file }))' in js
+    assert 'var file = String(url).split("/").pop();' in js
+    assert "countDownload(w.url)" in js                      # 首屏两个下载按钮
+    assert "countDownload.bind(null, h.win64.url)" in js     # 更新记录里每个版本的下载
