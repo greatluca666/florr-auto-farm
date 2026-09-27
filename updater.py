@@ -269,7 +269,9 @@ OLD_SUFFIX = ".old-update"              # swap.ps1 里写死了同样的后缀
 FAILED_SUFFIX = ".failed-update"        # 同上: 回滚时删不掉的新版本文件改成这个名字让位
 LOG_NAME = "update.log"                 # 同上: swap.ps1 写在安装目录里的日志
 
-_DETACHED_PROCESS = 0x00000008
+# 不能用 DETACHED_PROCESS: 没有控制台的 Windows PowerShell 5.1 一行脚本都不跑就 exit 0
+# (Windows CI 实测 2026-09-27, v1.0.1 实机每次"更新脚本没能启动"就是它)。
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
 
 # 程序退出后由它替换文件. 只能有 ASCII: Windows PowerShell 5.1 按系统代码页读没有 BOM 的脚本.
@@ -475,10 +477,10 @@ def _swap_env():
 
 
 def launch_swap(install, staged, pid):
-    """起替换脚本(脱离本进程, 不开窗口). 调用方随后要退出程序, 脚本等到 pid 退出才动手."""
+    """起替换脚本(单独进程组 + 隐藏控制台, 不开窗口). 调用方随后要退出程序, 脚本等到 pid 退出才动手."""
     script = write_swap_script(install)
     subprocess.Popen(swap_command(script, pid, install, staged),
-                     creationflags=_DETACHED_PROCESS | _CREATE_NO_WINDOW,
+                     creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, close_fds=True, cwd=str(install),
                      env=_swap_env())

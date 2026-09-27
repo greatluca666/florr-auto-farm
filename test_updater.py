@@ -553,11 +553,15 @@ def _capture_popen(monkeypatch):
     return seen
 
 
-def test_launch_swap_starts_detached_powershell(tmp_path, monkeypatch):
+def test_launch_swap_starts_hidden_powershell_without_detached_process(tmp_path, monkeypatch):
     seen = _capture_popen(monkeypatch)
     updater.launch_swap(tmp_path, tmp_path / ".update" / "florr-auto-pathing", 99)
     assert seen["cmd"][seen["cmd"].index("-WaitPid") + 1] == "99"
-    assert seen["kw"]["creationflags"] & 0x00000008        # DETACHED_PROCESS
+    flags = seen["kw"]["creationflags"]
+    # DETACHED_PROCESS 下 Windows PowerShell 5.1 一行不跑就 exit 0 (Windows CI 实测 2026-09-27)
+    assert not flags & 0x00000008
+    assert flags & 0x08000000                              # CREATE_NO_WINDOW: 不弹窗
+    assert flags & 0x00000200                              # CREATE_NEW_PROCESS_GROUP
     assert (tmp_path / ".update" / "swap.ps1").is_file()
 
 

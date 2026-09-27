@@ -194,3 +194,34 @@ def test_stage_then_swap_in_a_path_with_spaces_and_chinese(tmp_path):
     _assert_app_is(install, "new")
     _assert_user_data_untouched(install)
     assert "swap ok" in log and "launched" in log
+
+
+_APP_THAT_UPDATES = r"""
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import updater
+from pathlib import Path
+install, staged = Path(sys.argv[2]), Path(sys.argv[3])
+updater.launch_swap(install, staged, os.getpid())
+sys.exit(0 if updater.wait_for_swap_start(install, os.getpid()) else 3)
+"""
+
+
+def test_launch_swap_really_starts_and_finishes_after_the_app_exits(app):
+    """程序里真正走的那条路: launch_swap 后台起脚本 -> wait_for_swap_start 等到它 ->
+    程序退出 -> 脚本替换文件并重新打开. 上面几条都是前台 subprocess.run, 测不到
+    launch_swap 的启动参数 —— v1.0.1 实机(2026-09-27)就是 DETACHED_PROCESS 让
+    PowerShell 一行没跑就退出, 每次都"更新脚本没能启动"."""
+    install, staged = app
+    here = str(Path(__file__).resolve().parent)
+    r = subprocess.run([sys.executable, "-c", _APP_THAT_UPDATES, here, str(install), str(staged)],
+                       capture_output=True, text=True, timeout=60)
+    log = (install / "update.log").read_text(encoding="utf-8-sig") if (install / "update.log").exists() else ""
+    assert r.returncode == 0, f"脚本没起来: rc={r.returncode} {r.stderr} {log}"
+    deadline = time.time() + 90
+    while "swap ok" not in log and "swap failed" not in log and time.time() < deadline:
+        time.sleep(0.5)
+        log = _log(install)
+    assert "swap ok" in log and "launched" in log, log
+    _assert_app_is(install, "new")
+    _assert_user_data_untouched(install)
