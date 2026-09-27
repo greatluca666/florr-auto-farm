@@ -2988,6 +2988,18 @@ def test_force_utf8_stdio_lets_a_gbk_stream_print_emoji(monkeypatch):
     assert raw.getvalue() == "❌ 失败\n".encode("utf-8")
 
 
+def test_force_utf8_stdio_makes_each_line_reach_the_gui_right_away(monkeypatch):
+    # 打包版(PyInstaller)不认 GUI 给的 PYTHONUNBUFFERED: 管道上的 stdout 是块缓冲, worker
+    # 的日志攒满 8KB 或进程退出才出来, 面板上一行都看不到(v1.0.2 实机 2026-09-27)。
+    raw = io.BytesIO()
+    out = io.TextIOWrapper(raw, encoding="gbk")
+    monkeypatch.setattr(main.sys, "stdout", out)
+    monkeypatch.setattr(main.sys, "stderr", io.TextIOWrapper(io.BytesIO(), encoding="gbk"))
+    main._force_utf8_stdio()
+    print("🎮 开始自动寻路", file=out)          # 不手动 flush
+    assert raw.getvalue() == "🎮 开始自动寻路\n".encode("utf-8")
+
+
 def test_force_utf8_stdio_survives_missing_streams(monkeypatch):
     # pythonw 没有控制台时 sys.stdout 是 None: 不能因此启动失败
     monkeypatch.setattr(main.sys, "stdout", None)
