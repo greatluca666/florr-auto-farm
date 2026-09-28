@@ -1,4 +1,5 @@
 import math
+import pytest
 from enemy_detect import (
     classify_action, priority_score, aim_mouse_target, flee_mouse_target,
 )
@@ -1006,3 +1007,124 @@ def test_avoid_trigger_is_per_map():
     assert _ed.avoid_trigger_px_for("anthell", 400) == 200
     assert _ed.avoid_trigger_px_for("desert", 400) == 400
     assert _ed.avoid_trigger_px_for(None, 400) == 400
+
+
+# ── 蚁穴按物种打法 (florr 维基资料, 2026-09-27) ──────────────────────────────
+# 主动怪(兵蚁/蚁后)会自己凑上来, 停在远处等它就行; 被动/中立/不动的(幼蚁/工蚁/蚁卵)
+# 不会 —— 停在花瓣够不着的地方等它们 = 永远打不到。蠕虫体伤是同档兵蚁的 3 倍, 维基:
+# 「打蠕虫永远别停下」。蚁后判定圈比外观大。
+
+def test_passive_and_static_ants_are_closed_in_on_within_petal_reach():
+    # 花瓣够得着的大约 SWARM_KEEP_PX(实机帧里掉血的兵蚁 36~82px) —— 停下的距离必须在这以内.
+    for species in ("baby_ant", "worker_ant", "ant_egg"):
+        action, target, hold_px, _ = _nearest([_det(species, "Mythic", (1200, 540))])
+        assert action == "chase" and target["species"] == species
+        assert hold_px < _ed.SWARM_KEEP_PX, species
+
+
+def test_soldier_ant_still_holds_at_the_engage_radius():
+    _, _, hold_px, _ = _nearest([_det("soldier_ant", "Mythic", (1200, 540))])
+    assert hold_px == _ed.ANTHELL_ENGAGE_HOLD_PX
+
+
+def test_queen_ant_is_held_off_further_than_a_soldier():
+    # 判定圈比外观大: 贴到兵蚁那个距离就已经在挨她的体伤了.
+    _, _, hold_px, _ = _nearest([_det("queen_ant", "Mythic", (1250, 540))])
+    assert hold_px > _ed.ANTHELL_ENGAGE_HOLD_PX
+
+
+def test_worm_is_circled_at_petal_reach():
+    _, target, hold_px, _ = _nearest([_det("worm", "Mythic", (1200, 540))])
+    assert target["species"] == "worm"
+    assert hold_px == _ed.ANTHELL_WORM_STRAFE_PX
+    assert _ed.ANTHELL_WORM_STRAFE_PX <= _ed.SWARM_KEEP_PX
+
+
+def test_passive_ant_is_preferred_over_a_slightly_nearer_soldier():
+    # 同档幼蚁血量是兵蚁 1/4、经验更高: 都还没接上战时, 幼蚁远一点也先打它.
+    detections = [
+        _det("soldier_ant", "Mythic", (960 + 150, 540)),
+        _det("baby_ant", "Mythic", (960, 540 - 200)),
+    ]
+    _, target, _, _ = _nearest(detections)
+    assert target["species"] == "baby_ant"
+
+
+def test_a_fight_in_progress_is_not_abandoned_for_a_juicier_target():
+    # 兵蚁已经进了原地开打半径 —— 正在打, 别撇下它跑去追幼蚁.
+    detections = [
+        _det("soldier_ant", "Mythic", (960 + 100, 540)),
+        _det("baby_ant", "Mythic", (960, 540 - 150)),
+    ]
+    _, target, hold_px, _ = _nearest(detections)
+    assert target["species"] == "soldier_ant"
+    assert hold_px == _ed.ANTHELL_ENGAGE_HOLD_PX
+
+
+def test_queen_ant_is_left_for_last_when_a_soldier_is_about_as_close():
+    # 蚁后血量是兵蚁 2.5 倍、经验反而更少, 还一直下蛋孵兵蚁 —— 近处有兵蚁先打兵蚁.
+    detections = [
+        _det("queen_ant", "Mythic", (960 + 200, 540)),      # 还在她的停步半径外
+        _det("soldier_ant", "Mythic", (960, 540 + 240)),
+    ]
+    _, target, _, _ = _nearest(detections)
+    assert target["species"] == "soldier_ant"
+
+
+def test_nearby_worm_beats_the_swarm():
+    # 蠕虫就在旁边时站着遛蚁群 = 等它从脚下钻出来; 先边走边打蠕虫.
+    detections = _swarm_at(1300, 540, _ed.SWARM_MIN_COUNT) + [
+        _det("worm", "Mythic", (960 - 150, 540)),
+    ]
+    action, target, hold_px, _ = _nearest(detections)
+    assert action == "chase" and target["species"] == "worm"
+
+
+def test_far_worm_does_not_pull_the_bot_off_the_swarm():
+    far = _ed.ANTHELL_WORM_PRIORITY_PX + 50
+    detections = _swarm_at(1300, 540, _ed.SWARM_MIN_COUNT) + [
+        _det("worm", "Mythic", (960 - far, 540)),
+    ]
+    assert _nearest(detections)[0] == "swarm"
+
+
+def test_worms_do_not_count_toward_a_swarm():
+    # 蚁群是一堆蚂蚁; 蠕虫不是蚂蚁, 也不能站着跟它耗.
+    dets = _swarm_at(1300, 540, _ed.SWARM_MIN_COUNT)
+    dets[0] = dict(dets[0], species="worm")
+    assert _nearest(dets)[0] != "swarm"
+
+
+def test_chase_move_target_holds_still_on_an_ant_inside_the_hold_radius():
+    tgt = _det("soldier_ant", "Mythic", (1000, 540))
+    assert _ed.chase_move_target(tgt, 120, center=(960, 540), max_extend=500) == (960, 540)
+
+
+def test_chase_move_target_matches_aim_for_ants():
+    tgt = _det("baby_ant", "Mythic", (1300, 700))
+    want = _ed.aim_mouse_target((1300, 700), hold_px=50, center=(960, 540), max_extend=500,
+                                repel_positions=[(900, 400)])
+    assert _ed.chase_move_target(tgt, 50, center=(960, 540), max_extend=500,
+                                 repel_positions=[(900, 400)]) == want
+
+
+def test_chase_move_target_never_stands_still_next_to_a_worm():
+    # 在绕圈半径上、半径内、半径外, 都得在动.
+    for dist in (40, 80, 200):
+        tgt = _det("worm", "Mythic", (960 + dist, 540))
+        got = _ed.chase_move_target(tgt, 80, center=(960, 540), max_extend=500)
+        assert got != (960, 540), dist
+        assert math.hypot(got[0] - 960, got[1] - 540) == pytest.approx(500)
+
+
+def test_chase_move_target_circles_a_worm_on_the_radius():
+    # 正好在半径上: 纯切向, 不往里也不往外.
+    tgt = _det("worm", "Mythic", (1040, 540))
+    x, y = _ed.chase_move_target(tgt, 80, center=(960, 540), max_extend=500)
+    assert x == pytest.approx(960) and abs(y - 540) == pytest.approx(500)
+
+
+def test_chase_move_target_circles_a_worm_on_top_of_you_somewhere():
+    # 蠕虫正好在脚下(距离 0, 方向没定义): 也不能停.
+    tgt = _det("worm", "Mythic", (960, 540))
+    assert _ed.chase_move_target(tgt, 80, center=(960, 540), max_extend=500) != (960, 540)

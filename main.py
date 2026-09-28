@@ -693,7 +693,7 @@ def _update_mythic_latch(latched, misses, has_target, release_misses):
 
 
 def _drive_and_check_stall(mouse_target, current_pos, chase_pos_history, state, message,
-                           center=None):
+                           center=None, track_stall=True):
     """chase / flee / 清青怪 三条分支共用的"卡住检测 + 出手"收尾.
 
     mouse_target == center 是"刻意停在这" (保持距离 / 合力抵消), 不算移动 —— 这种
@@ -704,10 +704,16 @@ def _drive_and_check_stall(mouse_target, current_pos, chase_pos_history, state, 
     center 就是那几个 *_mouse_target 函数收到的同一个中心(玩家在画面上的位置) ——
     它们在"保持距离"时原样返回中心, 所以这里必须拿同一个值比, 不能比 SCREEN_CENTER:
     真实锚点在地图边界/非全屏时跟屏幕中心差上百像素, 比错了会把"刻意停住"当成
-    "在移动", 于是卡住检测每隔几 tick 就误判一次脱困。"""
+    "在移动", 于是卡住检测每隔几 tick 就误判一次脱困。
+
+    track_stall=False(绕圈打蠕虫): 不记样本, 还清掉旧的。绕圈的净位移最多一个直径, 蚁穴
+    里半径 60 屏幕像素只合 ~3 格小地图, 低于 chase_is_stalled 的 4 格 —— 喂进去必定误判。
+    代价: 绕圈时真顶在墙上也不脱困, 由蠕虫定时钻地(目标消失)兜底。"""
     if center is None:
         center = enemy_detect.current_center()
-    if mouse_target != center:
+    if not track_stall:
+        chase_pos_history.clear()
+    elif mouse_target != center:
         chase_pos_history.append(current_pos)
         if len(chase_pos_history) > enemy_detect.CHASE_STALL_WINDOW:
             chase_pos_history.pop(0)
@@ -903,15 +909,18 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
                                    center=center)
             continue
 
-        # 4) 普通追击 —— 不 fleeing 也没锁定 Mythic.
+        # 4) 普通追击 —— 不 fleeing 也没锁定 Mythic. 走位按物种(蚁穴蠕虫绕圈不停, 其余到
+        #    停步半径就停), 见 enemy_detect.chase_move_target。
         if enemy_action == "chase":
             target, hold_px, repel = enemy_decision[1], enemy_decision[2], enemy_decision[3]
             center = enemy_detect.current_center()
-            mouse_target = enemy_detect.aim_mouse_target(
-                target["screen_pos"], hold_px=hold_px, center=center, repel_positions=repel)
+            mouse_target = enemy_detect.chase_move_target(
+                target, hold_px, center, repel_positions=repel)
+            circling = target["species"] in enemy_detect.ANTHELL_STRAFE_SPECIES
+            verb = "绕圈打" if circling else "追击"
             _drive_and_check_stall(mouse_target, current_pos, chase_pos_history,
-                                   "索敌中", f"追击 {target['species']}({target['rarity']})",
-                                   center=center)
+                                   "索敌中", f"{verb} {target['species']}({target['rarity']})",
+                                   center=center, track_stall=not circling)
             continue
 
         # 5) enemy_action == "wander": 没有可打/需规避的目标, 随机漫游.

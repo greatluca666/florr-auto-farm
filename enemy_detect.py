@@ -200,7 +200,24 @@ def mythic_move_target(target, center=SCREEN_CENTER, *, strafe_radius, cactus_ho
         return (cx + dx * max_extend, cy + dy * max_extend)
 
     # policy == "strafe"
-    radial = (d - strafe_radius) / strafe_radius * k_radial
+    return _strafe_target(target["screen_pos"], center, strafe_radius, max_extend, k_radial)
+
+
+def _strafe_target(target_pos, center, radius, max_extend, k_radial, zero_dir=None):
+    """绕着 target_pos 转圈: 垂直方向 perp + 朝 radius 的径向修正(d>r 往里带, d<r 往外推),
+    归一化后 ×max_extend。perp 取固定一侧 (-u_y, u_x)。
+    d==0 没方向: 给了 zero_dir 就朝它走(蠕虫 —— 站着不动正好让它钻出来), 否则返回 center。"""
+    px, py = target_pos
+    cx, cy = center
+    vx, vy = px - cx, py - cy
+    d = math.hypot(vx, vy)
+    if d == 0:
+        if zero_dir is None:
+            return center
+        return (cx + zero_dir[0] * max_extend, cy + zero_dir[1] * max_extend)
+    ux, uy = vx / d, vy / d
+    perp = (-uy, ux)
+    radial = (d - radius) / radius * k_radial
     dx = perp[0] + ux * radial
     dy = perp[1] + uy * radial
     m = math.hypot(dx, dy)
@@ -348,6 +365,61 @@ def avoid_trigger_px_for(map_name, default):
     return AVOID_TRIGGER_PX_BY_MAP.get(map_name, default)
 
 
+# ── 蚁穴按物种打法 ─────────────────────────────────────────────────────────────
+# 依据 florr 维基(official-florrio.fandom.com, 2026-09 查): 同稀有度下
+#            血量   体伤   神话经验  行为
+#   幼蚁     0.25×  1×    8164     被动, 慢, 不还手
+#   工蚁     0.6×   1×    4105     中立, 挨打才追(追到你死)
+#   兵蚁     1×     1×    5437     主动, 仇恨范围全游戏最小, 走开一段就不追; 单只好打、成群危险
+#   蚁后     2.5×   1×    4425     主动, 判定圈比外观大(没碰到也掉血), 边走边下蛋孵低一档兵蚁
+#   蠕虫     1×     3×    3680     主动, 钻地移动、从目标脚下冒出; 维基:「打蠕虫永远别停下」
+#   蚁卵     -      -     -        不动, 打碎 30% 孵出同档主动幼蚁
+# (倍数以兵蚁为 1; 数值见 docs/superpowers/specs/2026-09-27-anthell-enemy-rules-design.md)
+#
+# 停下来打的距离按物种分: 主动怪会自己凑过来, 停在 ANTHELL_ENGAGE_HOLD_PX 等它就行; 被动/
+# 中立/不动的不会, 停在花瓣够不着的地方(掉血的兵蚁实测离玩家 36~82px, 见 SWARM_KEEP_PX)
+# 就永远打不到, 所以要贴到花瓣圈里。全部**未标定**。
+ANTHELL_HOLD_PX_BY_SPECIES = {
+    "baby_ant": 50,
+    "worker_ant": 50,
+    "ant_egg": 50,
+    "queen_ant": 180,       # 判定圈比外观大: 兵蚁那个 120 已经在挨她的体伤了
+}
+# 绕圈打、永远不停下的物种。hold_px 当绕圈半径用 —— 冒出地面的蠕虫是不动的, 半径得在花瓣
+# 够得着的范围内。
+ANTHELL_STRAFE_SPECIES = frozenset({"worm"})
+ANTHELL_WORM_STRAFE_PX = 60
+ANTHELL_WORM_K_RADIAL = 0.8     # 同 main.MYTHIC_STRAFE_K_RADIAL
+# 这么近的蠕虫先打, 压过蚁群(站着遛蚁群 = 等它从脚下钻出来)。未标定。
+ANTHELL_WORM_PRIORITY_PX = 200
+# 还没接上战时挑谁: 比 距离×系数, 小的先打。按同档"经验/血量"(兵蚁=1: 幼蚁 6.2、工蚁 1.3、
+# 蠕虫 0.7、蚁后 0.3)压缩到 0.5~1.5 —— 只在远近差不多时改主意, 不会为了幼蚁跑过半个屏幕。
+# 蚁卵不动、经验不明, 排最后(用户要"蚁卵也算怪", 所以仍会打, 只是不抢先)。
+ANTHELL_TARGET_COST = {
+    "baby_ant": 0.5,
+    "worker_ant": 0.9,
+    "soldier_ant": 1.0,
+    "worm": 1.2,
+    "queen_ant": 1.5,
+    "ant_egg": 1.5,
+}
+
+
+def chase_move_target(target, hold_px, center=SCREEN_CENTER, *, max_extend=None,
+                      repel_positions=None):
+    """普通追击这一 tick 鼠标该移到哪。蠕虫(ANTHELL_STRAFE_SPECIES)绕着它转、hold_px 当半径,
+    任何距离都不返回 center(包括正好在脚下); 其余等同 aim_mouse_target(到 hold_px 内就停)。
+    绕圈跟 Mythic 锁定的 strafe 一样不看 repel —— 进了规避半径的 AVOID 怪由 flee 管。"""
+    if target["species"] in ANTHELL_STRAFE_SPECIES:
+        if max_extend is None:
+            max_extend = 500 * utils.mouse_scale()
+        # 正好在脚下时横着走: 蚁穴刷怪区是一条横向窄带, 竖着走会顶墙。
+        return _strafe_target(target["screen_pos"], center, hold_px, max_extend,
+                              ANTHELL_WORM_K_RADIAL, zero_dir=(1.0, 0.0))
+    return aim_mouse_target(target["screen_pos"], hold_px=hold_px, center=center,
+                            max_extend=max_extend, repel_positions=repel_positions)
+
+
 def find_swarm(dets, center, radius_px=SWARM_RADIUS_PX, min_count=SWARM_MIN_COUNT):
     """一堆挤在一起的怪: {"center", "nearest", "count"}; 凑不够 min_count 只 -> None.
 
@@ -425,9 +497,11 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
       ("wander", None)                      —— 没有到Mythic档的目标, 交回随机漫游
       ("swarm", swarm, repel)               —— 只在 target_policy="nearest": 有蚁群
                                                (find_swarm), 交给 swarm_move_target 遛
-    target_policy="nearest"(蚁穴): 先看蚁群(swarm_chase_max_px 内, 只数 ENGAGE 怪);
-    没有蚁群时候选池里离center最近的直接当目标, 不看稀有度、
-    不设Mythic门槛, 返回的hold_px是engage_hold_px(CAUTIOUS怪仍用cautious_hold_px)。
+    target_policy="nearest"(蚁穴): ANTHELL_WORM_PRIORITY_PX 内有蠕虫就先打蠕虫(hold_px 是
+    绕圈半径); 否则先看蚁群(swarm_chase_max_px 内, 只数 ENGAGE 且不是蠕虫的怪); 再否则
+    chase_max_px 内挑一只: 已进自己停步半径的取最近, 都没进的取 距离×ANTHELL_TARGET_COST
+    最小。不看稀有度、不设Mythic门槛。hold_px 按物种(ANTHELL_HOLD_PX_BY_SPECIES, 表外的用
+    engage_hold_px; CAUTIOUS怪仍用cautious_hold_px)。
     flee优先、AVOID不进候选池这两条两种模式都一样。
     AVOID怪永远进不了"chase"候选池, 哪怕它稀有度算下来优先级最高。追击目标还要
     过chase_min_conf置信度关; 没过关的ENGAGE直接丢, 没过关的AVOID/CAUTIOUS仍算
@@ -465,22 +539,43 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
     if target_policy == "nearest":
         # 最近优先: 不看稀有度, 不设 Mythic 门槛 —— AVOID 怪早在上面被挡在候选池外。
         # 只追 chase_max_px 内的; 没有 -> 漫游(不能掉进下面按稀有度那套去追远处的神话)。
+        # 物种打法(见 ANTHELL_HOLD_PX_BY_SPECIES 上面的维基数据): 近处有蠕虫先打蠕虫;
+        # 蚁群不算蠕虫; 已经在打的不换; 还没接上战时按 距离×ANTHELL_TARGET_COST 挑。
         cx, cy = center
-        repel = list(avoid_positions) + [d["screen_pos"] for d in cautious_dets]
-        swarm = find_swarm([d for d, b in candidates if b == "ENGAGE"], center,
-                           swarm_radius_px, swarm_min_count)
-        if (swarm is not None and math.hypot(swarm["center"][0] - cx,
-                                             swarm["center"][1] - cy) <= swarm_chase_max_px):
-            return ("swarm", swarm, repel)
 
         def _dist(pair):
             return math.hypot(pair[0]["screen_pos"][0] - cx, pair[0]["screen_pos"][1] - cy)
 
-        reachable = [pair for pair in candidates if _dist(pair) <= chase_max_px]
-        if not reachable:
+        def _hold(pair):
+            if pair[1] == "CAUTIOUS":
+                return cautious_hold_px
+            if pair[0]["species"] in ANTHELL_STRAFE_SPECIES:
+                return ANTHELL_WORM_STRAFE_PX
+            return ANTHELL_HOLD_PX_BY_SPECIES.get(pair[0]["species"], engage_hold_px)
+
+        worms = [pair for pair in candidates
+                 if pair[0]["species"] in ANTHELL_STRAFE_SPECIES
+                 and _dist(pair) <= ANTHELL_WORM_PRIORITY_PX]
+        if worms:
+            pool = worms
+        else:
+            repel = list(avoid_positions) + [d["screen_pos"] for d in cautious_dets]
+            swarm = find_swarm([d for d, b in candidates
+                                if b == "ENGAGE" and d["species"] not in ANTHELL_STRAFE_SPECIES],
+                               center, swarm_radius_px, swarm_min_count)
+            if (swarm is not None and math.hypot(swarm["center"][0] - cx,
+                                                 swarm["center"][1] - cy) <= swarm_chase_max_px):
+                return ("swarm", swarm, repel)
+            pool = [pair for pair in candidates if _dist(pair) <= chase_max_px]
+        if not pool:
             return ("wander", None)
-        best, best_bucket = min(reachable, key=_dist)
-        hold_px = cautious_hold_px if best_bucket == "CAUTIOUS" else engage_hold_px
+        engaged = [pair for pair in pool if _dist(pair) <= _hold(pair)]
+        if engaged:
+            best, best_bucket = min(engaged, key=_dist)
+        else:
+            best, best_bucket = min(
+                pool, key=lambda pair: _dist(pair) * ANTHELL_TARGET_COST.get(pair[0]["species"], 1.0))
+        hold_px = _hold((best, best_bucket))
         repel = list(avoid_positions)
         repel += [d["screen_pos"] for d in cautious_dets if d is not best]
         return ("chase", best, hold_px, repel)

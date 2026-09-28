@@ -2919,6 +2919,21 @@ def test_stage_state_sync_to():
     assert st.map_name == "garden"
 
 
+def test_circling_does_not_feed_the_stall_detector(monkeypatch):
+    """绕圈(蠕虫)时净位移最多一个圈的直径: 半径 60 屏幕像素在蚁穴(zoom 0.315, 一格小地图
+    约 37 像素)只有 ~3 格, 低于 chase_is_stalled 的 4 格门槛 —— 喂进去就必定被判卡住、
+    触发脱困乱跳。绕圈 tick 不记样本, 还要清掉之前的旧样本(否则绕回原处时拿旧样本一比
+    又是"没动")。"""
+    moved = _stub_drive_env(monkeypatch)
+    monkeypatch.setattr(main, "execute_anti_stuck",
+                        lambda *a, **k: pytest.fail("绕圈被当成卡住"))
+    history = [(5, 5)] * main.enemy_detect.CHASE_STALL_WINDOW
+    got = main._drive_and_check_stall((1000.0, 540.0), (5, 5), history, "索敌中", "绕圈打",
+                                      center=(960.0, 540.0), track_stall=False)
+    assert got == "moved" and moved == [(1000.0, 540.0)]
+    assert history == []
+
+
 def test_entry_route_trusts_canvas_zone_label_over_stage_guess(monkeypatch):
     """人其实在蚁穴、状态变量却在花园: 不能拿花园的路线去走蚁穴的墙."""
     _quiet_entry_env(monkeypatch)
@@ -3048,3 +3063,56 @@ def test_auto_farming_kites_a_swarm(monkeypatch):
     with pytest.raises(Done):
         main.auto_farming(AREA, 30, enemy_ai_enabled=True)
     assert moved == {"swarm": swarm, "repel": [(1, 2)], "target": (1234.0, 567.0)}
+
+
+def test_auto_farming_chase_moves_by_species(monkeypatch):
+    # 追击分支走 enemy_detect.chase_move_target(蠕虫绕圈、其余到停步半径就停), 不再直接调 aim.
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))   # 区内
+    target = {"species": "worm", "rarity": "Mythic", "screen_pos": (1000, 540)}
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("chase", target, 60, [(1, 2)]), [], 0.0, True))
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+    moved = {}
+
+    def chase_move(tgt, hold_px, center, **kw):
+        moved["args"] = (tgt, hold_px, kw.get("repel_positions"))
+        return (1234.0, 567.0)
+
+    class Done(Exception):
+        pass
+
+    def drive(mouse_target, *a, **kw):
+        moved["target"] = mouse_target
+        raise Done
+
+    monkeypatch.setattr(main.enemy_detect, "chase_move_target", chase_move)
+    monkeypatch.setattr(main.enemy_detect, "aim_mouse_target",
+                        lambda *a, **k: pytest.fail("追击绕过了按物种的走位"))
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    assert moved == {"args": (target, 60, [(1, 2)]), "target": (1234.0, 567.0)}
+
+
+@pytest.mark.parametrize("species, want_track", [("worm", False), ("soldier_ant", True)])
+def test_auto_farming_only_circling_skips_stall_tracking(monkeypatch, species, want_track):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    target = {"species": species, "rarity": "Mythic", "screen_pos": (1000, 540)}
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("chase", target, 60, []), [], 0.0, True))
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+    seen = {}
+
+    class Done(Exception):
+        pass
+
+    def drive(mouse_target, *a, **kw):
+        seen["track"] = kw.get("track_stall", True)
+        raise Done
+
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    assert seen["track"] is want_track
