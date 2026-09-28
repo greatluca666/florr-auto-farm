@@ -12,29 +12,84 @@ import telemetry
 ROOT = Path(__file__).resolve().parent
 
 
+USER_ID = "user-data/florr-auto-farm/install_id"      # 这台电脑这个 Windows 用户共用的
+FOLDER_ID = "program-a/install_id"                     # 老版本存在程序文件夹里的
+
+
 @pytest.fixture(autouse=True)
 def _id_in_tmp(tmp_path, monkeypatch):
-    monkeypatch.setattr(telemetry, "ID_PATH", str(tmp_path / "install_id"))
+    monkeypatch.setattr(telemetry, "ID_PATH", str(tmp_path / USER_ID))
+    monkeypatch.setattr(telemetry, "LEGACY_ID_PATH", str(tmp_path / FOLDER_ID))
+    (tmp_path / "program-a").mkdir()
     monkeypatch.delenv("FLORR_TELEMETRY", raising=False)
 
 
 def test_install_id_is_created_once_and_reused(tmp_path):
     a = telemetry.install_id()
     assert len(a) == 32 and int(a, 16) >= 0
-    assert (tmp_path / "install_id").read_text(encoding="utf-8").strip() == a
+    assert (tmp_path / USER_ID).read_text(encoding="utf-8").strip() == a
     assert telemetry.install_id() == a
 
 
+def test_two_program_folders_on_one_computer_share_the_id(tmp_path, monkeypatch):
+    # 实机 2026-09-28: 打包版文件夹和源码文件夹各生成一个编号, 同一台电脑被算成两台
+    a = telemetry.install_id()
+    (tmp_path / "program-b").mkdir()
+    monkeypatch.setattr(telemetry, "LEGACY_ID_PATH", str(tmp_path / "program-b" / "install_id"))
+    assert telemetry.install_id() == a
+
+
+def test_id_from_an_older_version_folder_is_kept(tmp_path):
+    old = "0123456789abcdef0123456789abcdef"
+    (tmp_path / FOLDER_ID).write_text(old + "\n", encoding="utf-8")
+    assert telemetry.install_id() == old
+    assert (tmp_path / USER_ID).read_text(encoding="utf-8").strip() == old
+
+
+def test_shared_id_wins_over_a_folder_id(tmp_path):
+    shared = "fedcba9876543210fedcba9876543210"
+    (tmp_path / USER_ID).parent.mkdir(parents=True)
+    (tmp_path / USER_ID).write_text(shared, encoding="utf-8")
+    (tmp_path / FOLDER_ID).write_text("0123456789abcdef0123456789abcdef", encoding="utf-8")
+    assert telemetry.install_id() == shared
+
+
 def test_corrupt_install_id_file_is_replaced(tmp_path):
-    (tmp_path / "install_id").write_text("not-an-id\n", encoding="utf-8")
+    (tmp_path / USER_ID).parent.mkdir(parents=True)
+    (tmp_path / USER_ID).write_text("not-an-id\n", encoding="utf-8")
     a = telemetry.install_id()
     assert a != "not-an-id" and len(a) == 32
     assert telemetry.install_id() == a
 
 
-def test_unwritable_location_still_yields_an_id(tmp_path):
-    a = telemetry.install_id(str(tmp_path / "missing-dir" / "install_id"))
-    assert len(a) == 32
+def test_unwritable_user_dir_falls_back_to_the_program_folder(tmp_path, monkeypatch):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(telemetry, "ID_PATH", str(blocker / "install_id"))
+    a = telemetry.install_id()
+    assert (tmp_path / FOLDER_ID).read_text(encoding="utf-8").strip() == a
+    assert telemetry.install_id() == a
+
+
+def test_nowhere_writable_still_yields_an_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(telemetry, "ID_PATH", str(tmp_path / "x" / "\0bad"))
+    monkeypatch.setattr(telemetry, "LEGACY_ID_PATH", str(tmp_path / "missing" / "install_id"))
+    assert len(telemetry.install_id()) == 32
+
+
+@pytest.mark.parametrize("plat,env,want", [
+    ("win32", {"LOCALAPPDATA": "D:/LocalAppData"}, "D:/LocalAppData/florr-auto-farm"),
+    ("darwin", {}, "~/Library/Application Support/florr-auto-farm"),
+    ("linux", {"XDG_DATA_HOME": "/xdg"}, "/xdg/florr-auto-farm"),
+    ("linux", {}, "~/.local/share/florr-auto-farm"),
+])
+def test_user_data_dir_per_platform(plat, env, want, monkeypatch):
+    for k in ("LOCALAPPDATA", "XDG_DATA_HOME"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    got = telemetry.user_data_dir(plat)
+    assert Path(got) == Path(want.replace("~", str(Path.home())))
 
 
 def test_heartbeat_carries_map_and_area_but_no_account():

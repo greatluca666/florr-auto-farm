@@ -1,8 +1,8 @@
 """匿名使用统计. 控制面板启动时报一次; 刷怪进程在跑的时候每 5 分钟报一次当前时块的
 地图和刷怪区. 发到 florrfarm.cc.cd/api/t, 服务器按来源 IP 查出国家/省/市后就把 IP 丢掉.
 
-上报内容: 随机生成的安装 ID(每台电脑一个, 存在 config.json 旁边)、版本号、系统、地图、
-刷怪区坐标. 不报账号名、不报 Chrome 里的任何东西.
+上报内容: 随机生成的安装 ID(每台电脑每个系统用户一个, 存在用户目录里, 同一台电脑上的
+打包版、源码版、新旧版本文件夹共用)、版本号、系统、地图、刷怪区坐标. 不报账号名、不报 Chrome 里的任何东西.
 
 全部在后台线程里发, 5 秒超时, 失败就算了、不重试 —— 统计丢几条无所谓, 绝不能反过来
 卡住或弄崩控制面板. FLORR_TELEMETRY=0 关掉(给测试和开发机用).
@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import ssl
+import sys
 import threading
 import urllib.request
 import uuid
@@ -23,7 +24,24 @@ import version
 ENDPOINT = "https://florrfarm.cc.cd/api/t"
 HEARTBEAT_S = 300              # 和服务器 stats_store.HEARTBEAT_MINUTES 对应
 TIMEOUT_S = 5
-ID_PATH = os.path.join(os.path.dirname(app_config.CONFIG_PATH), "install_id")
+
+
+def user_data_dir(plat=None):
+    """这个系统用户的程序数据目录(不跟着程序文件夹走)."""
+    plat = plat or sys.platform
+    if plat.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    elif plat == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "florr-auto-farm")
+
+
+ID_PATH = os.path.join(user_data_dir(), "install_id")
+# v1.0.3 把 ID 存在程序文件夹里(config.json 旁边): 换个文件夹解压、或者源码和打包版各跑一份,
+# 同一台电脑就成了好几台. 现在只在用户目录存不了时才退回这里; 读到老 ID 就接着用.
+LEGACY_ID_PATH = os.path.join(os.path.dirname(app_config.CONFIG_PATH), "install_id")
 # 和 updater.py 同样的原因: Windows 上 urllib 不读系统证书库, 显式用 certifi.
 _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
@@ -32,23 +50,35 @@ def enabled():
     return os.environ.get("FLORR_TELEMETRY", "1") != "0"
 
 
-def install_id(path=None):
-    """读这台电脑的安装 ID, 没有就生成一个存下来. 存不下来(目录只读等)也照样返回一个,
-    只是下次启动会换 —— 多算一台电脑, 不影响程序."""
-    path = path or ID_PATH
+def _read_id(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             iid = f.read().strip()
-        if len(iid) == 32 and all(c in "0123456789abcdef" for c in iid):
-            return iid
-    except OSError:
-        pass
-    iid = uuid.uuid4().hex
+    except (OSError, ValueError):
+        return None
+    return iid if len(iid) == 32 and all(c in "0123456789abcdef" for c in iid) else None
+
+
+def _write_id(path, iid):
     try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(iid + "\n")
-    except OSError:
-        pass
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def install_id():
+    """这台电脑的安装 ID. 用户目录里有就用它; 没有就接过程序文件夹里老版本留下的, 再没有
+    才新生成, 然后存进用户目录. 用户目录存不了退回程序文件夹; 哪都存不了也照样返回一个,
+    只是下次启动会换 —— 多算一台电脑, 不影响程序."""
+    iid = _read_id(ID_PATH)
+    if iid:
+        return iid
+    iid = _read_id(LEGACY_ID_PATH) or uuid.uuid4().hex
+    if not _write_id(ID_PATH, iid):
+        _write_id(LEGACY_ID_PATH, iid)
     return iid
 
 
