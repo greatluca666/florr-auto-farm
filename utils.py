@@ -89,12 +89,24 @@ def mouse_scale():
     return min(SCREEN_WIDTH / _REF_WIDTH, SCREEN_HEIGHT / _REF_HEIGHT)
 
 MAP = ""
+# 这一段路线要走进去的传送门在 300x300 图上的矩形(map_routes.PORTAL_OPENINGS)。寻路图里
+# 传送门是墙(踩上去会被传走, 刷怪时必须绕开); 只有"走去踩它"的那一段才把它挖开 ——
+# open_map_rects() 设, apply_map() 清。
+MAP_OPEN_RECTS = ()
 
 
 def apply_map(name):
-    global MAP
+    global MAP, MAP_OPEN_RECTS
     assert name in [path.removesuffix(".png") for path in os.listdir("./maps")]
     MAP = name
+    MAP_OPEN_RECTS = ()
+
+
+def open_map_rects(rects):
+    """给当前 MAP 挖开这些矩形((x0,y0,x1,y1) 含边界), 之后 load_binary_map() 读到的是挖开后的图。
+    apply_map() 会清掉。传空 = 全部关上。"""
+    global MAP_OPEN_RECTS
+    MAP_OPEN_RECTS = tuple(tuple(r) for r in rects)
 
 
 def if_in_area(areas: list[tuple[tuple[int, int], tuple[int, int]]], point: tuple[int, int]):
@@ -414,7 +426,188 @@ PLAYER_MARKER_COLOR = "f8de60"   # 玩家小地图标记的真实颜色(实测�
 # 会把人绕晕.
 
 
+# 小地图世界坐标 -> maps/*.png 的像素坐标。那些 png 是 1920x1080 下从 (1600,20) 截的
+# 300x300; 那个布局下小地图画在 CTM [s,0,0,s, 1600+1000s, 20+1000s] 上(四周留 1000 世界
+# 单位的边), 所以 地图像素 = s × (世界坐标 + 1000)。s 跟世界大小有关, 每张图不同。
+# 实测(2026-09-28 蚁穴录像 + 2026-09-22 沙漠抓帧): 按这个式子换出来的跟截图认出来的
+# 位置差 1px 以内。没实测过的图不在表里 -> 不猜, 只走截图。
+# 海洋/丛林世界宽 61952, 跟花园/沙漠同大小, 缩放 300/(61952+2000) 一样, 没有单独实测。
+# 下水道/工厂(46080)缩放没实测, 不放进来。
+MINIMAP_WORLD_SCALE = {
+    "anthell": 0.00461708941,
+    "garden": 0.00469101826,
+    "desert": 0.00469101826,
+    "ocean": 0.00469101826,
+    "jungle": 0.00469101826,
+}
+_MINIMAP_BORDER_WORLD = 1000.0
+
+
+def minimap_scale_for_world(width_tiles):
+    """小地图缩放比(地图像素 / 世界单位) = 300/(世界宽+2000), 世界宽 = 格数 x 512。
+    花园(121 格)/蚁穴(123 格)上跟实测 CTM 缩放精确到 8 位。"""
+    return 300.0 / (width_tiles * 512 + 2000.0)
+
+
+# 认"人在哪张图"用的小地图缩放表。garden / anthell 跟 MINIMAP_WORLD_SCALE 是同一个数(实测);
+# sewers / factory 是按同一条公式预测的(官方 .tmj 90x90 格), 没实测过 —— 所以只在这里用来分类,
+# 不进 MINIMAP_WORLD_SCALE(那张表决定"位置读数直接信画布", 错了会静默把人摆错地方)。
+MINIMAP_SCALE_HINTS = {
+    "garden": minimap_scale_for_world(121), "anthell": minimap_scale_for_world(123),
+    "sewers": minimap_scale_for_world(90), "factory": minimap_scale_for_world(90),
+}
+
+
+# 认图时"最优必须明显比次优近"的倍数。为什么要它: 花园(0.00469102)和蚁穴(0.00461709)的提示值
+# 只差 1.58%, 而容差是 0.5% —— 光看"最优在容差内"的话, 读数往蚁穴那边偏 0.4% 时花园仍在容差内、
+# 离蚁穴也只有 1.20%, 两个值其实分不开了, 认错的代价是拿蚁穴的图在花园里刷(第六份录像卡 13 分钟)。
+# 要求次优至少差 3 倍, 等价于把这一对的有效容差从 0.5% 收到 ~0.4%; 差得远的图(花园 vs 下水道
+# 差 33%)一点不受影响。
+# 注意它挡不住"读数整体偏小 1.1~2.1%"那种情况 —— 那时读数正落在蚁穴的提示值上, 边距很大,
+# 任何倍数规则都会认成蚁穴。真要挡住只能靠独立信号(区域名), 不是靠收紧这一层。
+MINIMAP_SCALE_MARGIN = 3.0
+
+
+def map_for_minimap_scale(scale, candidates, ui_scale=1.0, tolerance=0.005):
+    """画布里读到的小地图缩放比 -> 候选图里唯一匹配的那张; 没有 / 分不开 / 不认识 -> None。
+    ui_scale: 屏幕高度 / 1080(小地图 CTM 跟着 UI 缩放, 参照分辨率下是 1)。tolerance 是相对误差:
+    花园和蚁穴只差 1.6%, 花园和下水道差 33%。
+    认的条件是两条: 最优的相对误差 <= tolerance, 而且它只有它一个候选、或者次优的误差至少是
+    它的 MINIMAP_SCALE_MARGIN 倍(见那个常量上面的说明)。
+    世界一样大的图(花园/沙漠/海洋/丛林都是 61952; 下水道/工厂都是 46080)缩放比一样, 用缩放比
+    分不出来 —— 这种候选组合里次优跟最优一样近, 恒 None; candidates 只传同一条路线里的那几张。"""
+    if not scale or not ui_scale:
+        return None
+    value = scale / ui_scale
+    errs = sorted((abs(value - MINIMAP_SCALE_HINTS[name]) / MINIMAP_SCALE_HINTS[name], name)
+                  for name in candidates if name in MINIMAP_SCALE_HINTS)
+    if not errs or errs[0][0] > tolerance:
+        return None
+    if len(errs) == 1:
+        return errs[0][1]
+    best, runner_up = errs[0][0], errs[1][0]
+    # 严格大于: 提示值一样的两张(下水道/工厂)误差完全相等, 0 >= 3*0 会误判成"分得开"。
+    if runner_up > best and runner_up >= MINIMAP_SCALE_MARGIN * best:
+        return errs[0][1]
+    return None
+
+
+# 页面 canvas 日志里最新那个小地图金点(自己)的世界坐标。只读, 不清空 window.__canvasLog
+# (enemy_detect.scan_enemies 从那里 drain)。canvas hook 没装 / 这一瞬没画小地图 -> null。
+_CANVAS_SELF_DOT_JS = """(() => {
+  var log = window.__canvasLog || [];
+  for (var i = log.length - 1; i >= 0; i--) {
+    var r = log[i];
+    if (r.op === "fill" && r.fill === "#FFE763" && r.r != null && r.m
+        && r.m[0] > 0 && r.m[0] < 0.05) {
+      return [(r.x - r.m[4]) / r.m[0], (r.y - r.m[5]) / r.m[3]];
+    }
+  }
+  return null;
+})()"""
+
+
+def canvas_player_world():
+    """自己的世界坐标(小地图金点反解), 读不到 -> None。canvas hook 没装 / 这一瞬没画
+    小地图(传送黑屏、菜单、死亡画面)都读不到。"""
+    try:
+        world = cdp_bridge._eval_value(_CANVAS_SELF_DOT_JS, timeout=2)
+        return (float(world[0]), float(world[1]))
+    except Exception:
+        return None
+
+
+# 不清空 __canvasLog, 取最新两帧里的文字和名牌血条底(zone_map_from_frame 要用血条底认出世界
+# 缩放, 把玩家/怪的名牌排除掉)。清空日志会抢 scan_enemies 的帧, 所以跟 _CANVAS_SELF_DOT_JS 一样只偷看。
+_CANVAS_ZONE_JS = """(() => {
+  var log = window.__canvasLog || [];
+  if (!log.length) return null;
+  var newest = log[log.length - 1].frame, out = [];
+  for (var i = log.length - 1; i >= 0; i--) {
+    var r = log[i];
+    if (r.frame < newest - 1) break;
+    if (r.op === "text" || (r.op === "stroke" && r.stroke === "%s"))
+      out.push({op: r.op, text: r.text, stroke: r.stroke, m: r.m, x: r.x, y: r.y});
+  }
+  return out;
+})()"""
+
+
+def canvas_zone_map():
+    """画布 HUD 上的区域名 -> 寻路图名("anthell"/"garden"/"desert"); 读不到 / 认不出 -> None。"""
+    import canvas_decode
+    try:
+        recs = cdp_bridge._eval_value(_CANVAS_ZONE_JS % canvas_decode.HEALTHBAR_BG, timeout=2)
+    except Exception:
+        return None
+    if not recs:
+        return None
+    try:
+        return canvas_decode.zone_map_from_frame(recs)
+    except Exception:
+        return None
+
+
+# 小地图 CTM 的缩放比 —— 跟 _CANVAS_SELF_DOT_JS 认的是同一个金点, 只是要 m[0] 本身不要
+# 反解出来的世界坐标。同样只偷看不清空 __canvasLog: 清了就把 scan_enemies /
+# canvas_player_world 的帧偷走了(main._canvas_scale_zone 原来走 drain 那条, 每次调用还白等 0.3 秒)。
+_CANVAS_MINIMAP_SCALE_JS = """(() => {
+  var log = window.__canvasLog || [];
+  for (var i = log.length - 1; i >= 0; i--) {
+    var r = log[i];
+    if (r.op === "fill" && r.fill === "%s" && r.r != null && r.m
+        && r.m[0] > 0 && r.m[0] < %s) {
+      return r.m[0];
+    }
+  }
+  return null;
+})()"""
+
+
+def canvas_minimap_scale():
+    """小地图 CTM 的缩放比(地图像素 / 世界单位), 读不到 -> None。
+
+    只跟世界大小有关(300/(世界宽+2000)), 所以能用来认"人在哪张图" ——
+    map_for_minimap_scale() 拿它跟 MINIMAP_SCALE_HINTS 比。"""
+    import canvas_decode
+    js = _CANVAS_MINIMAP_SCALE_JS % (canvas_decode.PLAYER_BODY_COLOR,
+                                     canvas_decode.MINIMAP_MAX_SCALE)
+    try:
+        scale = float(cdp_bridge._eval_value(js, timeout=2))
+    except Exception:       # 读不到(null)/CDP 掉线/类型对不上 都不该把 worker 撂倒
+        return None
+    return scale if scale > 0 else None
+
+
+def canvas_player_position(precise=False):
+    """从 canvas 日志读自己在小地图上的位置(地图像素), 读不到 -> None。
+
+    2026-09-28 蚁穴录像: 截图认小地图金点 11 分钟里读丢 40 次 —— 寻路时每次都当"卡住"去
+    乱冲脱困(还冲进过花园别的传送点), 刷怪时整轮 sleep(1) 不躲, 两次死亡都卡在这一秒上;
+    同一时刻画布里那个点一直都在。Chrome 退出全屏(页面往下挪 87px)后截图还会读到错的
+    位置, 世界坐标换算不受影响。
+    """
+    s = MINIMAP_WORLD_SCALE.get(MAP)
+    if s is None:
+        return None
+    world = canvas_player_world()
+    if world is None:
+        return None
+    x = s * (world[0] + _MINIMAP_BORDER_WORLD)
+    y = s * (world[1] + _MINIMAP_BORDER_WORLD)
+    if not (0 <= x < 300 and 0 <= y < 300):
+        return None
+    if precise:
+        return (x, y)
+    return calibrate_player(load_binary_map(), (round(x), round(y)))
+
+
 def get_player_position(precise=False):
+    """玩家在当前地图上的位置(maps/*.png 的像素坐标)。先读画布(canvas_player_position),
+    读不到再截图认小地图金点。"""
+    position = canvas_player_position(precise)
+    if position is not None:
+        return position
     image = get_map()
     binary_map = load_binary_map()
     # 旧列表里那10种颜色其实是迷宫墙壁/地板色 (~95%像素覆盖),
@@ -621,16 +814,22 @@ _CONFIRM_CLICK_MAX_ATTEMPTS = 10
 _CONFIRM_CLICK_SETTLE_SECONDS = 1.5
 
 
-def _click_button_until_gone(button_pos, still_showing, label):
+def _click_button_until_gone(button_pos, still_showing, label, park=False):
     """鼠标移到button_pos连点两下(第一下常只抢焦点), 等画面稳定, 再用still_showing()
     复查是不是真离开了该画面. 没离开就重试, 最多_CONFIRM_CLICK_MAX_ATTEMPTS次.
-    返回True=确认已离开, False=试满还在."""
+    返回True=确认已离开, False=试满还在.
+
+    park: 点完立刻把鼠标挪回屏幕中心(= 进局后原地不动)。「开始」要: 鼠标停在按钮上, 一进局
+    花就朝它走, 等画面稳定这一秒够滑出去两三百单位 —— 第六份录像蚁穴复活后就这样滑到回花园的
+    门边, 被传回了花园。"""
     for attempt in range(1, _CONFIRM_CLICK_MAX_ATTEMPTS + 1):
         pyautogui.moveTo(button_pos)
         time.sleep(0.2)
         pyautogui.click()
         time.sleep(0.1)
         pyautogui.click()
+        if park:
+            pyautogui.moveTo((SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
         time.sleep(_CONFIRM_CLICK_SETTLE_SECONDS)
         if not still_showing():
             return True
@@ -642,7 +841,7 @@ def _click_button_until_gone(button_pos, still_showing, label):
 def click_start_game():
     """确认开局菜单, 真正进入游戏. 连点两下 + 复查on_start_screen()确认菜单消失,
     没消失就重试(理由见_click_button_until_gone上面的注释)."""
-    return _click_button_until_gone(_START_BUTTON_POS, on_start_screen, "开始")
+    return _click_button_until_gone(_START_BUTTON_POS, on_start_screen, "开始", park=True)
 
 
 def click_play_as_guest():
@@ -667,9 +866,9 @@ def click_play_as_guest():
 # florr 改标题页布局 / 换了分辨率没对上 → 点空 → 照旧进花园(自愈, 不卡死),
 # 重新跑 debug_screen_pos.py 量 Desert 格中心, 换算到 1920x1080 基准
 # (ref_x = 实测x * 1920 / 屏宽) 填这里. 键 = server_lookup 的生态区 key
-# (main._apply_worker_config 传进来的 w["biome"]). 现在只有 desert 量过;
-# ocean GUI 禁用着没去量, garden 待标定(见下面表里那条注释) —— 蚁穴走 garden
-# 进场, 所以蚁穴时块传进来的是 "garden" 而不是 "anthell", 见 map_routes.py.
+# (main._apply_worker_config 传进来的 w["biome"]). desert/garden 是实机悬停量过的,
+# ocean/jungle 是从标题页截图量的外框中心(见下面表里的注释) —— 蚁穴/下水道/工厂走 garden
+# 进场, 所以它们的时块传进来的是 "garden", 见 map_routes.py.
 _BIOME_BUTTON_POS = {
     "desert": scale_point(977, 596),
     # 2026-09-15 实机标定(1920x1080, debug_screen_pos.py 悬停花园格)。蚁穴走花园
@@ -677,14 +876,20 @@ _BIOME_BUTTON_POS = {
     # 跟 desert 同一行、在它左边 116px, y 基本齐平(599 vs 596) —— 跟标题页那个
     # 「花园/沙漠/海洋 换行 丛林/冥界」的格子网格对得上, 可以互相印证。
     "garden": scale_point(861, 599),
+    # 2026-09-29 海洋/丛林: 从用户 Windows 机 1920x1080 标题页截图(debug_marked_pos.png)量的按钮外框
+    # 中心 —— 没有像花园/沙漠那样在实机上悬停复核过。外框: 海洋 x1013~1107 y590~617, 丛林 x864~956
+    # y624~651(丛林在第二行, 靠左)。点偏 = 照旧落进花园; main._run_entry_route 用服务器生态区
+    # (仅在服务器号读得到时)发现落错了, 就跳过这一轮(返回 "timeout"), 不会拿海洋/丛林的图在花园里刷。
+    "ocean": scale_point(1060, 603),
+    "jungle": scale_point(910, 637),
 }
 
 
 def select_biome_on_title(biome):
     """在标题页生态区选择器里点一下目标生态区, 保证点"开始"后进这个生态区.
-    biome 没有对应坐标(ocean 暂未量, 或未知值)→ 直接返回不点.
-    ("anthell" 不会被传进来: 蚁穴走花园进场, 时块拿到的 biome 就是 "garden",
-     见 map_routes.py。)
+    biome 没有对应坐标(未知值)→ 直接返回不点.
+    ("anthell" 不会被传进来: 蚁穴/下水道/工厂走花园进场, 时块拿到的 biome 就是
+     "garden", 见 map_routes.py。)
     已经选中目标生态区时再点一下也无害(幂等). 沿用确认类按钮的"先点一下抢焦点、
     再点一下真命中"套路, 但这个选择器点完不会消失、没有"画面已离开"的复查信号,
     所以不走 _click_button_until_gone, 就连点两下.
@@ -773,8 +978,11 @@ def _open_portal_blob(binary, hsv, point):
     为什么只开一个: 花园里这样的绿点有 7 个, 只有一个是蚁穴入口(2026-09-15 用户
     确认)。其余 6 个通向别处 —— 它们留在"墙"的状态才是对的: 寻路会自动绕开, bot
     就不会在去蚁穴的路上踩中别的传送点被拽走。
-    为什么这一个非开不可: 寻路的目标点要是墙, lazy_theta_star 直接规划失败, 报的
-    还是笼统的"路径规划失败", 根本看不出是地图的问题, bot 会一轮轮空转到超时。
+
+    现状: maps/*.png 一律不用这条路(preprocess_map 的 open_portal_at 谁都不传) ——
+    花园图里**所有**门都是墙, 走门那一段由 main._run_entry_route 在运行时按
+    map_routes.PORTAL_OPENINGS 把目标那一扇挖开(utils.open_map_rects), 刷怪时再关上。
+    这个函数只剩 capture_map.py 的遗留 --portal 开关在用(别对花园图用)。
 
     point 不在任何绿斑上 -> 原样返回(不猜、不就近吸附), 由调用方的回归用例去发现。
     """
@@ -814,8 +1022,8 @@ def preprocess_map(image, out_path=None, threshold=200, open_portal_at=None,
     threshold: 二值化阈值。不同生态区的小地图明暗对比不一样, 生成出来墙和地板
     分不开时调它(capture_map.py --threshold)。
     open_portal_at: (x, y) —— 只把这个点所在的那一个传送点绿斑打通成可走, 别的
-    绿斑照旧当墙(理由见 _open_portal_blob)。花园图要传 map_routes.ANTHELL_PORTAL;
-    别的图不用传。
+    绿斑照旧当墙(理由见 _open_portal_blob)。maps/*.png 一律不传 —— 传送门在
+    寻路图里都是墙, 走门那一段运行时才挖(map_routes.PORTAL_OPENINGS + open_map_rects)。
     open_shortcuts_at: 密道矩形范围列表, 每个 (x0,y0,x1,y1) —— 见 map_routes 里
     以 _SHORTCUTS 结尾的常量(比如 map_routes.GARDEN_SHORTCUTS)。capture_map.py
     按地图名自动查表传进来, 调这个函数的人一般不用自己传.
@@ -854,7 +1062,10 @@ def _ensure_grayscale_2d(img):
 
 
 def load_binary_map():
-    return _ensure_grayscale_2d(cv2.imread(f'./maps/{MAP}.png', cv2.IMREAD_GRAYSCALE))
+    binary = _ensure_grayscale_2d(cv2.imread(f'./maps/{MAP}.png', cv2.IMREAD_GRAYSCALE))
+    if binary is not None and MAP_OPEN_RECTS:
+        binary = _open_shortcut_rects(binary, MAP_OPEN_RECTS)
+    return binary
 
 
 # radius>2这个阈值是照1920x1080实测调出来的(那分辨率下get_map()截图区域正好
@@ -931,24 +1142,38 @@ def calibrate_player(map, player_position):
     像素分组, 只在**最大的那一组**里找最近点, 小碎块一律当"跟没有可走像素一样"
     忽略掉.
     """
-    walkable = (map == 255).astype(np.uint8)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(walkable, connectivity=8)
-    if num_labels <= 1:
+    pixels = _main_component_pixels(map)
+    if pixels is None:
         # 整张图一个可走像素都没有(地图没生成好/读错了文件) —— 没有"主区域"可言,
         # 原样吃老行为, 让上游(lazy_theta_star 规划失败/get_player_position 继续
         # 重试)去处理这种彻底异常的情况, 不在这里硬造一个假坐标出来.
         return player_position
-    main_label = max(range(1, num_labels), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    # 主连通区里离它最近的像素。np.nonzero 按行优先给坐标、argmin 取第一个最小值 ——
+    # 跟原来"逐行逐列扫、严格更小才换"的并列取舍一模一样。
+    ys, xs = pixels
+    d2 = (xs - player_position[0]) ** 2 + (ys - player_position[1]) ** 2
+    i = int(np.argmin(d2))
+    return (int(xs[i]), int(ys[i]))
 
-    rows, cols = map.shape
-    min_distance = float('inf')
-    nearest_walkable_position = player_position
-    for y in range(rows):
-        for x in range(cols):
-            if labels[y, x] == main_label:
-                distance = math.sqrt(
-                    (x - player_position[0])**2 + (y - player_position[1])**2)
-                if distance < min_distance:
-                    min_distance = distance
-                    nearest_walkable_position = (x, y)
-    return nearest_walkable_position
+
+# 每张地图的主连通区像素只算一次。原来 calibrate_player 每次都连通域分析 + Python 遍历
+# 9 万个像素(Mac 上 155ms), 而寻路/刷怪每 tick 都要读位置 —— 2026-09-28 第三份录像里躲究极
+# 的反应慢了 1.6 秒, 这是大头之一。load_binary_map() 每次返回新数组, 所以按内容做键。
+_MAIN_COMPONENT_CACHE = {}
+
+
+def _main_component_pixels(map):
+    key = (map.shape, hash(map.tobytes()))
+    if key not in _MAIN_COMPONENT_CACHE:
+        walkable = (map == 255).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(walkable, connectivity=8)
+        if num_labels <= 1:
+            value = None
+        else:
+            main_label = max(range(1, num_labels), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+            ys, xs = np.nonzero(labels == main_label)
+            value = (ys.astype(np.int64), xs.astype(np.int64))
+        if len(_MAIN_COMPONENT_CACHE) >= 8:
+            _MAIN_COMPONENT_CACHE.clear()
+        _MAIN_COMPONENT_CACHE[key] = value
+    return _MAIN_COMPONENT_CACHE[key]

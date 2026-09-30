@@ -124,6 +124,7 @@ _USER_AGENT = "florr-auto-pathing (github.com/greatluca666/florr-auto-farm)"
 
 _last_offset = 0
 _pause_until = 0.0
+_confirmed_since = None    # 画布确认过真弹窗的时刻; 弹窗从画面上消失就提前结束暂停
 # 上一条还没确认是真是假的"Found AFK window"的时间戳; None = 没有待确认的.
 _pending_since = None
 # 还没做过第一次真实读取 —— 用来区分"模块刚加载, 从没poll过"和"poll过, offset
@@ -172,6 +173,55 @@ def _read_new_lines():
         return []
 
 
+# florr 的挂机检测弹窗画在画布上, UI 缩放的字 —— 2026-09-20 两份实拍帧(test_frames/
+# afk_popup_20260920.json)里是「挂机检测」「将圆球拖动到终点」。只认中文客户端的字; 英文
+# 客户端的字没抓到过, 不猜 —— 那种情况下判断不了, 退回 florr-auto-afk 自己那套两段式。
+AFK_POPUP_TEXTS = ("挂机检测", "将圆球拖动到终点")
+
+# 只读 window.__canvasLog(canvas_hook.js 的缓冲, 最近几帧), 不清空。n = 缓冲里有几帧,
+# cjk = 画面上有没有中文字(= 中文客户端, 弹窗字对得上), popup = 有没有弹窗字。
+_AFK_CANVAS_JS = """(() => {
+  var log = window.__canvasLog || [], frames = {}, n = 0, cjk = false, popup = false;
+  for (var i = log.length - 1; i >= 0; i--) {
+    var r = log[i];
+    if (!frames[r.frame]) { frames[r.frame] = true; n++; }
+    if (r.op !== "text" || !r.text) continue;
+    var t = String(r.text);
+    if (t === "挂机检测" || t === "将圆球拖动到终点") popup = true;
+    if (/[\u4e00-\u9fff]/.test(t)) cjk = true;
+  }
+  return {n: n, cjk: cjk, popup: popup};
+})()"""
+
+
+def _canvas_afk_popup_once():
+    """True = 画面上有挂机检测弹窗; False = 中文客户端、画面在画、确认没有; None = 判断不了
+    (CDP 不通 / 没装 canvas hook / 缓冲刚被 drain 空 / 不是中文客户端)。"""
+    try:
+        import cdp_bridge
+        st = cdp_bridge._eval_value(_AFK_CANVAS_JS, timeout=2)
+    except Exception:
+        return None
+    if not isinstance(st, dict):
+        return None
+    if st.get("popup"):
+        return True
+    if st.get("n", 0) >= 1 and st.get("cjk"):
+        return False
+    return None
+
+
+def canvas_afk_popup(tries=3, gap=0.06):
+    """_canvas_afk_popup_once 读不出结论(多半是缓冲刚被 scan_enemies drain 空)就隔一两帧再看。"""
+    for i in range(tries):
+        seen = _canvas_afk_popup_once()
+        if seen is not None:
+            return seen
+        if i + 1 < tries:
+            time.sleep(gap)
+    return None
+
+
 def poll_afk_pause():
     """轮询一次. 发现新的"Found AFK window"事件就开一段暂停窗口; 返回当前是否
     还在暂停中. 日志文件不存在(florr-auto-afk还没启动, 或者LATEST_LOG_PATH没配对)
@@ -192,7 +242,7 @@ def poll_afk_pause():
     PAUSE_SECONDS(从最初检测到的那一刻算起, 不是从"确认为真"这一刻算起, 保证
     实际覆盖时长不缩水)。
     """
-    global _pause_until, _pending_since
+    global _pause_until, _pending_since, _confirmed_since
     now = time.time()
     provisional = min(PROVISIONAL_PAUSE_SECONDS, PAUSE_SECONDS)
     for line in _read_new_lines():
@@ -200,9 +250,31 @@ def poll_afk_pause():
             print("✅ florr-auto-afk这次是误检(未能分割出弹窗内容), 不再延长暂停")
             _pending_since = None
         elif _FOUND_MARKER in line:
+            # 先看画布: 2026-09-29 四份录像里它报的 10 次全是误报(画布里一次都没出现过
+            # 「挂机检测」), 其中一次按真弹窗在一群兵蚁中间停了 12 秒, 死了。
+            seen = canvas_afk_popup()
+            if seen is False:
+                print("✅ florr-auto-afk 报了 AFK 弹窗, 但画面上没有「挂机检测」—— 误报, 不暂停")
+                continue
+            if seen is True:
+                print(f"⏸️  florr-auto-afk 发现 AFK 弹窗, 画面上确认有「挂机检测」, 暂停让它解"
+                      f"(最多 {PAUSE_SECONDS} 秒, 弹窗一消失就恢复)")
+                _pause_until = max(_pause_until, now + PAUSE_SECONDS)
+                _confirmed_since = now
+                _pending_since = None
+                continue
             _pending_since = now
             _pause_until = max(_pause_until, now + provisional)
             print(f"⏸️  检测到florr-auto-afk发现AFK弹窗, 先暂停{provisional}秒待确认...")
+
+    # 画布确认过的真弹窗: 从画面上消失就提前恢复, 不死等 PAUSE_SECONDS
+    if _confirmed_since is not None:
+        if now >= _pause_until:
+            _confirmed_since = None
+        elif canvas_afk_popup(tries=1) is False:
+            print("✅ 挂机检测弹窗已经消失, 恢复")
+            _pause_until = now
+            _confirmed_since = None
 
     if _pending_since is not None and now - _pending_since >= provisional:
         _pause_until = max(_pause_until, _pending_since + PAUSE_SECONDS)

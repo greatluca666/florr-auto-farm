@@ -464,6 +464,25 @@ def test_scan_enemies_maps_a_two_mob_frame(monkeypatch):
     assert dets["scorpion"]["rarity"] == "Common"
 
 
+def test_scan_enemies_reports_world_positions_for_the_approach_tracker(monkeypatch):
+    monkeypatch.setattr(_ed.utils, "MAP", "desert")
+    f_old = (player_recs(0)
+             + nameplate(0, 400.0, 200.0, "Beetle", rarity="Mythic", rarity_color="#1FDBDE")
+             + [minimap_rec(0, 5640.0, 6911.0)])
+    _stub_canvas(monkeypatch, f_old + gameplay_frame(1))
+    (beetle,) = scan_enemies()
+    cam = _ed.canvas_decode.camera_from_frame(f_old, best_effort=True)
+    want = _ed.canvas_decode.mobs_from_frame(f_old, cam)[0]
+    assert beetle["world"] == (want["x"], want["y"])
+    assert _ed.last_player_world() == pytest.approx(cam["player_world"])
+
+
+def test_scan_enemies_forgets_the_player_world_when_nothing_decodes(monkeypatch):
+    monkeypatch.setattr(_ed, "_last_player_world", (1.0, 2.0))
+    _stub_canvas(monkeypatch, [])
+    assert scan_enemies() == [] and _ed.last_player_world() is None
+
+
 def test_scan_enemies_drops_non_desert_names(monkeypatch):
     monkeypatch.setattr(_ed.utils, "MAP", "desert")
     f_old = gameplay_frame(0, mobs=[(400.0, 200.0, "Ladybug", 1.0)])
@@ -619,6 +638,12 @@ def test_species_supported_desert_and_anthell_only():
     assert _ed.species_supported("ocean") is False
     assert _ed.species_supported("nope") is False
     assert _ed.species_supported(None) is False
+
+
+@pytest.mark.parametrize("name", ["garden", "ocean", "jungle", "sewers", "factory"])
+def test_maps_without_a_species_table_have_enemy_ai_off(name):
+    assert _ed.species_supported(name) is False
+    assert _ed.MAP_SPECIES[name] == frozenset()      # 显式登记成空集: "还没做索敌"是有意的
 
 
 def test_species_from_name_still_works_on_desert():
@@ -1128,3 +1153,239 @@ def test_chase_move_target_circles_a_worm_on_top_of_you_somewhere():
     # 蠕虫正好在脚下(距离 0, 方向没定义): 也不能停.
     tgt = _det("worm", "Mythic", (960, 540))
     assert _ed.chase_move_target(tgt, 80, center=(960, 540), max_extend=500) != (960, 540)
+
+
+# ── 究极冲过来 400px 就躲 (用户 2026-09-28) ─────────────────────────────────
+# 录像: 究极兵蚁追人 ≈ 自己的速度(~300 世界单位/秒), 200px 才起跑甩不掉。用户定:
+# 400px 内且正在朝你冲过来就躲; 站着 / 闲逛的不管; 200px 内一律躲。
+
+def _ultra(world, screen=(1300, 540), species="soldier_ant"):
+    return dict(_det(species, "Ultra", screen), world=world)
+
+
+def test_tracker_flags_an_ultra_closing_in():
+    tr = _ed.ApproachTracker()
+    me = (0.0, 0.0)
+    marks = []
+    for i, x in enumerate([900.0, 830.0, 760.0, 690.0]):          # 每 0.12s 近 70 = 580/s
+        d = _ultra((x, 0.0))
+        tr.update([d], me, 10.0 + 0.12 * i)
+        marks.append(d["approaching"])
+    assert marks == [False, False, False, True]     # 攒够 APPROACH_WINDOW_S 才下结论
+
+
+def test_tracker_ignores_an_idle_or_retreating_ultra():
+    tr = _ed.ApproachTracker()
+    for i in range(6):
+        idle = _ultra((800.0 + (i % 2) * 5, 0.0))                    # 原地抖
+        away = _ultra((0.0, 600.0 + 60 * i), screen=(960, 900))      # 越走越远
+        tr.update([idle, away], (0.0, 0.0), 10.0 + 0.12 * i)
+    assert idle["approaching"] is False and away["approaching"] is False
+
+
+def test_tracker_counts_us_walking_into_it_as_closing():
+    # 相对距离缩短就算 —— 自己朝一只站着的究极走过去也该躲
+    tr = _ed.ApproachTracker()
+    for i in range(5):
+        d = _ultra((900.0, 0.0))
+        tr.update([d], (70.0 * i, 0.0), 10.0 + 0.12 * i)
+    assert d["approaching"] is True
+
+
+def test_tracker_keeps_two_ultras_apart():
+    tr = _ed.ApproachTracker()
+    for i in range(5):
+        a = _ultra((900.0 - 70 * i, 0.0))                   # 冲过来
+        b = _ultra((0.0, 900.0), screen=(960, 940))         # 不动
+        tr.update([b, a], (0.0, 0.0), 10.0 + 0.12 * i)
+    assert a["approaching"] is True and b["approaching"] is False
+
+
+def test_tracker_leaves_non_avoid_mobs_alone():
+    tr = _ed.ApproachTracker()
+    for i in range(5):
+        d = dict(_det("soldier_ant", "Mythic", (1300, 540)), world=(900.0 - 70 * i, 0.0))
+        tr.update([d], (0.0, 0.0), 10.0 + 0.12 * i)
+    assert d["approaching"] is False
+
+
+def test_tracker_without_world_positions_marks_nothing():
+    tr = _ed.ApproachTracker()
+    d = _det("soldier_ant", "Ultra", (1300, 540))
+    tr.update([d], None, 10.0)
+    assert d["approaching"] is False
+
+
+def test_select_action_flees_a_charging_ultra_inside_the_early_radius():
+    d = dict(_det("soldier_ant", "Ultra", (960 + 350, 540)), approaching=True)
+    action, where = _nearest([d], avoid_trigger_px=200, avoid_early_px=400)
+    assert action == "flee" and where == [(1310, 540)]
+
+
+def test_select_action_ignores_an_idle_ultra_between_the_radii():
+    d = dict(_det("soldier_ant", "Ultra", (960 + 350, 540)), approaching=False)
+    action = _nearest([d], avoid_trigger_px=200, avoid_early_px=400)[0]
+    assert action != "flee"
+
+
+def test_select_action_early_radius_is_off_by_default():
+    d = dict(_det("soldier_ant", "Ultra", (960 + 350, 540)), approaching=True)
+    assert _nearest([d], avoid_trigger_px=200)[0] != "flee"
+
+
+def test_early_flee_is_anthell_only():
+    assert _ed.avoid_early_px_for("anthell") == 400
+    assert _ed.avoid_early_px_for("desert") is None
+
+
+# ── 300~600px 的怪: 看得见、走得到就追 (2026-09-29, 用户: 刷怪时怪"看不见") ──────────
+# 录像: 刷怪时 14~22% 的拍子在漫游, 其中 85% 以上最近的可打怪在 300~600px, 画面上看得见。
+# 300px 的上限是当初怕"隔着墙 / 出了刷怪带"加的 —— 现在由调用方给 can_reach 判这两件事。
+
+def test_far_mob_is_chased_when_reachable():
+    d = _det("soldier_ant", "Mythic", (960 + 450, 540))
+    action, target, _, _ = _nearest([d], can_reach=lambda det: True)
+    assert action == "chase" and target is d
+
+
+def test_far_mob_behind_a_wall_is_still_ignored():
+    d = _det("soldier_ant", "Mythic", (960 + 450, 540))
+    assert _nearest([d], can_reach=lambda det: False)[0] == "wander"
+
+
+def test_far_chase_needs_a_reach_check():
+    d = _det("soldier_ant", "Mythic", (960 + 450, 540))
+    assert _nearest([d])[0] == "wander"                    # 没给 can_reach = 老行为
+
+
+def test_far_chase_has_an_outer_limit():
+    d = _det("soldier_ant", "Mythic", (960 + _ed.ANTHELL_FAR_CHASE_PX + 30, 540))
+    assert _nearest([d], can_reach=lambda det: True)[0] == "wander"
+
+
+def test_near_mobs_do_not_ask_can_reach():
+    d = _det("soldier_ant", "Mythic", (960 + 200, 540))
+    action = _nearest([d], can_reach=lambda det: pytest.fail("近的不用问"))[0]
+    assert action == "chase"
+
+
+def test_a_near_mob_still_beats_a_farther_reachable_one():
+    near = _det("worker_ant", "Mythic", (960 + 250, 540))
+    far = _det("worker_ant", "Mythic", (960 + 500, 540))
+    _, target, _, _ = _nearest([far, near], can_reach=lambda det: True)
+    assert target is near
+
+
+# ── 刷怪区外的怪不追 (第四份录像: 8 次出区, 全是追着带边/带外 300px 内的怪出去的) ─────
+
+def test_mob_outside_the_farming_area_is_not_chased():
+    out = dict(_det("soldier_ant", "Mythic", (960 + 200, 540)), where="out")
+    inside = dict(_det("soldier_ant", "Mythic", (960, 540 + 280)), where="in")
+    _, target, _, _ = _nearest([out, inside], in_area=lambda d: d["where"] == "in")
+    assert target is inside
+
+
+def test_mob_outside_the_area_already_in_our_face_is_still_fought():
+    # 已经贴到停步半径里(正在打)的不管在不在区里 —— 站着打, 不会被带出去
+    out = dict(_det("soldier_ant", "Mythic", (960 + 80, 540)), where="out")
+    action, target, _, _ = _nearest([out], in_area=lambda d: False)
+    assert action == "chase" and target is out
+
+
+def test_swarm_outside_the_area_is_not_chased():
+    dets = [dict(d, where="out") for d in _swarm_at(1300, 540, _ed.SWARM_MIN_COUNT)]
+    assert _nearest(dets, in_area=lambda d: False)[0] == "wander"
+
+
+def test_in_area_is_optional():
+    d = _det("soldier_ant", "Mythic", (960 + 200, 540))
+    assert _nearest([d])[0] == "chase"
+
+
+# ── 躲究极时要绕开的怪群(flee_planner 的 crowd) ─────────────────────────────
+
+@pytest.mark.parametrize("species, rarity, want", [
+    ("soldier_ant", "Legendary", True),     # 第五份录像: 撞进 12~14 只传奇兵蚁里死的
+    ("soldier_ant", "Mythic", True),
+    ("worker_ant", "Mythic", True),
+    ("soldier_ant", "Epic", False),         # 史诗以下不绕
+    ("baby_ant", "Mythic", False),          # 被动
+    ("ant_egg", "Legendary", False),        # 不动
+    ("soldier_ant", "Ultra", False),        # 究极是追兵, 不是怪群
+])
+def test_flee_crowd_is_legendary_and_up_that_fights_back(species, rarity, want):
+    assert _ed.is_flee_crowd({"species": species, "rarity": rarity}) is want
+
+
+# ── 钩子装没装隔 2 秒才查一次: 每次 CDP ~56ms, 原来每拍扫描 3 次调用(第六份录像每拍近 1 秒) ──
+
+def _hook_env(monkeypatch, drains):
+    calls = {"inject": 0}
+    monkeypatch.setattr(_ed, "_hook_checked_at", float("-inf"))
+    monkeypatch.setattr(_ed.cdp_bridge, "inject_canvas_hook",
+                        lambda *a, **k: calls.__setitem__("inject", calls["inject"] + 1))
+    seq = iter(drains)
+    monkeypatch.setattr(_ed.cdp_bridge, "drain_canvas_log", lambda *a, **k: next(seq))
+    clock = {"t": 100.0}
+    monkeypatch.setattr(_ed.time, "time", lambda: clock["t"])
+    return calls, clock
+
+
+def test_scan_checks_the_hook_only_every_couple_of_seconds(monkeypatch):
+    frames = [{"frame": 1, "op": "x"}, {"frame": 2, "op": "x"}]
+    calls, clock = _hook_env(monkeypatch, [list(frames) for _ in range(10)])
+    for _ in range(5):
+        _ed.scan_enemies()
+        clock["t"] += 0.12
+    assert calls["inject"] == 1
+    clock["t"] += _ed.HOOK_CHECK_S
+    _ed.scan_enemies()
+    assert calls["inject"] == 2
+
+
+def test_scan_rechecks_the_hook_right_after_an_empty_drain(monkeypatch):
+    # 页面 reload 了: 钩子没了, 日志读出来是空的 -> 下一拍马上重注, 不等 2 秒
+    frames = [{"frame": 1, "op": "x"}, {"frame": 2, "op": "x"}]
+    calls, clock = _hook_env(monkeypatch, [list(frames), [], list(frames)])
+    _ed.scan_enemies()
+    clock["t"] += 0.12
+    _ed.scan_enemies()
+    clock["t"] += 0.12
+    _ed.scan_enemies()
+    assert calls["inject"] == 2
+
+
+def test_swarm_next_to_you_wins_over_a_bigger_one_far_away():
+    # 第六份录像 02:10:27: 身边 7 只, 左边 870px 外一堆 11 只 -> 挑了远的, 嫌远不去, 退回追单只
+    near = [{"species": "soldier_ant", "rarity": "Mythic", "screen_pos": (960 + 70 * math.cos(a),
+                                                                       540 + 70 * math.sin(a)),
+             "bbox": (0, 0, 0, 0), "confidence": 1.0} for a in [i * 0.9 for i in range(7)]]
+    far = [{"species": "soldier_ant", "rarity": "Legendary", "screen_pos": (90 + 20 * i, 400),
+            "bbox": (0, 0, 0, 0), "confidence": 1.0} for i in range(11)]
+    act = _ed.select_action(near + far, avoid_trigger_px=200, cautious_hold_px=500,
+                            center=(960, 540), target_policy="nearest")
+    assert act[0] == "swarm" and act[1]["count"] == 7
+
+
+def test_swarm_right_next_to_you_wins_over_a_bigger_one_a_bit_further():
+    # 第六份录像 02:10:27 修完远近后又一拍: 370px 外一堆 7 只, 贴身(76px)那堆 5 只 -> 去遛远的
+    def ant(x, y):
+        return {"species": "soldier_ant", "rarity": "Mythic", "screen_pos": (x, y),
+                "bbox": (0, 0, 0, 0), "confidence": 1.0}
+    close = [ant(960 + 76 + 30 * i, 540) for i in range(5)]
+    bigger = [ant(960 - 370 - 25 * i, 540 + 10 * (i % 2)) for i in range(7)]
+    sw = _ed.find_swarm(close + bigger, (960, 540), max_center_px=600, prefer_near=True)
+    assert sw["count"] == 5 and sw["nearest"] == (1036, 540)
+    # 不开 prefer_near 还是老规矩(只数多的赢), 别的调用方不受影响
+    assert _ed.find_swarm(close + bigger, (960, 540), max_center_px=600)["count"] == 7
+
+
+def test_select_action_kites_the_pile_next_to_you():
+    def ant(x, y):
+        return {"species": "soldier_ant", "rarity": "Mythic", "screen_pos": (x, y),
+                "bbox": (0, 0, 0, 0), "confidence": 1.0}
+    close = [ant(960 + 76 + 30 * i, 540) for i in range(5)]
+    bigger = [ant(960 - 370 - 25 * i, 540 + 10 * (i % 2)) for i in range(7)]
+    act = _ed.select_action(close + bigger, avoid_trigger_px=200, cautious_hold_px=500,
+                            center=(960, 540), target_policy="nearest")
+    assert act[0] == "swarm" and act[1]["nearest"] == (1036, 540)

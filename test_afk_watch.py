@@ -19,6 +19,9 @@ def _reset(monkeypatch, log_path):
     monkeypatch.setattr(afk_watch, "_initialized", True)
     monkeypatch.setattr(afk_watch, "_warned_unreadable", False)
     monkeypatch.setattr(afk_watch, "_pending_since", None)
+    monkeypatch.setattr(afk_watch, "_confirmed_since", None)
+    # 画布确认默认"判断不了" —— 老用例测的就是没有画布信号时的两段式行为
+    monkeypatch.setattr(afk_watch, "canvas_afk_popup", lambda **k: None)
 
 
 def test_poll_afk_pause_false_when_log_file_missing(tmp_path, monkeypatch):
@@ -961,3 +964,76 @@ def test_download_florr_auto_afk_delegates_without_prompting(monkeypatch):
     monkeypatch.setattr(afk_watch, "_prompt_download_confirm",
                         lambda: (_ for _ in ()).throw(AssertionError("不该问确认")))
     assert afk_watch.download_florr_auto_afk() is True
+
+
+
+# ── 画布确认 AFK 弹窗 (2026-09-29): 四份录像里 florr-auto-afk 报的 10 次"发现 AFK 弹窗"
+#    全是误报 —— 画布里一次都没出现过「挂机检测」; 其中一次没等到它自己的误检标记, 按真
+#    弹窗在一群兵蚁中间停了 12 秒, 死了。真弹窗的字来自 afk_20260920-*.json 两份实拍帧。 ──
+
+_FOUND = "[2026-09-29 00:00:00] <segment.py:127> <afk_thread()> EVENT: Found AFK window\n"
+
+
+def test_found_but_the_canvas_shows_no_popup_does_not_pause(tmp_path, monkeypatch):
+    log_path = tmp_path / "latest.log"
+    log_path.write_text(_FOUND)
+    _reset(monkeypatch, log_path)
+    monkeypatch.setattr(afk_watch, "canvas_afk_popup", lambda **k: False)
+    assert afk_watch.poll_afk_pause() is False
+
+
+def test_found_and_the_canvas_shows_the_popup_pauses_until_it_is_gone(tmp_path, monkeypatch):
+    log_path = tmp_path / "latest.log"
+    log_path.write_text(_FOUND)
+    _reset(monkeypatch, log_path)
+    state = {"popup": True}
+    monkeypatch.setattr(afk_watch, "canvas_afk_popup", lambda **k: state["popup"])
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(afk_watch.time, "time", lambda: clock["t"])
+    assert afk_watch.poll_afk_pause() is True
+    clock["t"] += 3.0
+    assert afk_watch.poll_afk_pause() is True           # 还在
+    state["popup"] = False                              # florr-auto-afk 解完了
+    clock["t"] += 0.5
+    assert afk_watch.poll_afk_pause() is False          # 不用等满 12 秒
+
+
+def test_confirmed_popup_still_has_the_full_pause_as_a_ceiling(tmp_path, monkeypatch):
+    log_path = tmp_path / "latest.log"
+    log_path.write_text(_FOUND)
+    _reset(monkeypatch, log_path)
+    monkeypatch.setattr(afk_watch, "canvas_afk_popup", lambda **k: True)   # 一直在(解不掉)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(afk_watch.time, "time", lambda: clock["t"])
+    assert afk_watch.poll_afk_pause() is True
+    clock["t"] += afk_watch.PAUSE_SECONDS + 0.1
+    assert afk_watch.poll_afk_pause() is False
+
+
+def test_canvas_check_unavailable_keeps_the_old_two_stage_pause(tmp_path, monkeypatch):
+    log_path = tmp_path / "latest.log"
+    log_path.write_text(_FOUND)
+    _reset(monkeypatch, log_path)                        # canvas_afk_popup -> None
+    assert afk_watch.poll_afk_pause() is True
+    assert afk_watch._pending_since is not None
+
+
+def test_canvas_afk_popup_reads_the_page(monkeypatch):
+    import cdp_bridge
+    answers = iter([{"n": 3, "cjk": True, "popup": True},
+                    {"n": 3, "cjk": True, "popup": False},
+                    {"n": 3, "cjk": False, "popup": False},     # 英文客户端: 字对不上, 不敢说没有
+                    {"n": 0, "cjk": False, "popup": False},     # 缓冲刚被 drain 空
+                    None])
+    monkeypatch.setattr(cdp_bridge, "_eval_value", lambda js, timeout=5: next(answers))
+    got = [afk_watch._canvas_afk_popup_once() for _ in range(5)]
+    assert got == [True, False, None, None, None]
+
+
+def test_canvas_afk_popup_survives_cdp_errors(monkeypatch):
+    import cdp_bridge
+
+    def boom(js, timeout=5):
+        raise ConnectionError("x")
+    monkeypatch.setattr(cdp_bridge, "_eval_value", boom)
+    assert afk_watch._canvas_afk_popup_once() is None

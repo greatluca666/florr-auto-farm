@@ -113,13 +113,111 @@ def test_camera_resolves_self_when_other_players_level_text_is_orphaned():
     recs = list(player_recs(0, 700.0, 470.0))
     recs += [_gold_body(700.0, 470.0)]                     # self
     recs += [_gold_body(200.0, 110.0)]                     # other player, same radius
-    recs += ([text_rec(0, 178.0, 131.0, "108级")] * 2)     # their level label, near their body
+    # their level label, where florr draws it: body + (0.39, 2.40) × radius (2026-09-28 录像实测)
+    recs += ([text_rec(0, 200.0 + 0.39 * 7.4, 110.0 + 2.4 * 7.4, "108级")] * 2)
     recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)        # a mob (gives zoom + a nameplate)
     recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
     recs += [minimap_rec(0, 5000.0, 6000.0)]
 
     cam = camera_from_frame(recs)
     assert cam["player_screen"] == (700.0, 470.0)
+
+
+def _label_for(x, y, r=7.4):
+    """别的玩家的等级字画在哪: 身体 + (0.39, 2.40) × 半径 (2026-09-28 录像 4142/4150 条)."""
+    return (x + 0.39 * r, y + 2.4 * r)
+
+
+def _self_and_other_frame(other_r, label_at, self_r=7.4):
+    recs = [_gold_body(700.0, 470.0, r=self_r)]             # 自己(没有等级字)
+    recs += [_gold_body(760.0, 470.0, r=other_r)]           # 另一个玩家, 就在旁边
+    recs += ([text_rec(0, label_at[0], label_at[1], "127级")] * 2)
+    recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)
+    recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    return recs
+
+
+def test_camera_excludes_a_labelled_body_even_when_it_is_the_largest():
+    # 2026-09-28 蚁穴: 别人的身体半径因浮点噪声大了 1e-5, 旧逻辑把它当唯一"最大"选中。
+    recs = _self_and_other_frame(other_r=7.4 + 1.5e-5, label_at=_label_for(760.0, 470.0))
+    assert camera_from_frame(recs)["player_screen"] == (700.0, 470.0)
+
+
+def test_camera_matches_a_label_by_where_florr_draws_it_not_by_distance():
+    # 2026-09-28 录像: 别人几乎站在自己身上, 他的「127级」离**自己**的身体只有 5px, 离他
+    # 自己的身体反而 25px。按"最近"认领会把自己排除掉。
+    recs = [_gold_body(960.0, 540.0), _gold_body(964.0, 517.0)]
+    recs += ([text_rec(0, *_label_for(964.0, 517.0), "127级")] * 2)
+    recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)
+    recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    assert camera_from_frame(recs)["player_screen"] == (960.0, 540.0)
+
+
+def test_camera_hud_level_text_does_not_claim_a_body():
+    # 左上角头像卡上自己的「121级」画在 UI 缩放上 —— 就算正好落在身体下方也不算
+    recs = [_gold_body(700.0, 470.0)]
+    recs += ([text_rec(0, *_label_for(700.0, 470.0), "121级", scale=1.25)] * 2)
+    recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)
+    recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    assert camera_from_frame(recs)["player_screen"] == (700.0, 470.0)
+
+
+def test_camera_radius_ties_tolerate_float_noise_but_not_real_size_differences():
+    # 没有等级字可认时, 半径差 1e-5 算一样大(走 tie-break), 差 20% 才是真的更大
+    recs = _self_and_other_frame(other_r=7.4 * 1.2, label_at=(5000.0, 5000.0))
+    assert camera_from_frame(recs)["player_screen"] == (760.0, 470.0)
+
+
+def test_camera_float_noise_radius_goes_to_the_tie_break():
+    # 两个都没等级字(别人的没抓到), 半径只差 1.5e-5: 不能让"大一点点"的那个直接赢, 得走
+    # tie-break(离怪群血条中心近的是自己)。
+    recs = [_gold_body(700.0, 470.0, r=7.4), _gold_body(1300.0, 470.0, r=7.4 + 1.5e-5)]
+    recs += healthbar_recs(0, 650.0, 520.0, hp=1.0)
+    recs += _labelled(650.0, 520.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    assert camera_from_frame(recs)["player_screen"] == (700.0, 470.0)
+
+
+def _ring(x, y, body_r=7.4, ratio=1.128):
+    r = body_r * ratio
+    return {"frame": 0, "op": "fill", "x": x, "y": y, "r": r, "bbox": [x - r, y - r, x + r, y + r],
+            "n": 1, "fill": "#CFBB50", "stroke": None, "lw": None, "alpha": 1,
+            "m": [ZOOM, 0, 0, ZOOM, x, y]}
+
+
+def test_camera_prefers_bodies_with_the_flower_outline_ring():
+    # 真花身前面画一圈 1.128 倍半径的描边; 同色(或"往红闪"放宽色)却没有描边圈的大圆不是花
+    recs = [_ring(700.0, 470.0), _gold_body(700.0, 470.0)]
+    blob = _gold_body(300.0, 300.0, r=30.0)
+    blob["fill"] = "#FFE51C"
+    recs += [blob]
+    recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)
+    recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    assert camera_from_frame(recs)["player_screen"] == (700.0, 470.0)
+
+
+def test_camera_without_any_ringed_body_falls_back_to_all_candidates():
+    # 老帧 / 合成帧里没有描边圈时, 行为不变
+    recs = [_gold_body(700.0, 470.0)]
+    recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)
+    recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    assert camera_from_frame(recs)["player_screen"] == (700.0, 470.0)
+
+
+def test_camera_never_picks_a_body_that_owns_a_level_label():
+    # 只剩一个候选, 而它头顶挂着等级字 = 那是别人; 自己的花身这一帧没认出来。
+    recs = [_gold_body(200.0, 110.0)]
+    recs += ([text_rec(0, *_label_for(200.0, 110.0), "108级")] * 2)
+    recs += healthbar_recs(0, 900.0, 700.0, hp=1.0)
+    recs += _labelled(900.0, 700.0, "Sandstorm", "Legendary", "#DE1F1F")
+    recs += [minimap_rec(0, 5000.0, 6000.0)]
+    with pytest.raises(ValueError, match="player_screen"):
+        camera_from_frame(recs)
 
 
 def _bare_hp_bar(frame, ax, ay, hp=1.0):
@@ -482,14 +580,19 @@ def test_zone_map_reads_the_zone_label():
     assert zone_map_from_frame(recs) == "anthell"
     recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "沙漠", scale=1.0)] * 2
     assert zone_map_from_frame(recs) == "desert"
+    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "下水道", scale=1.0)] * 2
+    assert zone_map_from_frame(recs) == "sewers"      # 中文译名是猜的, 没在实机帧里见过
+    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "工厂", scale=1.0)] * 2
+    assert zone_map_from_frame(recs) == "factory"
 
 
 def test_zone_map_is_none_without_a_known_label():
     from canvas_decode import zone_map_from_frame
     assert zone_map_from_frame(gameplay_frame(0)) is None
     assert zone_map_from_frame([]) is None
-    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "花园", scale=1.0)] * 2
-    assert zone_map_from_frame(recs) is None    # 花园的字样没在实机上核对过, 不猜
+    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "海洋", scale=1.0)] * 2
+    assert zone_map_from_frame(recs) is None    # 海洋的字样没在实机上核对过, 不猜
+    # (花园 2026-09-30 第六份录像实机核对过了, 见 test_zone_label_garden_...)
 
 
 def test_zone_map_ignores_a_mob_or_player_named_like_a_zone():
@@ -498,3 +601,29 @@ def test_zone_map_ignores_a_mob_or_player_named_like_a_zone():
     recs = (gameplay_frame(0) + healthbar_recs(0, 400.0, 300.0)
             + [text_rec(0, 400.0, 330.0, "蚂蚁地狱")] * 2)   # scale=ZOOM = 名牌那个缩放
     assert zone_map_from_frame(recs) is None
+
+
+def _minimap_dot(scale, fill="#FFE763"):
+    return {"frame": 0, "op": "fill", "fill": fill, "r": 3.0, "x": 0.0, "y": 0.0,
+            "m": [scale, 0.0, 0.0, scale, 1600 + 1000 * scale, 20 + 1000 * scale]}
+
+
+def test_minimap_scale_is_read_from_the_self_dot():
+    from canvas_decode import minimap_scale_from_frame
+    assert minimap_scale_from_frame([_minimap_dot(0.00624)]) == 0.00624
+
+
+def test_minimap_scale_ignores_world_scale_draws_and_other_colours():
+    from canvas_decode import minimap_scale_from_frame
+    world_dot = _minimap_dot(0.76)                 # 世界里的金色圆(自己的花身): 缩放 0.76, 不是小地图
+    other = _minimap_dot(0.00624, fill="#FF0000")   # 小地图上别的东西
+    assert minimap_scale_from_frame([world_dot, other]) is None
+    assert minimap_scale_from_frame([]) is None
+
+
+def test_zone_label_garden_is_the_hud_text_not_the_title_screen_button():
+    hud = [{"op": "text", "text": "花园", "m": [1, 0, 0, 1, 0, 0], "x": 1750, "y": 330}]
+    title = [{"op": "text", "text": "　花园　", "m": [1, 0, 0, 1, 0, 0], "x": 861, "y": 599}]
+    from canvas_decode import zone_map_from_frame
+    assert zone_map_from_frame(hud) == "garden"
+    assert zone_map_from_frame(title) is None

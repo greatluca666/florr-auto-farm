@@ -13,10 +13,12 @@ def cfg_path(tmp_path, monkeypatch):
     return p
 
 
-def test_gui_enabled_maps_has_desert_and_anthell_but_valid_maps_untouched():
-    # 蚁穴解锁(进场路线见 map_routes.py); ocean 仍然只在 coerce 层认, GUI 不给选.
-    assert app_config._GUI_ENABLED_MAPS == ("desert", "anthell")
-    assert app_config._VALID_MAPS == ("desert", "ocean", "anthell")
+_ALL_MAPS = ("garden", "desert", "ocean", "jungle", "anthell", "sewers", "factory")
+
+
+def test_every_supported_map_is_valid_and_selectable_in_the_gui():
+    assert app_config._VALID_MAPS == _ALL_MAPS
+    assert app_config._GUI_ENABLED_MAPS == _ALL_MAPS
     assert set(app_config._GUI_ENABLED_MAPS).issubset(app_config._VALID_MAPS)
 
 

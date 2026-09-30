@@ -387,11 +387,31 @@ def _eval_value(expression, timeout=5):
     return resp.get("result", {}).get("result", {}).get("value")
 
 
+# 读空日志, 只带最新 DRAIN_FRAMES 帧回来, 而且在页面里 JSON.stringify 成一个字符串。
+# 第七份录像: 刷怪主循环每拍 1.2~1.6 秒, 其中"索敌"占 0.9~1.3 秒, 而解码一帧只要 ~2ms ——
+# 慢在这里: returnByValue 要 Chrome 把日志里最多 5 帧、上千个对象逐个转成协议格式(每帧 65~150KB)。
+# 调用方(scan_enemies / 贴洞口 / 认区域名)只看次新那一帧(最新那帧可能还在画), 2 帧就够。
+# 字符串走 returnByValue 只是一个原始值, JSON.stringify 是原生的, 两头都快。
+DRAIN_FRAMES = 2
+_DRAIN_JS = """(() => {
+  var l = window.__canvasLog || [];
+  window.__canvasLog = [];
+  if (!l.length) return "[]";
+  var keep = l[l.length - 1].frame - (%d - 1), i = l.length;
+  while (i > 0 && l[i - 1].frame >= keep) i--;
+  return JSON.stringify(i ? l.slice(i) : l);
+})()""" % DRAIN_FRAMES
+
+
 def drain_canvas_log(timeout=5):
-    """读空 window.__canvasLog(canvas_hook.js 往里塞每帧的绘制记录), 返回记录列表.
-    一次 Runtime.evaluate 里读 + 清, 中间不会漏帧. 拿不到 → []."""
-    v = _eval_value(
-        "(()=>{const l=window.__canvasLog||[];window.__canvasLog=[];return l;})()", timeout)
+    """读空 window.__canvasLog(canvas_hook.js 往里塞每帧的绘制记录), 返回最新 DRAIN_FRAMES
+    帧的记录列表. 一次 Runtime.evaluate 里读 + 清, 中间不会漏帧. 拿不到 → []."""
+    v = _eval_value(_DRAIN_JS, timeout)
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return []
     return v if isinstance(v, list) else []
 
 

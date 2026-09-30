@@ -33,7 +33,8 @@ DANGER_HOVER = "#c43a3f"
 WARN = "#f0a020"
 LOG_BG = "#0f1115"
 
-MAP_LABELS = {"desert": "沙漠", "ocean": "海洋", "anthell": "蚁狱"}
+MAP_LABELS = {"garden": "花园", "desert": "沙漠", "ocean": "海洋", "jungle": "丛林",
+              "anthell": "蚁狱", "sewers": "下水道", "factory": "工厂"}
 
 
 def map_label(name):
@@ -114,11 +115,43 @@ def set_entry_enabled(entry, enabled):
                     text_color=TEXT if enabled else FAINT)
 
 
+# 屏幕下沿给任务栏 / Dock 留的余量(逻辑像素). winfo_screenheight 报的是整块屏幕,
+# 不扣任务栏 —— 1080p + Windows 任务栏 ≈ 只剩 1040 可用.
+_SCREEN_MARGIN_BOTTOM = 90
+_SCREEN_MARGIN_SIDE = 20
+
+
+def fit_geometry(w, h, parent_box, screen, margin_bottom=_SCREEN_MARGIN_BOTTOM):
+    """算一个弹窗的 (w, h, x, y): 先居中到 parent 上, 再整个夹进屏幕可用区.
+    所有量用同一种单位(调用方负责把物理像素除以 DPI 缩放). 纯函数, 好单测.
+
+    以前只做了 x/y >= 0, 窗口尺寸写死 —— 时块编辑窗 780 高, Windows 上 125%/150%
+    缩放 + 任务栏时超出屏幕, 底部的「保存 / 取消」整条掉到屏幕外面点不到."""
+    px, py, pw, ph = parent_box
+    sw, sh = screen
+    w = max(1, min(w, sw - 2 * _SCREEN_MARGIN_SIDE))
+    h = max(1, min(h, sh - margin_bottom))
+    x = px + (pw - w) // 2
+    y = py + (ph - h) // 2
+    x = max(0, min(x, sw - w))
+    y = max(0, min(y, sh - margin_bottom - h))
+    return int(w), int(h), int(x), int(y)
+
+
 def center_on(win, parent, w, h):
-    """把 Toplevel 摆到 parent 正中(而不是 Tk 默认的屏幕左上角)."""
+    """把 Toplevel 摆到 parent 正中(而不是 Tk 默认的屏幕左上角), 并保证整个窗口
+    落在屏幕可用区里. w/h 是 CTk 的逻辑像素(会被 DPI 缩放放大)."""
     parent.update_idletasks()
-    px, py = parent.winfo_rootx(), parent.winfo_rooty()
-    pw, ph = parent.winfo_width(), parent.winfo_height()
-    x = max(0, px + (pw - w) // 2)
-    y = max(0, py + (ph - h) // 2)
+    # CTk 的 geometry() 会把整串 "WxH+X+Y" 按缩放系数放大, 所以这里全部换成逻辑单位;
+    # winfo_* 报的是物理像素.
+    scale = 1.0
+    try:
+        scale = float(win._get_window_scaling()) or 1.0
+    except Exception:
+        pass
+    box = (parent.winfo_rootx() / scale, parent.winfo_rooty() / scale,
+           parent.winfo_width() / scale, parent.winfo_height() / scale)
+    screen = (win.winfo_screenwidth() / scale, win.winfo_screenheight() / scale)
+    w, h, x, y = fit_geometry(w, h, box, screen)
     win.geometry(f"{w}x{h}+{x}+{y}")
+    return w, h

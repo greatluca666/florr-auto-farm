@@ -1,4 +1,6 @@
 import hashlib
+import shutil
+import subprocess
 import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -334,6 +336,30 @@ def test_drain_canvas_log_unwraps_and_clears():
 def test_drain_canvas_log_returns_empty_on_bad_shape():
     with patch("cdp_bridge._send_cdp_command", return_value={"id": 1, "result": {}}):
         assert cdp_bridge.drain_canvas_log() == []
+    with patch("cdp_bridge._send_cdp_command", return_value=_eval_result("{not json")):
+        assert cdp_bridge.drain_canvas_log() == []
+
+
+def test_drain_canvas_log_decodes_the_json_string_the_page_sends():
+    # 页面里 JSON.stringify 过的: returnByValue 拿回来是一个字符串(第七份录像: 逐个对象转
+    # 协议格式让"索敌"每拍 ~1 秒)
+    with patch("cdp_bridge._send_cdp_command",
+               return_value=_eval_result('[{"frame": 7, "op": "fill"}]')):
+        assert cdp_bridge.drain_canvas_log() == [{"frame": 7, "op": "fill"}]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="没装 node")
+def test_drain_js_sends_only_the_newest_two_frames_as_a_string_and_clears(tmp_path):
+    log = [{"frame": f, "op": "fill", "x": i} for f in (3, 4, 5, 6) for i in range(3)]
+    f = tmp_path / "t.js"
+    f.write_text(f"globalThis.window = {{__canvasLog: {json.dumps(log)}}};\n"
+                 f"var out = {cdp_bridge._DRAIN_JS};\n"
+                 f"console.log(JSON.stringify([typeof out, JSON.parse(out), window.__canvasLog]));",
+                 encoding="utf-8")
+    r = subprocess.run([shutil.which("node"), str(f)], capture_output=True, text=True)
+    kind, got, left = json.loads(r.stdout)
+    assert kind == "string" and left == []
+    assert [x["frame"] for x in got] == [5, 5, 5, 6, 6, 6]
 
 
 def test_inject_canvas_hook_noop_when_matching_version_installed():

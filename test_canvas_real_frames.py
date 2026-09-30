@@ -210,6 +210,63 @@ def test_what_counts_as_our_body_color(color, ok):
     assert cd._is_self_body_color(color) is ok
 
 
+# ── 左上角头像卡上的血量/护甲 ────────────────────────────────────────────────
+#
+# 用户(2026-09-24)指出: 左上角有自己的血量。它画在固定位置、不会被怪挤住, 也不用先在
+# 世界里找到自己的花身。画法跟世界里的名牌血条不同 —— 没有 #222222 底色, 只有红色
+# 残影 #DD3434 + 当前血量(绿), 所以原来的 _bar_blocks 根本不认它。
+# 满长 = 2 × (锚点 x - 起点 x): 实拍 163px, 两帧读数跟脚下血条对得上(0.748/0.749、
+# 0.834/0.837)。
+
+
+def _hud(value_right, *, shield=None, bg=False, avatar_y=110.0):
+    """合成一张左上角头像卡: 锚点 (197.5, 110), 起点 116 -> 满长 163。"""
+    m = [1.25, 0, 0, 1.25, 197.5, 110.0]
+    am = [1.25, 0, 0, 1.25, 60.0, avatar_y]
+    recs = [{"op": "fill", "fill": "#CFBB50", "r": 33.125, "m": am},     # 描边圈
+            {"op": "fill", "fill": "#FFE763", "r": 29.375, "m": am}]     # 身体圈
+    if bg:
+        recs.append({"op": "stroke", "stroke": "#222222", "m": m, "bbox": [116, 110, 279, 110]})
+    recs += [{"op": "stroke", "stroke": "#DD3434", "m": m, "bbox": [116, 110, 279, 110]},
+             {"op": "stroke", "stroke": "#75DD34", "m": m, "bbox": [116, 110, value_right, 110]}]
+    if shield is not None:
+        recs.append({"op": "stroke", "stroke": "#42E3F5", "m": m,
+                     "bbox": [116, 104, 116 + 163 * shield, 104]})
+    return recs
+
+
+def test_the_hud_reads_a_partial_hp():
+    assert cd.hud_self_from_frame(_hud(116 + 163 * 0.4))["hp"] == pytest.approx(0.4)
+
+
+def test_the_hud_reads_the_shield():
+    """用户: 血量里还有护甲。标题页的卡片上护甲是一条独立的青色 #42E3F5 条(跟世界里
+    名牌上那条同色), 满长同样是 2 × (锚点 - 起点)。游戏里带护甲的帧还没抓到过 ——
+    这里按同一种画法读, 抓到实拍帧再钉。"""
+    hud = cd.hud_self_from_frame(_hud(279, shield=0.3))
+    assert hud["hp"] == pytest.approx(1.0) and hud["hp_secondary"] == pytest.approx(0.3)
+
+
+def test_the_title_screen_card_is_not_read_as_hp():
+    """标题页的卡片带 #222222 底色, 血量那条宽度是 0 —— 当真的话等于"死了"。"""
+    assert cd.hud_self_from_frame(_hud(116, bg=True)) is None
+
+
+def test_a_bar_with_no_avatar_on_its_row_is_not_ours():
+    assert cd.hud_self_from_frame(_hud(279, avatar_y=400.0)) is None
+
+
+def test_the_hud_full_length_comes_from_the_drawing_not_a_constant():
+    """实拍满长 163px 是 1920×1080 下的; 换个分辨率 UI 缩放就变。满长得从锚点和起点现算。"""
+    m = [1.0, 0, 0, 1.0, 150.0, 88.0]
+    am = [1.0, 0, 0, 1.0, 48.0, 88.0]
+    recs = [{"op": "fill", "fill": "#CFBB50", "r": 26.5, "m": am},
+            {"op": "fill", "fill": "#FFE763", "r": 23.5, "m": am},
+            {"op": "stroke", "stroke": "#DD3434", "m": m, "bbox": [100, 88, 200, 88]},
+            {"op": "stroke", "stroke": "#75DD34", "m": m, "bbox": [100, 88, 140, 88]}]
+    assert cd.hud_self_from_frame(recs)["hp"] == pytest.approx(0.4)
+
+
 # ── 状态染色: 头像和花身跟着中毒/受伤等状态变色 ──────────────────────────────
 #
 # 实机(2026-09-25)存下的 41 帧 no_hp: 左上角头像卡其实都在, 血条也在, 但
@@ -220,6 +277,12 @@ def test_what_counts_as_our_body_color(color, ok):
 
 TINTED = ["self_tint_poison.json", "self_tint_dimgold.json", "self_tint_red.json",
           "self_tint_pale.json"]
+
+
+@pytest.mark.parametrize("name", TINTED)
+def test_the_hud_is_read_whatever_colour_the_avatar_is(name):
+    hud = cd.hud_self_from_frame(load(name))
+    assert hud is not None and 0.0 < hud["hp"] <= 1.0
 
 
 @pytest.mark.parametrize("name", TINTED)
@@ -237,6 +300,12 @@ def test_the_hud_avatar_colour_is_reported(name):
     assert cd.hud_self_colour(raw) == body[0]["fill"]
 
 
+def test_a_single_circle_on_the_row_is_not_an_avatar():
+    """头像认的是"描边圈 + 身体圈"这一对(半径比 1.128), 不是随便两个同心圆。"""
+    recs = [dict(r, r=5.0) if r.get("r") == 33.125 else r for r in _hud(279)]
+    assert cd.hud_self_from_frame(recs) is None
+
+
 # 花身会整体旋转(矩阵带旋转分量, 缩放不变; 头像卡上的头像跟着一起转)。原来"不许旋转"
 # 是为了挡掉转着画的怪, 顺手把转着的自己也挡了。另一种: 怪全挤在屏幕一边, 宽松模式的
 # "离怪群中位数太远 = 别人的花身"判据把自己扔了(严格模式明明找到了)。
@@ -248,3 +317,30 @@ def test_the_camera_trusts_a_body_that_matches_the_hud_avatar(name):
     cam = cd.camera_from_frame(load(name), best_effort=True)
     assert not cam["approx"]
     assert math.hypot(cam["player_screen"][0] - 960, cam["player_screen"][1] - 540) < 5
+
+
+# ── 蚁穴: 别人的花身半径多了一点浮点噪声 (2026-09-28 录像) ─────────────────────
+
+def test_anthell_camera_is_not_fooled_by_another_players_float_noise_radius():
+    # 6 个同色金身(自己 + 5 个别的玩家)。别人那个半径 10.575015, 自己 10.575000 ——
+    # 旧逻辑"半径最大的唯一一个"选中了别人((1531,17), 旁边就是它的「127级」), 等级字
+    # tie-break 根本没机会跑。整段录像 1013 帧里 178 帧这样认错, 距离全从别人身上算。
+    raw = load("anthell_other_player_radius_noise.json")
+    utils.apply_map("anthell")
+    cam = cd.camera_from_frame(raw, best_effort=True)
+    assert cam["approx"] is False
+    assert math.hypot(cam["player_screen"][0] - 960, cam["player_screen"][1] - 540) < 1
+    cam_strict = cd.camera_from_frame(raw)
+    assert cam_strict["player_screen"] == cam["player_screen"]
+
+
+@pytest.mark.parametrize("name", ["anthell_gold_blob_bigger_than_self.json",
+                                  "anthell_gold_ring_55px.json"])
+def test_anthell_camera_ignores_gold_things_that_are_not_flowers(name):
+    # 2026-09-29 第四份录像 42 帧认错: 一个 #FFE51C 的金色圆(半径 11.8 / 55.4, 花身是 10.575)
+    # 混进候选 —— "往红闪"那条颜色放宽让它过了关, 又因为最大被选中。真花身前面都画着一圈
+    # 半径 1.128 倍的描边, 它没有。
+    raw = load(name)
+    utils.apply_map("anthell")
+    cam = cd.camera_from_frame(raw, best_effort=True)
+    assert math.hypot(cam["player_screen"][0] - 960, cam["player_screen"][1] - 540) < 1

@@ -1,4 +1,5 @@
 import math
+import time
 
 import utils
 import cdp_bridge
@@ -104,6 +105,12 @@ SCREEN_CENTER = (utils.SCREEN_WIDTH / 2, utils.SCREEN_HEIGHT / 2)  # 屏幕中�
 
 
 _last_center = None   # 最近一次扫描解出的玩家屏幕锚点; None = 不可信, 退回 SCREEN_CENTER
+_last_player_world = None   # 同一次扫描里自己的世界坐标(小地图点反解); 给 ApproachTracker 用
+
+
+def last_player_world():
+    """最近一次扫描里自己的世界坐标; 解不出 / 相机只是近似 -> None。"""
+    return _last_player_world
 
 
 def current_center():
@@ -283,6 +290,18 @@ def aim_mouse_target(target_pos, hold_px=None, center=SCREEN_CENTER, max_extend=
     return (cx + ux / umag * extend, cy + uy / umag * extend)
 
 
+# 躲究极时别撞进去的怪群(flee_planner 的 crowd): 传奇及以上、会还手的。被动的幼蚁 / 不动的
+# 蚁卵不算。第五份录像: 背离究极的方向上正好 12~14 只传奇兵蚁, 撞进去 1.2 秒满血到 0。
+FLEE_CROWD_MIN_RARITY = "Legendary"
+FLEE_CROWD_PASSIVE = frozenset({"baby_ant", "ant_egg"})
+
+
+def is_flee_crowd(det):
+    return (det["species"] not in FLEE_CROWD_PASSIVE
+            and RARITY_RANK.get(det["rarity"], 0) >= RARITY_RANK[FLEE_CROWD_MIN_RARITY]
+            and classify_action(det["species"], det["rarity"]) != "AVOID")
+
+
 def flee_mouse_target(avoid_positions, center=SCREEN_CENTER, extend=None):
     """算所有AVOID怪的排斥力合向量, 换算成鼠标该移到的位置(往远离它们的方向)。
     合力互相抵消成约0向量(比如两个AVOID怪分别在玩家两侧)时没有明确逃离方向,
@@ -345,6 +364,10 @@ ANTHELL_ENGAGE_HOLD_PX = 120
 # 追过去顶墙 -> "索敌中途中卡住", 出带 -> "离开刷怪区域" 拉回来, 来回空转; 规避途中
 # 卡住还直接死了一次。限制半径 = 只处理够得着的, 不追远处的。
 ANTHELL_CHASE_MAX_PX = 300
+# 300px 外、这个半径内的怪, 调用方给的 can_reach 说"走得到"(在刷怪区里 + 小地图上直线没墙)
+# 也追。2026-09-29 用户: 刷怪时怪"看不见" —— 录像里刷怪时 14~22% 的拍子在漫游, 其中 85%
+# 以上最近的可打怪在 300~600px, 画面上看得见, 只是被上面那个 300 一刀切掉了。
+ANTHELL_FAR_CHASE_PX = 600
 
 # 蚁群 = 一堆挤在一起的蚂蚁(用户 2026-09-27): 有就先打蚁群, 不直接冲进去, 保持距离、
 # 近了就退(蚂蚁追上来撞在花瓣圈上)。以下全是**未标定**的初值, 实机调:
@@ -363,6 +386,63 @@ AVOID_TRIGGER_PX_BY_MAP = {"anthell": 200}
 
 def avoid_trigger_px_for(map_name, default):
     return AVOID_TRIGGER_PX_BY_MAP.get(map_name, default)
+
+
+# 究极"冲过来"就提前躲的半径(屏幕像素)。用户 2026-09-28 定: 400px 内且正在朝你冲过来就躲,
+# 站着 / 闲逛的不管, AVOID_TRIGGER_PX_BY_MAP 那个半径内一律躲。录像依据: 究极兵蚁追人的速度
+# ≈ 自己(~300 世界单位/秒), 200px 才起跑甩不掉, 两次死亡都是这样。不在表里的图不提前躲。
+AVOID_EARLY_PX_BY_MAP = {"anthell": 400}
+APPROACH_CLOSING_MIN = 120.0   # 世界单位/秒: 相对距离缩得比这快 = 冲过来(追人时 ~300)
+APPROACH_WINDOW_S = 0.3        # 两次读数至少隔这么久才算速度, 单帧抖动不算
+APPROACH_MATCH_WORLD = 250.0   # 前后两次扫描, 同物种、世界坐标这么近的算同一只
+APPROACH_TTL_S = 1.5           # 这么久没再见到就忘掉
+
+
+def avoid_early_px_for(map_name):
+    return AVOID_EARLY_PX_BY_MAP.get(map_name)
+
+
+class ApproachTracker:
+    """跨扫描跟踪 AVOID 怪跟自己的相对距离, 给检测打 approaching 标记。
+
+    用世界坐标(scan_enemies 给的 "world" + 自己的 player_world), 不用屏幕坐标: 屏幕跟着
+    自己动, 同一只怪在屏幕上的位置每拍都在变, 按世界坐标认同一只才稳。相对距离缩短就算
+    "冲过来" —— 怪冲过来和自己朝它走过去都算, 两种都该躲。"""
+
+    def __init__(self):
+        self._tracks = []
+
+    def reset(self):
+        self._tracks = []
+
+    def update(self, detections, player_world, now):
+        live = [tr for tr in self._tracks if now - tr["seen"] <= APPROACH_TTL_S]
+        used = set()
+        for d in detections:
+            d["approaching"] = False
+            if classify_action(d["species"], d["rarity"]) != "AVOID":
+                continue
+            w = d.get("world")
+            if w is None or player_world is None:
+                continue
+            dist = math.hypot(w[0] - player_world[0], w[1] - player_world[1])
+            pool = [tr for tr in live if id(tr) not in used and tr["species"] == d["species"]
+                    and math.hypot(tr["world"][0] - w[0], tr["world"][1] - w[1])
+                    <= APPROACH_MATCH_WORLD]
+            if pool:
+                tr = min(pool, key=lambda tr: math.hypot(tr["world"][0] - w[0],
+                                                        tr["world"][1] - w[1]))
+            else:
+                tr = {"species": d["species"], "hist": []}
+                live.append(tr)
+            used.add(id(tr))
+            tr["world"], tr["seen"] = w, now
+            tr["hist"] = [h for h in tr["hist"] if now - h[0] <= 1.0] + [(now, dist)]
+            old = [h for h in tr["hist"] if now - h[0] >= APPROACH_WINDOW_S]
+            if old:
+                t0, d0 = old[-1]
+                d["approaching"] = (d0 - dist) / (now - t0) >= APPROACH_CLOSING_MIN
+        self._tracks = live
 
 
 # ── 蚁穴按物种打法 ─────────────────────────────────────────────────────────────
@@ -420,13 +500,25 @@ def chase_move_target(target, hold_px, center=SCREEN_CENTER, *, max_extend=None,
                             max_extend=max_extend, repel_positions=repel_positions)
 
 
-def find_swarm(dets, center, radius_px=SWARM_RADIUS_PX, min_count=SWARM_MIN_COUNT):
+SWARM_NEAR_SLACK_PX = 100   # prefer_near: 最近一只比最贴身那堆远不到这么多的, 都算"一样近"
+
+
+def find_swarm(dets, center, radius_px=SWARM_RADIUS_PX, min_count=SWARM_MIN_COUNT,
+               max_center_px=None, prefer_near=False):
     """一堆挤在一起的怪: {"center", "nearest", "count"}; 凑不够 min_count 只 -> None.
 
     以每只为圆心数 radius_px 内有几只, 取最多的那堆(同样多取离玩家近的)。center 是
-    那堆的平均位置, nearest 是那堆里离玩家(center 参数)最近的那只的屏幕坐标。"""
+    那堆的平均位置, nearest 是那堆里离玩家(center 参数)最近的那只的屏幕坐标。
+
+    max_center_px: 只在中心离玩家这么近的堆里挑。不给的话会挑全屏最大的那堆 —— 第六份录像
+    02:10:27, 身边 7 只神话/传奇兵蚁, 左边 870px 外另有一堆 11 只; 挑中了远的那堆, 调用方
+    嫌它太远不去, 于是退回"追最近一只", 人就站在 7 只中间被打死。
+
+    prefer_near: 只在"最近一只"跟最贴身那堆差不到 SWARM_NEAR_SLACK_PX 的堆里比只数。
+    遛蚁群要躲的是贴身那堆: 同一拍 370px 外有一堆 7 只, 贴身 76px 那堆只有 5 只, 按只数会去
+    遛远的那堆, 身边那只神话兵蚁没人管。"""
     cx, cy = center
-    best = None
+    piles = []
     for d in dets:
         px, py = d["screen_pos"]
         members = [m["screen_pos"] for m in dets
@@ -435,11 +527,19 @@ def find_swarm(dets, center, radius_px=SWARM_RADIUS_PX, min_count=SWARM_MIN_COUN
             continue
         mx = sum(p[0] for p in members) / len(members)
         my = sum(p[1] for p in members) / len(members)
-        key = (len(members), -math.hypot(mx - cx, my - cy))
-        if best is None or key > best[0]:
-            nearest = min(members, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
-            best = (key, {"center": (mx, my), "nearest": nearest, "count": len(members)})
-    return best[1] if best else None
+        center_dist = math.hypot(mx - cx, my - cy)
+        if max_center_px is not None and center_dist > max_center_px:
+            continue
+        nearest = min(members, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
+        piles.append({"near_dist": math.hypot(nearest[0] - cx, nearest[1] - cy),
+                      "key": (len(members), -center_dist),
+                      "swarm": {"center": (mx, my), "nearest": nearest, "count": len(members)}})
+    if not piles:
+        return None
+    if prefer_near:
+        closest = min(p["near_dist"] for p in piles)
+        piles = [p for p in piles if p["near_dist"] <= closest + SWARM_NEAR_SLACK_PX]
+    return max(piles, key=lambda p: p["key"])["swarm"]
 
 
 def swarm_move_target(swarm, center=SCREEN_CENTER, *, keep_px=SWARM_KEEP_PX,
@@ -485,7 +585,9 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
                   center=SCREEN_CENTER, chase_min_conf=CHASE_MIN_CONF,
                   target_policy="priority", engage_hold_px=ANTHELL_ENGAGE_HOLD_PX,
                   chase_max_px=ANTHELL_CHASE_MAX_PX, swarm_min_count=SWARM_MIN_COUNT,
-                  swarm_radius_px=SWARM_RADIUS_PX, swarm_chase_max_px=SWARM_CHASE_MAX_PX):
+                  swarm_radius_px=SWARM_RADIUS_PX, swarm_chase_max_px=SWARM_CHASE_MAX_PX,
+                  avoid_early_px=None, can_reach=None, far_chase_px=ANTHELL_FAR_CHASE_PX,
+                  in_area=None):
     """每tick的索敌决策入口. detections是scan_enemies()给的检测列表(或测试里
     手搭的同结构字典列表). 返回三选一:
       ("flee", avoid_positions)             —— 触发半径内有AVOID怪, 优先规避
@@ -514,6 +616,7 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
     move_count=0一点没刷. Common..传奇这些交回wander撞怪 + 外部"一直攻击"就够了,
     不值得专门追。"""
     avoid_positions = []
+    charging = []          # 打了 approaching 标记的 AVOID 怪(ApproachTracker)
     cautious_dets = []
     candidates = []
     for d in detections:
@@ -521,6 +624,8 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
         conf = d.get("confidence", 1.0)
         if bucket == "AVOID":
             avoid_positions.append(d["screen_pos"])
+            if d.get("approaching"):
+                charging.append(d["screen_pos"])
             continue
         if bucket == "CAUTIOUS":
             cautious_dets.append(d)
@@ -533,6 +638,10 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
             p for p in avoid_positions
             if math.hypot(p[0] - cx, p[1] - cy) <= avoid_trigger_px
         ]
+        # 冲过来的究极: 在更大的 avoid_early_px 内就躲(见 AVOID_EARLY_PX_BY_MAP)
+        if avoid_early_px:
+            in_range += [p for p in charging if p not in in_range
+                         and math.hypot(p[0] - cx, p[1] - cy) <= avoid_early_px]
         if in_range:
             return ("flee", in_range)
 
@@ -553,6 +662,11 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
                 return ANTHELL_WORM_STRAFE_PX
             return ANTHELL_HOLD_PX_BY_SPECIES.get(pair[0]["species"], engage_hold_px)
 
+        if in_area is not None:
+            # 刷怪区外的怪不追(也不算进蚁群) —— 第四份录像 8 次出区全是追着带边 / 带外的怪
+            # 出去的。已经贴到停步半径里的(正在交手)照打: 站着打不会被带出去。
+            candidates = [pair for pair in candidates
+                          if _dist(pair) <= _hold(pair) or in_area(pair[0])]
         worms = [pair for pair in candidates
                  if pair[0]["species"] in ANTHELL_STRAFE_SPECIES
                  and _dist(pair) <= ANTHELL_WORM_PRIORITY_PX]
@@ -562,11 +676,15 @@ def select_action(detections, avoid_trigger_px=400, cautious_hold_px=250,
             repel = list(avoid_positions) + [d["screen_pos"] for d in cautious_dets]
             swarm = find_swarm([d for d, b in candidates
                                 if b == "ENGAGE" and d["species"] not in ANTHELL_STRAFE_SPECIES],
-                               center, swarm_radius_px, swarm_min_count)
+                               center, swarm_radius_px, swarm_min_count,
+                               max_center_px=swarm_chase_max_px, prefer_near=True)
             if (swarm is not None and math.hypot(swarm["center"][0] - cx,
                                                  swarm["center"][1] - cy) <= swarm_chase_max_px):
                 return ("swarm", swarm, repel)
-            pool = [pair for pair in candidates if _dist(pair) <= chase_max_px]
+            pool = [pair for pair in candidates
+                    if _dist(pair) <= chase_max_px
+                    or (can_reach is not None and _dist(pair) <= far_chase_px
+                        and can_reach(pair[0]))]
         if not pool:
             return ("wander", None)
         engaged = [pair for pair in pool if _dist(pair) <= _hold(pair)]
@@ -611,8 +729,12 @@ MAP_SPECIES = {
     # 蚁穴 (2026-09-27 实机): 幼蚁/工蚁/兵蚁/蠕虫/蚁卵; queen_ant 是没抓到过的假设。
     "anthell": frozenset({"baby_ant", "worker_ant", "soldier_ant", "worm", "queen_ant",
                           "ant_egg"}),
+    # 这几张图还没做索敌(没有实机录像, 打法不能猜): 显式登记成空集, 让"没做"是有意的。
     "garden": frozenset(),
     "ocean": frozenset(),
+    "jungle": frozenset(),
+    "sewers": frozenset(),
+    "factory": frozenset(),
 }
 
 
@@ -729,6 +851,13 @@ _FRAME_BUFFER_CAP = 20000   # 硬上限, 防 _frame_buffer 无界增长: 若 __c
                             # 20000 条已经很宽裕.
 
 
+# 钩子装没装的检查(inject_canvas_hook 里两次 CDP 求值)隔这么久才做一次。每次 CDP 调用在
+# Windows 上 ~56ms(cdp_breakdown.py 实测), 原来每拍扫描 = 查两次 + 读一次 = 3 次; 第六份录像
+# 刷怪主循环每拍将近 1 秒, 究极冲到脸上才开始躲。读出来是空的(页面 reload 了)下一拍马上重查。
+HOOK_CHECK_S = 2.0
+_hook_checked_at = float("-inf")
+
+
 def scan_enemies(image=None, conf=0.4, model_path=None):
     """解码最新一帧完整的 canvas 绘制记录, 返回检测字典列表(跟旧 YOLO 版同结构:
     species / rarity / screen_pos / bbox / confidence). image/conf/model_path 保留
@@ -740,15 +869,21 @@ def scan_enemies(image=None, conf=0.4, model_path=None):
     _send_cdp_command 找不到标签页也抛, canvas_decode 的除法可能抛
     ZeroDivisionError/IndexError, cdp_bridge 底下 websocket 可能抛 WebSocketException
     /OSError —— 全都当"这次没检测到"退化成 wander."""
-    global _last_center
+    global _last_center, _last_player_world, _hook_checked_at
     try:
-        cdp_bridge.inject_canvas_hook()
-        _frame_buffer.extend(cdp_bridge.drain_canvas_log())
+        now = time.time()
+        if now - _hook_checked_at >= HOOK_CHECK_S:
+            cdp_bridge.inject_canvas_hook()
+            _hook_checked_at = now
+        drained = cdp_bridge.drain_canvas_log()
+        if not drained:
+            _hook_checked_at = float("-inf")    # 页面 reload 了 / 钩子没了 -> 下一拍马上重查
+        _frame_buffer.extend(drained)
         if len(_frame_buffer) > _FRAME_BUFFER_CAP:
             del _frame_buffer[:-_FRAME_BUFFER_CAP]   # 硬上限, 见 _FRAME_BUFFER_CAP 注释
         frames = canvas_decode.group_by_frame(_frame_buffer)
         if len(frames) < 2:
-            _last_center = None
+            _last_center = _last_player_world = None
             return []
         keys = sorted(frames)
         recs = frames[keys[-2]]                 # 最新那帧可能还在画, 取次新的
@@ -756,12 +891,13 @@ def scan_enemies(image=None, conf=0.4, model_path=None):
         cam = canvas_decode.camera_from_frame(recs, best_effort=True)
         mobs = canvas_decode.mobs_from_frame(recs, cam)
     except Exception:
-        _last_center = None                    # 别留着上一帧的锚点当"当前位置"用
+        _last_center = _last_player_world = None   # 别留着上一帧的锚点当"当前位置"用
         return []                              # 任何异常 → 当作这次没解出来, 返回 []
 
     # 近似相机(approx)的锚点实测会落在别的实体身上, 不能拿来当玩家位置 —— 宁可退回
     # SCREEN_CENTER, 那至少是个稳定的近似。
     _last_center = None if cam.get("approx") else cam.get("player_screen")
+    _last_player_world = None if cam.get("approx") else cam.get("player_world")
 
     out = []
     for m in mobs:
@@ -775,5 +911,6 @@ def scan_enemies(image=None, conf=0.4, model_path=None):
             "screen_pos": (sx, sy),
             "bbox": (sx - 1, sy - 1, sx + 1, sy + 1),
             "confidence": 1.0,
+            "world": (m["x"], m["y"]),
         })
     return out

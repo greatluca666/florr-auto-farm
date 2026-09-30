@@ -12,7 +12,10 @@ chrome-profiles/
 downloads/
 florr-auto-afk-*/
 debug_*.png
-afk_*.json
+# 这张不是临时产物: test_map_routes.py 拿它核对花园那几个传送门的开门矩形
+!debug_garden_raw.png
+# AFK 抓帧只忽略根目录下的(程序自己写的), test_frames/ 里的是测试素材
+/afk_*.json
 *.log
 .env
 .DS_Store

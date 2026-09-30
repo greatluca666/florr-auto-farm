@@ -1,4 +1,5 @@
 import os
+import re
 
 import cv2
 import numpy as np
@@ -548,6 +549,17 @@ class _MoveClickSpy:
         self.clicks += 1
 
 
+def test_click_start_game_parks_the_mouse_right_after_clicking(monkeypatch):
+    # 鼠标停在「开始」上 = 一进局就朝它走; 第六份录像蚁穴复活后这样滑到回花园的门边被传走
+    spy = _MoveClickSpy()
+    monkeypatch.setattr(utils, "pyautogui", spy)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr(utils, "on_start_screen", lambda: False)
+    assert utils.click_start_game() is True
+    assert spy.moves == [tuple(utils._START_BUTTON_POS),
+                         (utils.SCREEN_WIDTH // 2, utils.SCREEN_HEIGHT // 2)]
+
+
 def test_select_biome_on_title_clicks_desert_button(monkeypatch):
     spy = _MoveClickSpy()
     monkeypatch.setattr(utils, "pyautogui", spy)
@@ -577,13 +589,54 @@ def test_biome_button_positions_are_calibrated_constants():
     assert gx < dx and abs(gy - dy) <= utils.scale_y(10)
 
 
+# 1920x1080 标题页截图(debug_marked_pos.png)上量的按钮外框: (x0, x1, y0, y1)
+_TITLE_GRID_BOXES = {
+    "garden": (814, 904, 590, 617), "desert": (913, 1007, 590, 617),
+    "ocean": (1013, 1107, 590, 617), "jungle": (864, 956, 624, 651),
+}
+
+
+@pytest.mark.parametrize("biome", sorted(_TITLE_GRID_BOXES))
+def test_every_biome_button_point_lies_inside_its_measured_box(biome):
+    x0, x1, y0, y1 = _TITLE_GRID_BOXES[biome]
+    lo = utils.scale_point(x0, y0)
+    hi = utils.scale_point(x1, y1)
+    x, y = utils._BIOME_BUTTON_POS[biome]
+    assert lo[0] <= x <= hi[0] and lo[1] <= y <= hi[1]
+
+
+def test_ocean_and_jungle_button_points_are_the_box_centres():
+    assert utils._BIOME_BUTTON_POS["ocean"] == utils.scale_point(1060, 603)
+    assert utils._BIOME_BUTTON_POS["jungle"] == utils.scale_point(910, 637)
+    ox, oy = utils._BIOME_BUTTON_POS["ocean"]
+    jx, jy = utils._BIOME_BUTTON_POS["jungle"]
+    assert jy > oy and jx < ox            # 丛林在第二行, 靠左
+
+
+@pytest.mark.parametrize("biome", ["ocean", "jungle"])
+def test_select_biome_on_title_clicks_the_new_buttons(monkeypatch, biome):
+    spy = _MoveClickSpy()
+    monkeypatch.setattr(utils, "pyautogui", spy)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    utils.select_biome_on_title(biome)
+    assert spy.moves == [tuple(utils._BIOME_BUTTON_POS[biome])]
+    assert spy.clicks == 2
+
+
+def test_ocean_and_jungle_share_the_garden_minimap_scale():
+    # 世界一样大(121 格 = 61952), 小地图缩放 300/(61952+2000) 就一样
+    s = utils.MINIMAP_WORLD_SCALE
+    assert s["ocean"] == s["jungle"] == s["garden"]
+    assert abs(s["ocean"] - 300.0 / (61952 + 2000)) < 1e-9
+
+
 def test_select_biome_on_title_noop_for_unmapped_biome(monkeypatch):
     # "anthell" 也在这里: 它永远不该被当成生态区 key 传进来(蚁穴传的是 "garden"),
     # 万一传了也只是不点, 不会乱点别的格子.
     spy = _MoveClickSpy()
     monkeypatch.setattr(utils, "pyautogui", spy)
     monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
-    for biome in ("ocean", "ant_hell", "anthell", "", None):
+    for biome in ("ant_hell", "anthell", "", None):
         utils.select_biome_on_title(biome)
     assert spy.moves == [] and spy.clicks == 0
 
@@ -882,3 +935,199 @@ def test_execute_anti_stuck_leaves_calibrated_maps_on_the_old_path(monkeypatch):
                         lambda d: pytest.fail("沙漠不该走地图脱困"))
     utils.execute_anti_stuck(duration=0.5)
     assert len(randoms) == 1
+
+
+# ── 位置先读画布里的小地图点 (2026-09-28 蚁穴录像) ─────────────────────────────
+# 截图认小地图金点 11 分钟里读丢 40 次(每次: 寻路判卡住乱冲 / 刷怪整轮停 1 秒不躲),
+# 而同一时刻画布里那个点一直都在; 两者读数差 1px 以内。
+
+def test_canvas_position_converts_minimap_world_to_map_pixels(monkeypatch):
+    # 录像实测: 蚁穴世界 (7661, 19176) 的那一帧, 小地图点在 (40.0, 93.2)
+    monkeypatch.setattr(utils, "MAP", "anthell")
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", lambda js, timeout=5: [7661.0, 19176.0])
+    x, y = utils.canvas_player_position(precise=True)
+    assert x == pytest.approx(40.0, abs=0.1) and y == pytest.approx(93.2, abs=0.1)
+
+
+def test_canvas_position_is_calibrated_like_the_pixel_one(monkeypatch):
+    monkeypatch.setattr(utils, "MAP", "anthell")
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", lambda js, timeout=5: [7661.0, 19176.0])
+    seen = {}
+
+    def calib(m, pos):
+        seen["pos"] = pos
+        return (1, 2)
+    monkeypatch.setattr(utils, "calibrate_player", calib)
+    monkeypatch.setattr(utils, "load_binary_map", lambda: "map")
+    assert utils.canvas_player_position() == (1, 2) and seen["pos"] == (40, 93)
+
+
+@pytest.mark.parametrize("value", [None, [], [1e9, 5.0], "boom"])
+def test_canvas_position_gives_up_quietly(monkeypatch, value):
+    monkeypatch.setattr(utils, "MAP", "anthell")
+
+    def ev(js, timeout=5):
+        if value == "boom":
+            raise ConnectionError("没开 CDP")
+        return value
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", ev)
+    assert utils.canvas_player_position(precise=True) is None
+
+
+def test_canvas_position_needs_a_measured_scale_for_the_map(monkeypatch):
+    monkeypatch.setattr(utils, "MAP", "sewers")       # 没实测过缩放的图 -> 不猜(海洋/丛林现在有了)
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value",
+                        lambda js, timeout=5: pytest.fail("不该去读"))
+    assert utils.canvas_player_position() is None
+
+
+def test_get_player_position_prefers_the_canvas(monkeypatch):
+    monkeypatch.setattr(utils, "canvas_player_position", lambda precise=False: (7, 8))
+    monkeypatch.setattr(utils, "get_map", lambda: pytest.fail("画布有就不截图"))
+    assert utils.get_player_position() == (7, 8)
+
+
+def test_get_player_position_falls_back_to_the_screenshot(monkeypatch):
+    monkeypatch.setattr(utils, "canvas_player_position", lambda precise=False: None)
+    monkeypatch.setattr(utils, "get_map", lambda: "img")
+    monkeypatch.setattr(utils, "load_binary_map", lambda: "map")
+    monkeypatch.setattr(utils, "get_player_location_on_map",
+                        lambda img, color, m, precise: (3, 4) if img == "img" else None)
+    assert utils.get_player_position() == (3, 4)
+
+
+# ── calibrate_player 提速: 结果必须跟原来逐像素找的一模一样 (2026-09-28) ─────────
+# 原实现每次读位置都 Python 遍历 9 万个像素(Mac 上 155ms), 寻路/刷怪每 tick 都读, 第三份
+# 录像里躲究极的反应慢了 1.6 秒, 这是大头之一。
+
+def _calibrate_bruteforce(m, pos):
+    walkable = (m == 255).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(walkable, connectivity=8)
+    if num <= 1:
+        return pos
+    main = max(range(1, num), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    best, best_d = pos, float("inf")
+    for y in range(m.shape[0]):
+        for x in range(m.shape[1]):
+            if labels[y, x] == main:
+                d = ((x - pos[0]) ** 2 + (y - pos[1]) ** 2) ** 0.5
+                if d < best_d:
+                    best, best_d = (x, y), d
+    return best
+
+
+def test_fast_calibrate_matches_the_bruteforce_one_including_ties():
+    rng = np.random.default_rng(7)
+    for trial in range(6):
+        m = np.where(rng.random((40, 50)) < 0.55, 255, 0).astype(np.uint8)
+        for pos in [(0, 0), (49, 39), (25, 20), (3, 37), (-5, 10), (60, 60)]:
+            assert utils.calibrate_player(m, pos) == _calibrate_bruteforce(m, pos), (trial, pos)
+
+
+def test_fast_calibrate_on_the_real_anthell_map():
+    import cv2 as _cv2
+    m = _cv2.imread("./maps/anthell.png", _cv2.IMREAD_GRAYSCALE)
+    for pos in [(47, 99), (121, 102), (18, 91), (200, 5)]:
+        got = utils.calibrate_player(m, pos)
+        assert got == _calibrate_bruteforce(m, pos)
+        assert isinstance(got[0], int) and isinstance(got[1], int)
+
+
+def test_fast_calibrate_is_fast():
+    import time
+    import cv2 as _cv2
+    m = _cv2.imread("./maps/anthell.png", _cv2.IMREAD_GRAYSCALE)
+    utils.calibrate_player(m, (47, 99))               # 第一次建缓存
+    t = time.time()
+    for _ in range(50):
+        utils.calibrate_player(m.copy(), (47, 99))    # 每次都是新数组(load_binary_map 就是这样)
+    assert (time.time() - t) / 50 < 0.01
+
+
+def test_open_map_rects_carves_the_loaded_map_and_apply_map_clears_it(monkeypatch, tmp_path):
+    import cv2
+    import numpy as np
+    (tmp_path / "maps").mkdir()
+    cv2.imwrite(str(tmp_path / "maps" / "toy.png"), np.zeros((300, 300), np.uint8))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils, "MAP", "")
+    monkeypatch.setattr(utils, "MAP_OPEN_RECTS", ())
+
+    utils.apply_map("toy")
+    assert (utils.load_binary_map() == 0).all()
+    utils.open_map_rects([(10, 20, 12, 21)])
+    carved = utils.load_binary_map()
+    assert int((carved == 255).sum()) == 6 and (carved[20:22, 10:13] == 255).all()
+    utils.apply_map("toy")                       # 重新 apply = 换段了, 门关上
+    assert (utils.load_binary_map() == 0).all()
+
+
+def test_open_map_rects_with_nothing_is_a_no_op(monkeypatch):
+    monkeypatch.setattr(utils, "MAP_OPEN_RECTS", ((1, 1, 2, 2),))
+    utils.open_map_rects(())
+    assert utils.MAP_OPEN_RECTS == ()
+
+
+def test_minimap_scale_hints_agree_with_the_measured_scales():
+    for name in ("garden", "anthell"):
+        assert abs(utils.MINIMAP_SCALE_HINTS[name] - utils.MINIMAP_WORLD_SCALE[name]) < 1e-9
+    # 下水道/工厂只是按同一条公式预测的, 没实测 —— 只能用来分类, 不能进"位置读数信画布"的那张表
+    assert "sewers" not in utils.MINIMAP_WORLD_SCALE and "factory" not in utils.MINIMAP_WORLD_SCALE
+    assert abs(utils.minimap_scale_for_world(90) - 300.0 / (46080 + 2000)) < 1e-12
+
+
+def test_map_for_minimap_scale_picks_the_unique_candidate():
+    h = utils.MINIMAP_SCALE_HINTS
+    assert utils.map_for_minimap_scale(h["sewers"], ["garden", "sewers"]) == "sewers"
+    assert utils.map_for_minimap_scale(h["garden"], ["garden", "sewers"]) == "garden"
+    assert utils.map_for_minimap_scale(h["anthell"], ["garden", "anthell"]) == "anthell"   # 只差 1.6%
+    assert utils.map_for_minimap_scale(h["sewers"], ["garden", "factory"]) == "factory"
+    assert utils.map_for_minimap_scale(h["sewers"], ["sewers", "factory"]) is None   # 一样大: 分不出
+    assert utils.map_for_minimap_scale(0.1, ["garden", "sewers"]) is None
+    assert utils.map_for_minimap_scale(None, ["garden"]) is None
+    assert utils.map_for_minimap_scale(h["sewers"], ["garden", "nope"]) is None
+
+
+def test_map_for_minimap_scale_normalises_the_ui_scale():
+    h = utils.MINIMAP_SCALE_HINTS
+    assert utils.map_for_minimap_scale(h["sewers"] * 0.5, ["garden", "sewers"], ui_scale=0.5) == "sewers"
+    assert utils.map_for_minimap_scale(h["sewers"] * 0.5, ["garden", "sewers"], ui_scale=1.0) is None
+
+
+def test_map_for_minimap_scale_needs_a_margin_over_the_runner_up():
+    # 花园和蚁穴的提示值只差 1.58%, 容差 0.5% —— 读数偏了 0.4% 就已经"离花园近、离蚁穴也不算远",
+    # 而认错的代价是拿蚁穴的图在花园里刷(第六份录像卡了 13 分钟)。要求次优至少差 3 倍才认。
+    h = utils.MINIMAP_SCALE_HINTS
+    # 读数偏小就是往蚁穴那个值靠: 偏 0.4% 时离蚁穴只剩 1.20%(不到 3 倍) -> 不认
+    assert utils.map_for_minimap_scale(h["garden"] * 0.996, ["garden", "anthell"]) is None
+    assert utils.map_for_minimap_scale(h["garden"] * 0.997, ["garden", "anthell"]) == "garden"
+    assert utils.map_for_minimap_scale(h["garden"] * 1.003, ["garden", "anthell"]) == "garden"
+    assert utils.map_for_minimap_scale(h["garden"] * 1.01, ["garden", "anthell"]) is None
+    # 边距只对"分不开的一对"起作用: 花园 vs 下水道差 33%, 容差内的读数照旧认得出
+    assert utils.map_for_minimap_scale(h["garden"] * 0.996, ["garden", "sewers"]) == "garden"
+    # 提示值一模一样的两张(下水道/工厂, 世界都是 90 格): 次优跟最优一样近 = 永远分不出
+    assert utils.map_for_minimap_scale(h["sewers"], ["sewers", "factory"]) is None
+
+
+def test_canvas_minimap_scale_peeks_and_never_clears_the_log(monkeypatch):
+    # 清 __canvasLog 会把 scan_enemies / canvas_player_world 的帧偷走 —— 读缩放比只能偷看,
+    # 跟 canvas_zone_map / canvas_player_world 走同一条路(main._canvas_scale_zone 原来走 drain)。
+    seen = {}
+
+    def ev(js, timeout=5):
+        seen["js"] = js
+        return 0.00624
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", ev)
+    assert utils.canvas_minimap_scale() == 0.00624
+    assert "__canvasLog" in seen["js"]
+    assert not re.search(r"__canvasLog\s*=", seen["js"])    # 只读, 不赋值 = 不清空
+
+
+@pytest.mark.parametrize("value", [None, 0, "boom", "nope"])
+def test_canvas_minimap_scale_gives_up_quietly(monkeypatch, value):
+    def ev(js, timeout=5):
+        if value == "boom":
+            raise ConnectionError("没开 CDP")
+        return value
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", ev)
+    assert utils.canvas_minimap_scale() is None

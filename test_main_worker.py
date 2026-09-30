@@ -1,5 +1,6 @@
 import inspect
 import io
+import math
 import os
 
 import numpy as np
@@ -7,6 +8,27 @@ import pytest
 
 import main
 import map_routes
+
+
+@pytest.fixture(autouse=True)
+def _fresh_enemy_state(monkeypatch):
+    """_FLEE_LATCH / _APPROACH 是进程内共享的状态 —— 前一条用例"刚躲过"会让后一条用例的
+    决策被滞回改写, 结果跟执行顺序有关。每条用例一份干净的。"""
+    monkeypatch.setattr(main, "_FLEE_LATCH", main._FleeLatch())
+    monkeypatch.setattr(main, "_APPROACH", main.enemy_detect.ApproachTracker())
+    monkeypatch.setattr(main, "_FLEE_PLAN", main._FleePlan())
+    # release_keys 直接调 pyautogui.keyUp —— 测试机上别真的发按键
+    monkeypatch.setattr(main, "release_keys", lambda: None)
+    # 画布区域名要连 Chrome; 默认读不到(= 不判"人不在这张图上"), 要测的用例自己换
+    monkeypatch.setattr(main, "canvas_zone_map", lambda: None)
+    monkeypatch.setattr(main, "_WRONG_MAP_SEEN", None)
+    # utils.MAP_OPEN_RECTS 也是进程内共享的(哪扇传送门被运行时挖开了) —— 上一条用例走过
+    # 进场路线、门还开着的话, 下一条用例的 load_binary_map() 读到的就是挖开过的图, 结果
+    # 跟执行顺序有关。每条用例前后都归零。
+    monkeypatch.setattr(main.utils, "MAP_OPEN_RECTS", ())
+
+
+_REAL_RELEASE_KEYS = main.release_keys
 
 
 def test_apply_worker_config_reads_active_slice(monkeypatch):
@@ -460,13 +482,16 @@ class _SlidingFlower:
         return (int(round(self.p[0])), int(round(self.p[1])))
 
 
-@pytest.mark.parametrize("start, goal, vmax", [
-    ((117, 102), (23, 89), 3.0),    # 实机出生点 -> 刷怪区, 连穿两条密道
-    ((72, 91), (109, 110), 2.0),    # 反着穿回来
+@pytest.mark.parametrize("map_name, start, goal, vmax", [
+    ("anthell", (117, 102), (23, 89), 3.0),    # 实机出生点 -> 刷怪区, 连穿两条密道
+    ("anthell", (72, 91), (109, 110), 2.0),    # 反着穿回来
+    ("garden", (62, 132), (31, 129), 3.0),     # 出生点左边那条
+    ("desert", (194, 142), (167, 138), 3.0),
+    ("ocean", (72, 268), (68, 243), 3.0),
 ])
-def test_anthell_routes_through_the_shortcut_tunnels_get_walked(monkeypatch, start, goal, vmax):
+def test_routes_through_the_shortcut_tunnels_get_walked(monkeypatch, map_name, start, goal, vmax):
     import cv2
-    walk = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    walk = cv2.imread(f"./maps/{map_name}.png", cv2.IMREAD_GRAYSCALE)
     _stub_move_env(monkeypatch)
     path = main.lazy_theta_star(walk, start, goal)
     assert path is not None
@@ -652,15 +677,40 @@ def test_path_walk_hands_each_hop_the_next_one_and_the_planning_map(monkeypatch)
 def test_execute_path_stops_as_soon_as_the_goal_is_reached():
     moves = []
     orig = main.move_to_position
-    main.move_to_position = lambda a, b, **kw: moves.append(b) or "arrived"
+
+    def move(a, b, on_tick=None, **kw):
+        moves.append(b)
+        return (on_tick(b) if on_tick else None) or True
+
+    main.move_to_position = move
     try:
-        # 第一段之前不问(lazy_theta_pathing 规划前已经查过一次, 再截一次屏是浪费);
-        # 之后每段之前问一次 —— 走完第一段就到了。
         assert main.execute_path([(0, 0), (1, 1), (2, 2), (3, 3)],
-                                 stop_when=lambda: True) is True
+                                 stop_when=lambda p: p == (1, 1)) is True
     finally:
         main.move_to_position = orig
     assert moves == [(1, 1)]
+
+
+def test_a_single_leg_walk_back_stops_at_the_edge_not_the_waypoint(monkeypatch):
+    """实机(2026-09-27): 从下边出区一格, 拉回的路只有一段 "(24,61) -> (24,51)" ——
+    原来"进区就停"只在两段之间查, 一段的路照样走到底, 往里多走 9 格。现在走的过程中
+    每个 tick 都查。"""
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "_move_mouse_safely", lambda p: None)
+    monkeypatch.setattr(main, "reset_keyboard", lambda: None)
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    ys = iter(range(61, 40, -1))                   # 每读一次往北挪一格
+    seen = []
+
+    def position():
+        y = next(ys)
+        seen.append(y)
+        return (24, y)
+
+    monkeypatch.setattr(main, "get_player_position", position)
+    assert main.execute_path([(24, 61), (24, 51)],
+                             stop_when=lambda p: main.if_in_area([[(6, 8), (43, 59)]], p)) is True
+    assert seen[-1] == 59                          # 一进区(y=59)就停, 没走到 51
 
 
 def test_walking_back_stops_the_moment_the_flower_is_inside(monkeypatch):
@@ -670,10 +720,10 @@ def test_walking_back_stops_the_moment_the_flower_is_inside(monkeypatch):
     pos = {"p": (20, 80)}
     moves = []
 
-    def move(a, b, **kw):
+    def move(a, b, on_tick=None, **kw):
         moves.append(b)
         pos["p"] = b
-        return "arrived"
+        return (on_tick(b) if on_tick else None) or True
 
     monkeypatch.setattr(main, "move_to_position", move)
     monkeypatch.setattr(main, "get_player_position", lambda: pos["p"])
@@ -701,7 +751,6 @@ def test_rules_farming_walks_back_to_the_nearest_edge_not_the_centre(monkeypatch
         main.auto_farming(AREA, 30, enemy_ai_enabled=False)
     (x, y), = targets
     assert x == 20 and 60 <= y <= 73           # 正下方的边内点, 不是中心 (23, 39)
-
 
 
 def test_lazy_theta_pathing_does_not_cry_stuck_while_it_is_actually_walking(monkeypatch):
@@ -874,6 +923,41 @@ def test_run_worker_selects_biome_only_once_across_respawns(monkeypatch):
     assert selects == ["desert"]      # 3 轮都回开局菜单, 只点了第 1 轮那次
     assert len(waits) == 1            # 等菜单回来也只在那一次选择之后做
     assert len(clicks) == 3           # 每轮照常点开始, 不受影响
+
+
+def _run_one_round_with_route(monkeypatch, map_name):
+    """只跑一轮 run_worker(第一次寻路就 KeyboardInterrupt), 路线换成 map_name 那条.
+    返回 florr_server.clear_last_server_id 收到的调用次数。"""
+    _stub_run_worker_env(monkeypatch)
+    base = main._apply_worker_config(None)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: dict(
+        base, map_name=map_name, biome=map_routes.route_for(map_name).server_biome,
+        route=map_routes.route_for(map_name)))
+    monkeypatch.setattr(main, "on_start_screen", lambda: True)
+    monkeypatch.setattr(main, "click_start_game", lambda: True)
+    monkeypatch.setattr(main, "_reassert_florr_toggles",
+                        lambda *a, **k: {"attack": "unchanged", "defense": "unchanged"})
+    monkeypatch.setattr(main, "_run_entry_route", lambda *a, **k: "arrived")
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "load_binary_map", lambda: None)
+    cleared = []
+    monkeypatch.setattr(main.florr_server, "clear_last_server_id",
+                        lambda ej: cleared.append(1) or True)
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    return len(cleared)
+
+
+def test_run_worker_clears_the_stale_server_id_only_for_the_landing_checked_maps(monkeypatch):
+    """探针记的服务器号活在页面里, worker 重启/换时块都不会没 —— 花园时块切到海洋的那一轮,
+    _run_entry_route 的落地核对会读到上一个时块那台花园服务器的号, 判"按钮点偏了"白跳一轮。
+    点「开始」之前清掉它。别给别的路线清: 多阶段路线每圈靠这个号分"还在花园/已经进蚁穴"。"""
+    for name in ("ocean", "jungle"):
+        assert _run_one_round_with_route(monkeypatch, name) == 1, name
+    for name in ("desert", "garden", "anthell", "sewers", "factory"):
+        assert _run_one_round_with_route(monkeypatch, name) == 0, name
 
 
 def test_run_worker_does_not_select_biome_when_not_on_start_screen(monkeypatch):
@@ -1561,6 +1645,7 @@ def _quiet_entry_env(monkeypatch):
     monkeypatch.setattr(main.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(main, "execute_anti_stuck", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(main, "_canvas_zone_map", lambda: None, raising=False)
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: None, raising=False)
 
 
 def test_maybe_scan_enemies_passes_target_policy_for_current_map(monkeypatch):
@@ -1587,10 +1672,42 @@ def test_apply_worker_config_force_disables_enemy_ai_on_unsupported_map(monkeypa
     assert w2["enemy_ai_enabled"] is True
 
 
-def test_route_blocker_reports_uncalibrated_portal(monkeypatch):
+def test_route_blocker_names_the_route_when_a_portal_is_uncalibrated(monkeypatch):
     monkeypatch.setattr(map_routes, "ANTHELL_PORTAL", None)
-    blocker = main._route_blocker(map_routes.route_for("anthell"))
-    assert blocker is not None and "ANTHELL_PORTAL" in blocker
+    msg = main._route_blocker(map_routes.route_for("anthell"))
+    assert msg is not None and "未标定" in msg and "anthell" in msg
+
+
+def test_route_blocker_is_none_for_every_shipped_map():
+    for name in ("garden", "desert", "ocean", "jungle", "anthell", "sewers", "factory"):
+        assert main._route_blocker(map_routes.route_for(name)) is None, name
+
+
+def test_route_blocker_refuses_a_door_that_has_no_registered_opening(monkeypatch):
+    """重标了 *_PORTAL 却忘了改 PORTAL_OPENINGS: 门在二值图里还是墙, lazy_theta_star 只会
+    报笼统的"路径规划失败"一轮轮空转 —— 谁也看不出是漏登记。启动时就得拦住并点名那张表。"""
+    monkeypatch.setattr(map_routes, "ANTHELL_PORTAL", (120, 120))    # 不是 PORTAL_OPENINGS 的键
+    msg = main._route_blocker(map_routes.route_for("anthell"))
+    assert msg is not None and "PORTAL_OPENINGS" in msg and "(120, 120)" in msg
+
+
+def test_route_blocker_recalibration_recipe_never_tells_you_to_overwrite_the_garden_map(
+        monkeypatch):
+    # `capture_map.py garden` 会把仓库自带的 maps/garden.png(门全是墙那张)覆盖掉 ——
+    # 三处文案以前都这么写。现在统一用 map_routes 那一份步骤。
+    monkeypatch.setattr(map_routes, "ANTHELL_PORTAL", None)
+    msg = main._route_blocker(map_routes.route_for("anthell"))
+    assert "capture_map.py garden`" not in msg and "capture_map.py garden " not in msg
+    assert "git checkout -- maps/garden.png" in msg
+    assert "map_select.py" in msg and "PORTAL_OPENINGS" in msg
+
+
+def test_route_blocker_tells_you_to_restore_a_missing_shipped_map(monkeypatch):
+    real_exists = main.os.path.exists
+    monkeypatch.setattr(main.os.path, "exists",
+                        lambda p: False if str(p).endswith("jungle.png") else real_exists(p))
+    msg = main._route_blocker(map_routes.route_for("jungle"))
+    assert msg is not None and "git checkout" in msg
 
 
 def test_route_blocker_reports_missing_map_png(monkeypatch, tmp_path):
@@ -1619,6 +1736,9 @@ def test_route_blocker_does_not_tell_you_to_recapture_the_shipped_anthell_map(
 
 def test_route_blocker_is_none_when_everything_is_there(monkeypatch, tmp_path):
     route = _anthell_route(monkeypatch)
+    # 挪过洞口坐标就得连着登记这个门运行时要挖开的像素, 不然 _route_blocker 会(正确地)拦下来
+    monkeypatch.setitem(map_routes.PORTAL_OPENINGS, ("garden", (150, 40)),
+                        [(149, 39, 151, 41)])
     monkeypatch.chdir(tmp_path)
     (tmp_path / "maps").mkdir()
     for name in ("garden.png", "anthell.png"):
@@ -1650,7 +1770,8 @@ def test_run_worker_blocked_route_exits_before_any_screen_side_effect(monkeypatc
     with pytest.raises(SystemExit) as excinfo:
         main.run_worker({"version": 2, "active": {"map": "anthell"}})
     assert excinfo.value.code == 1
-    assert "ANTHELL_PORTAL" in capsys.readouterr().out   # 明说缺哪个值
+    out = capsys.readouterr().out
+    assert "未标定" in out and "anthell" in out   # 明说缺哪个值、哪条路线
 
 
 def test_stage_state_advances_and_resets(monkeypatch):
@@ -1678,7 +1799,8 @@ def test_entry_route_is_a_noop_on_single_stage_maps(monkeypatch):
 
 
 def test_entry_route_never_reads_the_server_id_on_single_stage_routes(monkeypatch):
-    """单图路线(沙漠/海洋)一次都不该去问"我现在在哪张图".
+    """单图路线(沙漠/花园)一次都不该去问"我现在在哪张图"(海洋/丛林只有一次落地核对,
+    见下面 test_entry_route_skips_the_round_when_ocean_button_missed...).
 
     探针装上、真读得到服务器号之后这条才真正咬人: 沙漠那一轮只要读回来的号跟
     stage_state 对不上(读到别的标签页的号 / 上一台服务器的陈旧号 / 大厅号),
@@ -1701,6 +1823,54 @@ def test_entry_route_never_reads_the_server_id_on_single_stage_routes(monkeypatc
                                  timeout=5) == "arrived"
     assert walked == []
     assert reads == []                 # 单图路线连 CDP 都不该去打扰
+
+
+def _landing_env(monkeypatch, landed):
+    """海洋/丛林落地核对用的打桩: current_map_name 返回 landed, 记下 apply_map 调用。"""
+    _quiet_entry_env(monkeypatch)
+    applied = []
+    monkeypatch.setattr(main, "apply_map", lambda n: applied.append(n))
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda loc, area, **kw: False)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: landed)
+    return applied
+
+
+def test_entry_route_skips_the_round_when_ocean_button_missed_and_we_landed_in_garden(monkeypatch):
+    # 海洋按钮坐标是从截图量的, 点偏 = 落进花园。单图路线以前完全不核对, 会拿 ocean.png
+    # 在花园里刷 —— 现在读得到服务器号且不是海洋就 "timeout"(上层跳过这一轮)。
+    applied = _landing_env(monkeypatch, "garden")
+    route = map_routes.route_for("ocean")
+    assert main._run_entry_route(route, main._StageState(route), timeout=5) == "timeout"
+    assert applied == []               # 一张图都没套上
+
+
+def test_entry_route_arrives_on_jungle_when_the_server_says_jungle(monkeypatch):
+    applied = _landing_env(monkeypatch, "jungle")
+    route = map_routes.route_for("jungle")
+    assert main._run_entry_route(route, main._StageState(route), timeout=5) == "arrived"
+    assert applied == ["jungle"]
+
+
+def test_entry_route_proceeds_on_ocean_when_the_server_id_is_unreadable(monkeypatch):
+    # 探针没装 / 读不到 -> None -> 跟改之前一样往下走, 不比以前更差。
+    applied = _landing_env(monkeypatch, None)
+    route = map_routes.route_for("ocean")
+    assert main._run_entry_route(route, main._StageState(route), timeout=5) == "arrived"
+    assert applied == ["ocean"]
+
+
+def test_entry_route_never_reads_florr_server_on_desert(monkeypatch):
+    # 沙漠是唯一在实机跑过的配置, 读服务器号对它有害(陈旧号 / 别的标签页的号会让这一轮
+    # 被跳过) —— 落地核对只给 _LANDING_CHECK_MAPS, 沙漠一次都不许碰 florr_server。
+    _quiet_entry_env(monkeypatch)
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+
+    def forbidden(ev):
+        raise AssertionError("沙漠不该读服务器号")
+
+    monkeypatch.setattr(main.florr_server, "current_map_name", forbidden)
+    route = map_routes.route_for("desert")
+    assert main._run_entry_route(route, main._StageState(route), timeout=5) == "arrived"
 
 
 def test_entry_route_walks_to_portal_then_arrives_when_server_id_flips(monkeypatch):
@@ -2906,18 +3076,6 @@ def test_drive_defaults_to_enemy_detect_current_center(monkeypatch):
     main._drive_and_check_stall((100.0, 200.0), (5, 5), history, "清青怪", "保持距离")
     assert history == []
 
-# ── 死在蚁穴 -> 重生还在蚁穴, 但阶段猜测回到花园 (2026-09-27 实机: 3 轮各白烧 180 秒) ──
-
-def test_stage_state_sync_to():
-    route = map_routes.route_for("anthell")
-    st = main._StageState(route)
-    st.sync_to("anthell")
-    assert st.map_name == "anthell"
-    st.sync_to("garden")
-    assert st.map_name == "garden"
-    st.sync_to("desert")               # 不在路线上 -> 不动
-    assert st.map_name == "garden"
-
 
 def test_circling_does_not_feed_the_stall_detector(monkeypatch):
     """绕圈(蠕虫)时净位移最多一个圈的直径: 半径 60 屏幕像素在蚁穴(zoom 0.315, 一格小地图
@@ -2932,6 +3090,49 @@ def test_circling_does_not_feed_the_stall_detector(monkeypatch):
                                       center=(960.0, 540.0), track_stall=False)
     assert got == "moved" and moved == [(1000.0, 540.0)]
     assert history == []
+
+
+# ── 死在蚁穴 -> 重生还在蚁穴, 但阶段猜测回到花园 (2026-09-27 实机: 3 轮各白烧 180 秒) ──
+
+def test_stage_state_sync_to():
+    route = map_routes.route_for("anthell")
+    st = main._StageState(route)
+    st.sync_to("anthell")
+    assert st.map_name == "anthell"
+    st.sync_to("garden")
+    assert st.map_name == "garden"
+    st.sync_to("desert")               # 不在路线上 -> 不动
+    assert st.map_name == "garden"
+
+
+def test_entry_route_opens_the_stage_door_before_pathing(monkeypatch):
+    # 花园图的门全是墙; 走门这一段要先把这一段的门挖开, 再寻路 —— 否则目标是墙, 规划直接失败.
+    _quiet_entry_env(monkeypatch)
+    route = _anthell_route(monkeypatch, portal=(133, 234))
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
+    calls = []
+    monkeypatch.setattr(main, "apply_map", lambda n: calls.append(("apply", n)))
+    monkeypatch.setattr(main, "open_map_rects", lambda rects: calls.append(("open", tuple(rects))))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: calls.append(("walk", loc)) or False)
+    main._run_entry_route(route, main._StageState(route), timeout=5)
+    assert calls[:3] == [
+        ("apply", "garden"),
+        ("open", tuple(map_routes.PORTAL_OPENINGS[("garden", (133, 234))])),
+        ("walk", (133, 234)),
+    ]
+
+
+def test_entry_route_does_not_open_anything_on_arrival(monkeypatch):
+    _quiet_entry_env(monkeypatch)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
+    opened = []
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "open_map_rects", lambda rects: opened.append(rects))
+    route = map_routes.route_for("desert")
+    assert main._run_entry_route(route, main._StageState(route)) == "arrived"
+    # 唯一一次调用是退出时那道"全部关上"(finally 里的 open_map_rects(())) —— 没有任何门被挖开
+    assert opened == [()]
 
 
 def test_entry_route_trusts_canvas_zone_label_over_stage_guess(monkeypatch):
@@ -2979,16 +3180,180 @@ def test_entry_route_still_walks_when_canvas_zone_is_unknown(monkeypatch):
     assert len(walked) == 1
 
 
+def test_entry_route_uses_the_minimap_scale_when_the_zone_label_is_unknown(monkeypatch):
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("sewers")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")   # 同一台服务器
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: None)
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: "sewers")
+    applied, walked = [], []
+    monkeypatch.setattr(main, "apply_map", lambda n: applied.append(n))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    assert main._run_entry_route(route, st, timeout=5) == "arrived"
+    assert walked == []                       # 一步花园路线都不该走
+    assert applied == ["sewers"] and st.map_name == "sewers"
+
+
+def test_entry_route_uses_the_minimap_scale_on_the_anthell_route_too(monkeypatch):
+    # 区域名读不出 + 服务器号读不出: 缩放比(花园 0.004691 / 蚁穴 0.004617, 都是实测值)分得开,
+    # 说在蚁穴就直接判 arrived, 一步花园路线都不走.
+    _quiet_entry_env(monkeypatch)
+    route = _anthell_route(monkeypatch)
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: None)
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: "anthell")
+    applied, walked = [], []
+    monkeypatch.setattr(main, "apply_map", lambda n: applied.append(n))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    assert main._run_entry_route(route, st, timeout=5) == "arrived"
+    assert walked == []
+    assert applied == ["anthell"] and st.map_name == "anthell"
+
+
+def _false_hop_env(monkeypatch, route):
+    """走门那一段"传送被误判成功"(连续复查都判已离开, 其实人还在花园): 服务器号说花园, 区域名读不出,
+    缩放比说人还在花园 —— 返回 (walked, applied)."""
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: None)
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: "garden")
+    monkeypatch.setattr(main, "_walk_toward_visible_portal", lambda *a, **k: True)
+    monkeypatch.setattr(main, "_canvas_portal_world_offset", lambda *a, **k: None)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (10, 10))   # 离目标框远 = 已离开
+    walked, applied = [], []
+    monkeypatch.setattr(main, "apply_map", lambda n: applied.append(n))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    return walked, applied
+
+
+def test_entry_route_false_hop_on_the_anthell_route_walks_the_garden_again(monkeypatch):
+    """传送被误判成功(advance 过 + hopped) —— 下一圈缩放比还说花园, 就不能因为 hopped 判 arrived,
+    要回花园那段重走; 从头到尾没有 apply_map("anthell")."""
+    _quiet_entry_env(monkeypatch)
+    route = _anthell_route(monkeypatch)
+    walked, applied = _false_hop_env(monkeypatch, route)
+    st = main._StageState(route)
+    assert main._run_entry_route(route, st, timeout=0.05) == "timeout"
+    garden_target = route.stages[0].walk_to
+    assert walked.count(garden_target) >= 2 and set(walked) == {garden_target}
+    assert "anthell" not in applied
+
+
+def test_entry_route_false_hop_on_the_sewers_route_walks_the_garden_again(monkeypatch):
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("sewers")
+    walked, applied = _false_hop_env(monkeypatch, route)
+    assert main._run_entry_route(route, main._StageState(route), timeout=0.05) == "timeout"
+    garden_target = route.stages[0].walk_to
+    assert walked.count(garden_target) >= 2 and set(walked) == {garden_target}
+    assert "sewers" not in applied
+
+
+def test_entry_route_trusts_the_stage_state_right_after_a_confirmed_hop(monkeypatch):
+    """走门传送成功(连续复查都判"已离开")后: 服务器号还说花园(同一台服务器), 区域名和缩放比也
+    读不出 —— 该信阶段状态, 不该再拿花园的路线去走下水道的墙。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("sewers")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: None)
+    monkeypatch.setattr(main, "_walk_toward_visible_portal", lambda *a, **k: True)
+    monkeypatch.setattr(main, "_canvas_portal_world_offset", lambda *a, **k: None)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (10, 10))   # 离目标框远 = 已离开
+    walked, applied = [], []
+    monkeypatch.setattr(main, "apply_map", lambda n: applied.append(n))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    assert main._run_entry_route(route, st, timeout=5) == "arrived"
+    assert walked == [(86, 185)]              # 花园那一段只走了一次
+    assert applied[-1] == "sewers" and st.map_name == "sewers"
+
+
+def test_entry_route_without_a_hop_still_believes_the_server_id(monkeypatch):
+    # 没有"刚传送过": 服务器号说花园就是花园(死亡重生还在同一张图上时靠区域名/缩放比纠正, 不靠这条)
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("sewers")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: None)
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    walked = []
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    st.advance()                               # 阶段状态说"已经在下水道了"
+    main._run_entry_route(route, st, timeout=5)
+    assert walked                              # 服务器号说花园 -> 照旧走花园那段(不是 hop 后第一圈)
+
+
+def test_entry_route_syncs_the_stage_state_even_when_the_zone_agrees_with_the_server_id(
+        monkeypatch):
+    """乐观推进成了下水道, 区域名和服务器号都说花园 —— 两个说的一样也得把阶段猜测拽回花园。
+    留着那个陈旧值的话, 下一圈服务器号一读不到, current 就退回 stage_state.map_name 又变成下水道。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("sewers")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: "garden")
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: (_ for _ in ()).throw(KeyboardInterrupt))
+    st = main._StageState(route)
+    st.advance()                               # 阶段状态说"已经在下水道了"
+    with pytest.raises(KeyboardInterrupt):
+        main._run_entry_route(route, st, timeout=5)
+    assert st.map_name == "garden"
+
+
+def test_entry_route_closes_the_runtime_door_on_every_exit(monkeypatch):
+    """走门那一段挖开的门, 出 _run_entry_route 就得关上 —— 不然超时/被打断回去之后, 紧接着的
+    刷怪寻路会把那扇门当普通空地踩上去被传走。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("anthell")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    monkeypatch.setattr(main, "apply_map", lambda n: None)     # 别让 apply_map 顺手清掉
+    seen = []
+
+    def pathing(loc, area, **kw):
+        seen.append(tuple(main.utils.MAP_OPEN_RECTS))
+        raise KeyboardInterrupt
+    monkeypatch.setattr(main, "lazy_theta_pathing", pathing)
+    with pytest.raises(KeyboardInterrupt):
+        main._run_entry_route(route, main._StageState(route), timeout=5)
+    assert seen and seen[0]                     # 走这一段时门是挖开的
+    assert main.utils.MAP_OPEN_RECTS == ()      # 回去时关上了
+
+
 def test_entry_route_never_reads_the_canvas_on_single_stage_routes(monkeypatch):
     # 单图路线(沙漠/海洋)压根没有"我在哪一段"的问题 —— 连画布都不该碰.
     _quiet_entry_env(monkeypatch)
     reads = []
     monkeypatch.setattr(main, "_canvas_zone_map", lambda: reads.append(1) or "anthell")
+    monkeypatch.setattr(main, "_canvas_scale_zone", lambda r: reads.append(1) or "anthell")
     monkeypatch.setattr(main, "apply_map", lambda n: None)
     monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: None)
     route = map_routes.route_for("desert")
     assert main._run_entry_route(route, main._StageState(route)) == "arrived"
     assert reads == []
+
+
+def test_canvas_zone_and_scale_reads_never_drain_the_canvas_log(monkeypatch):
+    """认图的两次读都只能偷看 __canvasLog: drain 会清空日志(把 scan_enemies /
+    canvas_player_world 的帧偷走), 而且每次白等 0.3 秒 —— 进场路线每圈都要读一次。
+    清空还会互相打断: 先 drain 一遍再读缩放比, 读的就是刚被清空的那份日志。"""
+    monkeypatch.setattr(main, "_drain_second_newest_frame",
+                        lambda *a, **k: pytest.fail("认图不该清空画布日志"))
+    monkeypatch.setattr(main, "canvas_zone_map", lambda: "anthell")
+    assert main._canvas_zone_map() == "anthell"
+
+    monkeypatch.setattr(main.utils, "SCREEN_HEIGHT", main.utils._REF_HEIGHT)
+    monkeypatch.setattr(main.utils, "canvas_minimap_scale",
+                        lambda: main.utils.MINIMAP_SCALE_HINTS["sewers"])
+    assert main._canvas_scale_zone(map_routes.route_for("sewers")) == "sewers"
+    monkeypatch.setattr(main.utils, "canvas_minimap_scale", lambda: None)
+    assert main._canvas_scale_zone(map_routes.route_for("sewers")) is None
 
 
 def test_force_utf8_stdio_lets_a_gbk_stream_print_emoji(monkeypatch):
@@ -3065,6 +3430,46 @@ def test_auto_farming_kites_a_swarm(monkeypatch):
     assert moved == {"swarm": swarm, "repel": [(1, 2)], "target": (1234.0, 567.0)}
 
 
+def test_auto_farming_screenshots_for_the_death_screen_only_every_half_second(monkeypatch):
+    # 第六份录像: 刷怪主循环每拍近 1 秒, 每拍两张截图查死亡/开局画面是其中一块
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("flee", [(1100.0, 540.0)]), [], 0.0, True))
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    shots = []
+    monkeypatch.setattr(main, "on_death_screen", lambda: shots.append(clock["t"]) or False)
+
+    class Done(Exception):
+        pass
+    drives = []
+
+    def drive(*a, **kw):
+        drives.append(1)
+        clock["t"] += 0.1
+        if len(drives) >= 20:
+            raise Done
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 300, enemy_ai_enabled=True)
+    assert 3 <= len(shots) <= 5                     # 20 拍 × 0.1 秒 = 2 秒, 半秒一张
+
+
+def test_loop_clock_reports_where_the_time_goes(capsys):
+    c = main._LoopClock(every=30.0, now=0.0)
+    for i in range(10):
+        c.part("读位置", 0.05)
+        c.part("索敌", 0.2)
+        c.tick(0.3 if i % 2 else 0.5, now=float(i))
+    c.tick(2.0, wander=True, now=10.0)
+    assert capsys.readouterr().out == ""            # 不到 30 秒不打
+    line = c.tick(0.4, now=31.0)
+    assert "反应拍 11 个" in line and "每拍中位 400ms" in line and "漫游腿 1 条" in line
+    assert "读位置 42" in line and "索敌 167" in line   # 按拍数平均(12 拍)
+
+
 def test_auto_farming_chase_moves_by_species(monkeypatch):
     # 追击分支走 enemy_detect.chase_move_target(蠕虫绕圈、其余到停步半径就停), 不再直接调 aim.
     _pathing_env(monkeypatch)
@@ -3116,3 +3521,1053 @@ def test_auto_farming_only_circling_skips_stall_tracking(monkeypatch, species, w
     with pytest.raises(Done):
         main.auto_farming(AREA, 30, enemy_ai_enabled=True)
     assert seen["track"] is want_track
+
+
+# ── 躲怪别往墙里跑 (2026-09-28 蚁穴录像: 往左下躲究极兵蚁, 一头顶在刷怪带下沿, 速度
+# 304 -> 11, 被贴身打死) ─────────────────────────────────────────────────────
+
+def _corridor(y0=85, y1=96, size=300):
+    import numpy as np
+    m = np.zeros((size, size), dtype=np.uint8)
+    m[y0:y1 + 1, 5:200] = 255
+    return m
+
+
+def test_flee_into_a_wall_is_turned_along_the_corridor():
+    # 贴着刷怪带下沿(y=95), 理想方向左下 -> 下面是墙, 转成沿走廊往左
+    center = (960.0, 540.0)
+    want = (960.0 - 283.0, 540.0 + 283.0)                 # 左下 45°
+    got = main._steer_clear_of_walls(want, center, (60, 95), _corridor())
+    dx, dy = got[0] - center[0], got[1] - center[1]
+    assert dx < 0 and abs(dy) < abs(dx)                    # 主要往左
+    assert math.hypot(dx, dy) == pytest.approx(math.hypot(283.0, 283.0))
+
+
+def test_flee_with_open_space_is_left_alone():
+    center = (960.0, 540.0)
+    want = (660.0, 540.0)                                   # 正左, 走廊里一路通
+    assert main._steer_clear_of_walls(want, center, (60, 90), _corridor()) == want
+
+
+def test_flee_never_turns_back_toward_the_threat():
+    # 死胡同: 除了来路(右边)全是墙 -> 不掉头, 保持原方向
+    import numpy as np
+    m = np.zeros((300, 300), dtype=np.uint8)
+    m[90, 60:200] = 255                                     # 只剩往右一条路
+    center = (960.0, 540.0)
+    want = (660.0, 540.0)                                   # 往左躲(怪在右边)
+    assert main._steer_clear_of_walls(want, center, (60, 90), m) == want
+
+
+def test_flee_steering_is_skipped_without_a_map_or_position():
+    center = (960.0, 540.0)
+    assert main._steer_clear_of_walls((700.0, 540.0), center, None, _corridor()) == (700.0, 540.0)
+    assert main._steer_clear_of_walls((700.0, 540.0), center, (60, 90), None) == (700.0, 540.0)
+    assert main._steer_clear_of_walls(center, center, (60, 90), _corridor()) == center
+
+
+def test_auto_farming_flee_is_steered_clear_of_walls(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("flee", [(1100, 540)]), [], 0.0, True))
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+    seen = {}
+
+    class Done(Exception):
+        pass
+
+    def steer(mouse_target, center, pos, binary_map):
+        seen["args"] = (pos, binary_map is not None)
+        return (1.0, 2.0)
+
+    def drive(mouse_target, *a, **kw):
+        seen["target"] = mouse_target
+        raise Done
+
+    monkeypatch.setattr(main, "_steer_clear_of_walls", steer)
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    assert seen == {"args": ((20, 40), True), "target": (1.0, 2.0)}
+
+
+def test_maybe_scan_enemies_tracks_charging_ultras_and_passes_the_early_radius(monkeypatch):
+    seen = {}
+    dets = [{"species": "soldier_ant", "rarity": "Ultra", "screen_pos": (1300, 540),
+             "world": (900.0, 0.0)}]
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: dets)
+    monkeypatch.setattr(main.enemy_detect, "last_player_world", lambda: (0.0, 0.0))
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda d, **k: seen.update(k, marked=d[0].get("approaching"))
+                        or ("wander", None))
+    monkeypatch.setattr(main, "_APPROACH", main.enemy_detect.ApproachTracker())
+    for map_name, want in (("anthell", 400), ("desert", None)):
+        monkeypatch.setattr(main.utils, "MAP", map_name)
+        main._maybe_scan_enemies(True, main.ENEMY_SCAN_INTERVAL + 1.0, 0.0, ("wander", None), [])
+        assert seen["avoid_early_px"] == want
+        assert seen["marked"] is False            # 第一眼, 还算不出速度
+
+
+def test_maybe_scan_enemies_cached_ticks_do_not_feed_the_tracker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "_APPROACH", type("T", (), {"update": lambda self, *a: calls.append(a)})())
+    main._maybe_scan_enemies(True, 1.0, 0.99, ("wander", None), [])     # 节流, 不扫
+    assert calls == []
+
+
+# ── 寻路路上也躲究极 (用户 2026-09-28; 第二份录像 8 次死亡里 3 次死在去刷怪区的路上) ──
+
+class _FakeWatch:
+    """_PathingEnemyWatch 的替身: 按脚本依次回答"现在要不要躲"。"""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.decision = ("flee", [(1100, 540)])
+
+    def should_flee(self):
+        return self.answers.pop(0) if self.answers else False
+
+
+def test_execute_path_hands_back_when_an_ultra_needs_dodging():
+    moves = []
+    orig = main.move_to_position
+
+    def move(a, b, on_tick=None, **kw):
+        moves.append(b)
+        return (on_tick(b) if on_tick else None) or True
+
+    main.move_to_position = move
+    try:
+        got = main.execute_path([(0, 0), (1, 1), (2, 2)], enemy_watch=_FakeWatch([False, True]))
+    finally:
+        main.move_to_position = orig
+    assert got == "enemy" and moves == [(1, 1), (2, 2)]
+
+
+def test_execute_path_reaching_the_goal_wins_over_dodging():
+    orig = main.move_to_position
+    main.move_to_position = lambda a, b, on_tick=None, **kw: on_tick(b) or True
+    try:
+        got = main.execute_path([(0, 0), (1, 1)], stop_when=lambda p: True,
+                                enemy_watch=_FakeWatch([True]))
+    finally:
+        main.move_to_position = orig
+    assert got is True
+
+
+def test_lazy_theta_pathing_dodges_then_replans(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
+    positions = iter([(30, 30), (30, 30), (40, 40), (40, 40)])
+    monkeypatch.setattr(main, "get_player_position", lambda: next(positions))
+    results = iter(["enemy", True])
+    monkeypatch.setattr(main, "execute_path", lambda path, **kw: next(results))
+    fled = []
+    monkeypatch.setattr(main, "_flee_while_pathing", lambda watch: fled.append(watch))
+    watch = _FakeWatch([])
+    assert main.lazy_theta_pathing((40, 40), [[(35, 35), (45, 45)]], enemy_watch=watch) is True
+    assert fled == [watch]
+
+
+def test_flee_while_pathing_runs_until_clear(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960.0, 540.0))
+    monkeypatch.setattr(main, "reset_keyboard", lambda: None)
+    drives = []
+    monkeypatch.setattr(main, "_drive_and_check_stall",
+                        lambda target, pos, hist, *a, **kw: drives.append(target))
+    main._flee_while_pathing(_FakeWatch([True, True, False]))
+    assert len(drives) == 2
+    assert all(t[0] < 960 for t in drives)          # 背离右边的究极
+
+
+def test_flee_while_pathing_gives_up_after_a_while(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    monkeypatch.setattr(main, "reset_keyboard", lambda: None)
+    monkeypatch.setattr(main, "_drive_and_check_stall", lambda *a, **kw: None)
+    clock = {"t": 100.0}
+
+    def tick():
+        clock["t"] += 1.0
+        return clock["t"]
+    monkeypatch.setattr(main.time, "time", tick)
+    main._flee_while_pathing(_FakeWatch([True] * 1000))
+    assert clock["t"] - 100.0 <= main.PATH_FLEE_MAX_S + 3
+
+
+def test_flee_while_pathing_stops_on_death(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "on_death_screen", lambda: True)
+    monkeypatch.setattr(main, "reset_keyboard", lambda: None)
+    monkeypatch.setattr(main, "_drive_and_check_stall", lambda *a, **kw: pytest.fail("死了还在躲"))
+    main._flee_while_pathing(_FakeWatch([True] * 5))
+
+
+def test_flee_while_pathing_does_not_track_stalls_without_a_position(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: None)
+    monkeypatch.setattr(main, "reset_keyboard", lambda: None)
+    seen = []
+    monkeypatch.setattr(main, "_drive_and_check_stall",
+                        lambda target, pos, hist, *a, **kw: seen.append(kw.get("track_stall", True)))
+    main._flee_while_pathing(_FakeWatch([True, False]))
+    assert seen == [False]
+
+
+# ── 躲究极往哪跑: flee_planner 接进刷怪 / 寻路两处躲避(第五份录像两次死亡) ──────────
+
+_ZOOM = 0.45
+
+
+def _flee_plan_env(monkeypatch, me_world=(31488.0, 31488.0)):
+    """me_world 默认落在小地图 (150, 150) 附近; 整张图都能走。"""
+    import numpy as np
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    monkeypatch.setattr(main.enemy_detect, "last_player_world", lambda: me_world)
+    monkeypatch.setattr(main, "mouse_scale", lambda: 1.0)
+    return np.full((300, 300), 255, dtype=np.uint8)
+
+
+def _det_at(species, rarity, screen, me_world=(31488.0, 31488.0)):
+    world = (me_world[0] + (screen[0] - 960.0) / _ZOOM, me_world[1] + (screen[1] - 540.0) / _ZOOM)
+    return {"species": species, "rarity": rarity, "screen_pos": screen, "world": world,
+            "bbox": (0, 0, 0, 0), "confidence": 1.0}
+
+
+def test_flee_goes_around_a_crowd_instead_of_into_it(monkeypatch):
+    bm = _flee_plan_env(monkeypatch)
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    crowd = [_det_at("soldier_ant", "Legendary", (1100.0 + 60 * i, 540.0 + 60 * j))
+             for i in range(3) for j in (-1, 0, 1)]
+    tx, ty = main._FLEE_PLAN.target([ultra["screen_pos"]], [ultra] + crowd, (960.0, 540.0),
+                                    (150, 150), bm, now=10.0)
+    assert abs(ty - 540) > abs(tx - 960) * 0.5      # 往上或往下绕, 不是正右边撞进怪群
+    assert tx > 960 - 150                            # 也不是回头冲究极
+    # 老办法就是正右边: 这条测试就是为它写的
+    old = main.enemy_detect.flee_mouse_target([ultra["screen_pos"]], center=(960.0, 540.0))
+    assert abs(old[1] - 540) < 1
+
+
+def test_flee_falls_back_to_the_old_way_without_a_world_position(monkeypatch):
+    bm = _flee_plan_env(monkeypatch, me_world=None)
+    monkeypatch.setattr(main.enemy_detect, "last_player_world", lambda: None)
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    got = main._FLEE_PLAN.target([ultra["screen_pos"]], [ultra], (960.0, 540.0), (150, 150), bm)
+    want = main._steer_clear_of_walls(
+        main.enemy_detect.flee_mouse_target([ultra["screen_pos"]], center=(960.0, 540.0)),
+        (960.0, 540.0), (150, 150), bm)
+    assert got == want
+
+
+def test_flee_falls_back_when_the_planner_blows_up(monkeypatch, capsys):
+    bm = _flee_plan_env(monkeypatch)
+    monkeypatch.setattr(main.flee_planner, "plan_flee",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError("坏了")))
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    tx, ty = main._FLEE_PLAN.target([ultra["screen_pos"]], [ultra], (960.0, 540.0), (150, 150), bm)
+    assert tx > 960                                  # 老办法: 背离左边的究极
+    assert "躲避规划出错" in capsys.readouterr().out
+
+
+def test_flee_plan_keeps_its_goal_between_ticks_and_forgets_it_later(monkeypatch):
+    bm = _flee_plan_env(monkeypatch)
+    calls = []
+
+    def fake(bm_, me, chasers, crowd, prefer=None):
+        calls.append(prefer)
+        return {"dir": (0.0, 1.0), "goal": (150, 170), "lead": 3.0, "safe": True}
+    monkeypatch.setattr(main.flee_planner, "plan_flee", fake)
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    args = ([ultra["screen_pos"]], [ultra], (960.0, 540.0), (150, 150), bm)
+    first = main._FLEE_PLAN.target(*args, now=10.0)
+    again = main._FLEE_PLAN.target(*args, now=10.05)        # 不到 FLEE_REPLAN_S: 沿用, 不重算
+    main._FLEE_PLAN.target(*args, now=10.2)
+    main._FLEE_PLAN.target(*args, now=10.2 + main.FLEE_PLAN_FORGET_S + 0.5)
+    assert first == again == (960.0, 940.0)
+    assert calls == [None, (150, 170), None]
+
+
+def test_flee_plan_takes_an_explicit_world_position(monkeypatch):
+    # analyze_recording 离线重放时没有"最近一次索敌扫描", 自己把每帧的世界坐标递进来
+    bm = _flee_plan_env(monkeypatch)
+    monkeypatch.setattr(main.enemy_detect, "last_player_world", lambda: None)
+    seen = {}
+    monkeypatch.setattr(main.flee_planner, "plan_flee",
+                        lambda bm_, me, *a, **k: seen.setdefault("me", me) and None)
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    main._FLEE_PLAN.target([ultra["screen_pos"]], [ultra], (960.0, 540.0), (150, 150), bm,
+                           me_world=(31488.0, 31488.0))
+    assert seen["me"] == pytest.approx((150.0, 150.0), abs=0.1)
+
+
+def test_flee_counts_every_nearby_ultra_as_a_chaser(monkeypatch):
+    bm = _flee_plan_env(monkeypatch)
+    seen = {}
+
+    def fake(bm_, me, chasers, crowd, prefer=None):
+        seen["chasers"], seen["crowd"] = chasers, crowd
+        return None
+    monkeypatch.setattr(main.flee_planner, "plan_flee", fake)
+    trig = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    other = _det_at("worm", "Ultra", (960.0, 900.0))              # 没触发躲避, 但 450px 内
+    far = _det_at("soldier_ant", "Ultra", (960.0 + 600, 540.0))   # 太远
+    baby = _det_at("baby_ant", "Mythic", (1000.0, 540.0))         # 被动的不算怪群
+    leg = _det_at("soldier_ant", "Legendary", (1000.0, 600.0))
+    main._FLEE_PLAN.target([trig["screen_pos"]], [trig, other, far, baby, leg],
+                           (960.0, 540.0), (150, 150), bm)
+    assert len(seen["chasers"]) == 2 and len(seen["crowd"]) == 1
+
+
+def test_move_to_position_hands_over_without_braking(monkeypatch):
+    # 交班(躲究极 / 进区了)不踩刹车: reset_keyboard 会把鼠标挪回屏幕中心
+    _stub_move_env(monkeypatch, pos=(10, 10))
+    calls = []
+    monkeypatch.setattr(main, "reset_keyboard", lambda: calls.append("reset"))
+    monkeypatch.setattr(main, "release_keys", lambda: calls.append("release"))
+    assert main.move_to_position((10, 10), (999, 999), on_tick=lambda p: "enemy") == "enemy"
+    assert calls == ["release"]
+
+
+def test_flee_while_pathing_hands_back_without_braking(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    calls = []
+    monkeypatch.setattr(main, "reset_keyboard", lambda: calls.append("reset"))
+    monkeypatch.setattr(main, "release_keys", lambda: calls.append("release"))
+    monkeypatch.setattr(main, "_drive_and_check_stall", lambda *a, **kw: None)
+    main._flee_while_pathing(_FakeWatch([True, False]))
+    assert calls == ["release"]
+
+
+def test_release_keys_lets_go_of_attack_and_defense_but_leaves_the_mouse(monkeypatch):
+    up, moved = [], []
+    monkeypatch.setattr(main.pyautogui, "keyUp", up.append)
+    monkeypatch.setattr(main.pyautogui, "moveTo", lambda *a, **k: moved.append(a))
+    _REAL_RELEASE_KEYS()
+    assert sorted(up) == ["shift", "space"] and moved == []
+
+
+def test_pathing_flee_log_names_the_ultra(monkeypatch):
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960.0, 540.0))
+    w = _FakeWatch([])
+    d = _det_at("soldier_ant", "Ultra", (960.0, 390.0))
+    d["approaching"] = True
+    w.decision, w.detections = ("flee", [d["screen_pos"]]), [d]
+    assert main._describe_threats(w) == "soldier_ant(Ultra) 150px 冲过来"
+    assert main._describe_threats(_FakeWatch([])) == "?"          # 替身没有 detections 也不能炸
+
+
+# ── 人被传送门传到别的图: 第六份录像拿蚁穴的图在花园里寻路卡了 13 分钟 ─────────────
+
+def test_pathing_hands_back_when_the_player_is_on_another_map(monkeypatch, capsys):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    monkeypatch.setattr(main, "canvas_zone_map", lambda: "garden")
+    monkeypatch.setattr(main, "get_player_position",
+                        lambda: pytest.fail("人不在这张图上, 不该再按这张图读位置"))
+    assert main.lazy_theta_pathing((18, 91), [[(7, 85), (61, 96)]]) is False
+    assert main._WRONG_MAP_SEEN == "garden"
+    assert "人在 garden" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("zone", ["anthell", None])
+def test_pathing_goes_on_when_on_the_right_map_or_the_zone_is_unknown(monkeypatch, zone):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    monkeypatch.setattr(main, "canvas_zone_map", lambda: zone)
+    monkeypatch.setattr(main, "get_player_position", lambda: (40, 90))
+    assert main.lazy_theta_pathing((18, 91), [[(7, 85), (61, 96)]]) is True
+    assert main._WRONG_MAP_SEEN is None
+
+
+def test_pathing_watch_only_cares_about_flee(monkeypatch):
+    decisions = iter([(("chase", "x", 1, []), [], 1.0, True), (("flee", [(1, 2)]), [], 2.0, True)])
+    monkeypatch.setattr(main, "_maybe_scan_enemies", lambda *a, **k: next(decisions))
+    w = main._PathingEnemyWatch()
+    assert w.should_flee() is False and w.should_flee() is True
+    assert w.decision == ("flee", [(1, 2)])
+
+
+@pytest.mark.parametrize("ai, want", [(True, True), (False, False)])
+def test_walking_back_into_the_area_dodges_ultras_only_with_enemy_ai(monkeypatch, ai, want):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (90, 90))      # 区外
+    seen = {}
+
+    class Done(Exception):
+        pass
+
+    def pathing(target, area, **kw):
+        seen["watch"] = kw.get("enemy_watch")
+        raise Done
+    monkeypatch.setattr(main, "lazy_theta_pathing", pathing)
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [], 0.0, False))
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=ai)
+    assert isinstance(seen["watch"], main._PathingEnemyWatch) is want
+
+
+@pytest.mark.parametrize("ai", [True, False])
+def test_run_worker_walks_to_the_farm_dodging_ultras_only_with_enemy_ai(monkeypatch, ai):
+    _stub_run_worker_env(monkeypatch)
+    cfg = main._apply_worker_config({})
+    monkeypatch.setattr(main, "_apply_worker_config", lambda c: dict(cfg, enemy_ai_enabled=ai))
+    monkeypatch.setattr(main, "_reassert_florr_toggles", lambda *a, **k: {})
+    seen = {}
+
+    def pathing(target, area, **kw):
+        seen["watch"] = kw.get("enemy_watch")
+        raise KeyboardInterrupt
+    monkeypatch.setattr(main, "lazy_theta_pathing", pathing)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert isinstance(seen["watch"], main._PathingEnemyWatch) is ai
+
+
+# ── 蚁穴: 走回花园的传送门, 传送时换服, 出生点不重置 (用户 2026-09-28) ──────────
+# 直接换服 = 新服从花园出生点走过来(录像里每次 2 分多钟); 用户给的技巧: 蚁穴里走进回花园
+# 的门, 传送(黑屏)那一下换服, 新服里还是蚁穴出生点。
+
+def test_portal_staging_point_is_walkable_and_off_the_portal():
+    import numpy as np
+    m = np.zeros((300, 300), dtype=np.uint8)
+    m[95:110, 110:140] = 255
+    m[102, 121] = 0                                   # 门本身是墙
+    x, y = main._portal_staging_point(m, (121, 102))
+    assert m[y, x] == 255
+    assert 3 <= math.hypot(x - 121, y - 102) < 4
+
+
+_PW = None   # map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD, 在 _portal_env 里取
+
+
+def _portal_env(monkeypatch, *, pathing=True, worlds=(), dead=False, here=(128, 102)):
+    """worlds: 依次读到的自己世界坐标(None = 这一拍读不到小地图点 = 传送黑屏)。读完之后
+    一直停在最后一个值(没有就当一直在门外 2000 单位)。here: 开局读到的小地图坐标。"""
+    import numpy as np
+    m = np.zeros((300, 300), dtype=np.uint8)
+    m[95:110, 110:140] = 255
+    monkeypatch.setattr(main, "load_binary_map", lambda: m)
+    monkeypatch.setattr(main, "overlay", _StubOverlay(), raising=False)
+    seen = {"pathing": [], "switch": [], "mouse": []}
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda target, area, **kw: seen["pathing"].append((target, area)) or pathing)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: here)
+    pw = map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD
+    seq = list(worlds) or [(pw[0] + 2000.0, pw[1])]
+    state = {"i": 0}
+
+    def world():
+        v = seq[min(state["i"], len(seq) - 1)]
+        state["i"] += 1
+        return v
+    monkeypatch.setattr(main, "canvas_player_world", world)
+    monkeypatch.setattr(main, "on_death_screen", lambda: dead)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "reset_keyboard", lambda: None)
+    monkeypatch.setattr(main, "_move_mouse_safely", seen["mouse"].append)
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960.0, 540.0))
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    monkeypatch.setattr(main, "switch_server", lambda b: seen["switch"].append(b) or "srv")
+    return seen
+
+
+def _toward_portal(steps=6, start=2000.0, step=300.0):
+    pw = map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD
+    return [(pw[0] + start - i * step, pw[1]) for i in range(steps)]
+
+
+def test_portal_switch_happens_once_the_teleport_starts(monkeypatch):
+    seen = _portal_env(monkeypatch, worlds=_toward_portal() + [None, None])
+    assert main._switch_server_via_portal("garden", (121, 102)) is True
+    assert seen["switch"] == ["garden"]
+
+
+def test_portal_pulser_waits_for_rest_then_pushes_toward_the_portal():
+    target = (0.0, 0.0)
+    p = main._PortalPulser(target, now=0.0)
+    assert p.step(0.0, (500.0, 0.0)) is None                  # 先松手等停稳
+    assert p.step(0.1, (500.0, 0.0)) is None
+    ox, oy = p.step(0.3, (500.0, 0.0))                        # 停稳 0.2 秒以上 -> 朝门点一下
+    assert ox < 0 and abs(oy) < 1e-9
+    assert p.push_s == main.PORTAL_PULSE_FIRST_S
+
+
+def test_portal_pulser_does_not_mistake_a_fresh_push_for_rest():
+    # 刚推完那一下人才开始动: 拿推之前的样本比会误判"停稳了"又推一下(仿真里在门边来回点)
+    p = main._PortalPulser((0.0, 0.0), now=0.0)
+    p.step(0.0, (500.0, 0.0))
+    p.step(0.3, (500.0, 0.0))                                 # 开推
+    assert p.step(0.3 + p.push_s + 0.01, (495.0, 0.0)) is None   # 推完 -> 松手
+    assert p.step(0.3 + p.push_s + 0.05, (480.0, 0.0)) is None   # 还在滑, 别再推
+    assert p.phase == "settle"
+
+
+def test_portal_switch_needs_two_misses_in_a_row(monkeypatch):
+    # 单独一次读不到 = 刚好撞上 scan_enemies drain 画布日志, 不是传送
+    pw = map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD
+    worlds = [(pw[0] + 900, pw[1]), None, (pw[0] + 600, pw[1]), None, (pw[0] + 300, pw[1]),
+              None, None]
+    seen = _portal_env(monkeypatch, worlds=worlds)
+    assert main._switch_server_via_portal("garden", (121, 102)) is True
+    assert len(seen["switch"]) == 1
+    assert len(seen["mouse"]) == 3        # 三个读得到的拍子都在朝门走, 没被单个 None 骗去换服
+
+
+def test_portal_switch_gives_up_when_it_stops_getting_closer(monkeypatch):
+    pw = map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD
+    seen = _portal_env(monkeypatch, worlds=[(pw[0] + 1100, pw[1])])     # 顶住了, 一动不动
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock.__setitem__("t", clock["t"] + 0.25) or clock["t"])
+    assert main._switch_server_via_portal("garden", (121, 102)) is False
+    assert seen["switch"] == []
+    assert clock["t"] < main.PORTAL_SWITCH_TIMEOUT / 2      # 顶住几秒就放弃, 不耗光整个预算
+
+
+def test_portal_switch_walks_straight_when_already_near_the_portal(monkeypatch):
+    # 第四份录像: 离门 6 格, 寻路到集结点却先往下绕到 y=115, 在墙角卡了 3 分钟
+    seen = _portal_env(monkeypatch, worlds=_toward_portal() + [None, None], here=(127, 103))
+    main._switch_server_via_portal("garden", (121, 102))
+    assert seen["pathing"] == []
+
+
+def test_portal_switch_paths_over_first_when_far_away(monkeypatch):
+    seen = _portal_env(monkeypatch, worlds=_toward_portal() + [None, None], here=(60, 95))
+    main._switch_server_via_portal("garden", (121, 102))
+    assert len(seen["pathing"]) == 1
+
+
+def test_portal_switch_does_not_switch_on_the_death_screen(monkeypatch):
+    seen = _portal_env(monkeypatch, worlds=[None, None], dead=True)
+    assert main._switch_server_via_portal("garden", (121, 102)) is False
+    assert seen["switch"] == []
+
+
+# ── 走进门: 第五~七份录像跑图装 ~1000/秒 反复冲过门心, 门要人停在里面才传 ─────────
+
+class _PortalSim:
+    """带惯性的花 + 要停在里面才传送的门。按录像量的: 松手后速度时间常数 ~0.55 秒, 跑图装
+    ~1000/秒; 花园那边离门心 ~30 以内、慢下来 0.5~1 秒才传。第七份录像按住推的时候比松手
+    滑行加速得快(accel_tau), 读位置有 CDP 延迟(read_s: 每读一次时钟走这么久)、读到的是
+    lag_s 之前的位置、还带 noise 的抖动 —— 上一版控制就是被这些弄得来回振荡。鼠标离中心
+    sat_px 参照像素就满速。time.sleep 推进仿真时钟。"""
+
+    def __init__(self, start, vel=(0.0, 0.0), vmax=1000.0, tau=0.55, sat_px=50.0,
+                 teleports=True, dwell_s=0.6, accel_tau=None, read_s=0.0, lag_s=0.0,
+                 noise=0.0, seed=0):
+        import random
+        pw = map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD
+        self.target = pw
+        self.p = [pw[0] + start[0], pw[1] + start[1]]
+        self.v = list(vel)
+        self.vmax, self.tau, self.sat = vmax, tau, sat_px
+        self.accel_tau = accel_tau or tau
+        self.read_s, self.lag_s, self.noise = read_s, lag_s, noise
+        self.rnd = random.Random(seed)
+        self.cmd = (0.0, 0.0)
+        self.t = 1000.0
+        self.teleports, self.dwell_s = teleports, dwell_s
+        self.inside = 0.0
+        self.gone = False
+        self.hist = [(self.t, tuple(self.p))]
+
+    def time(self):
+        return self.t
+
+    def sleep(self, dt):
+        steps = max(1, int(round(dt / 0.005)))
+        for _ in range(steps):
+            h = 0.005
+            m = math.hypot(*self.cmd)
+            u = min(1.0, m / self.sat) if m > 1e-9 else 0.0
+            ux, uy = (self.cmd[0] / m * u, self.cmd[1] / m * u) if m > 1e-9 else (0.0, 0.0)
+            tau = self.accel_tau if u > 0 else self.tau
+            self.v[0] += (ux * self.vmax - self.v[0]) / tau * h
+            self.v[1] += (uy * self.vmax - self.v[1]) / tau * h
+            self.p[0] += self.v[0] * h
+            self.p[1] += self.v[1] * h
+            self.t += h
+            self.hist.append((self.t, (self.p[0], self.p[1])))
+            d = math.hypot(self.p[0] - self.target[0], self.p[1] - self.target[1])
+            if d < 50 and math.hypot(*self.v) < 150:
+                self.inside += h
+            else:
+                self.inside = 0.0
+            if self.teleports and self.inside >= self.dwell_s:
+                self.gone = True
+        self.hist = self.hist[-400:]
+
+    def world(self):
+        if self.read_s:
+            self.sleep(self.read_s)
+        if self.gone:
+            return None
+        want = self.t - self.lag_s
+        pos = next((p for t, p in reversed(self.hist) if t <= want), self.hist[0][1])
+        return (pos[0] + self.rnd.gauss(0, self.noise), pos[1] + self.rnd.gauss(0, self.noise))
+
+    def mouse(self, pos):
+        self.cmd = (pos[0] - 960.0, pos[1] - 540.0)
+
+
+def _portal_sim_env(monkeypatch, sim):
+    seen = _portal_env(monkeypatch, here=(121, 103))
+    monkeypatch.setattr(main.time, "time", sim.time)
+    monkeypatch.setattr(main.time, "sleep", sim.sleep)
+    monkeypatch.setattr(main, "canvas_player_world", sim.world)
+    monkeypatch.setattr(main, "_move_mouse_safely", lambda pos: (seen["mouse"].append(pos), sim.mouse(pos)))
+    monkeypatch.setattr(main, "clamp_to_screen", lambda x, y: (x, y))
+    monkeypatch.setattr(main, "mouse_scale", lambda: 1.0)
+    return seen
+
+
+_REAL_READS = dict(read_s=0.055, lag_s=0.03, noise=15.0)   # 第七份录像: 每拍 ~75ms
+
+
+@pytest.mark.parametrize("start, vel, kw", [
+    ((-381.0, 188.0), (0.0, 0.0), {}),                         # 第五份录像: 复活在门左下 ~420
+    ((1000.0, -100.0), (0.0, 0.0), {}),
+    ((-300.0, 0.0), (1000.0, 0.0), {}),                        # 正以跑图速度冲向门
+    ((-381.0, 188.0), (0.0, 0.0), {"sat_px": 150.0}),          # 鼠标要推很远才满速
+    ((-381.0, 188.0), (0.0, 0.0), {"sat_px": 20.0}),           # 鼠标一推就满速
+    ((-381.0, 188.0), (0.0, 0.0), {"vmax": 300.0}),            # 刷怪装
+    # 第七份录像的样子: 按住加速快、读数慢半拍还抖 —— 上一版在这里来回冲过门心
+    ((-470.0, 0.0), (0.0, 0.0), dict(accel_tau=0.2, **_REAL_READS)),
+    ((-470.0, 0.0), (0.0, 0.0), dict(accel_tau=0.2, sat_px=20.0, **_REAL_READS)),
+    ((200.0, -150.0), (0.0, 0.0), dict(accel_tau=0.2, tau=0.8, **_REAL_READS)),
+    ((-381.0, 188.0), (0.0, 0.0), dict(accel_tau=0.3, vmax=1300.0, **_REAL_READS)),
+    # 推多久要按计时器掐: 按读位置的节拍(~75ms)掐, 加速快的跑图装最小一下就滑 ~180, 比门还宽
+    ((0.0, -219.0), (0.0, 0.0), dict(tau=0.4, accel_tau=0.15, sat_px=20.0, read_s=0.055)),
+    ((1000.0, -100.0), (0.0, 0.0), dict(tau=0.4, accel_tau=0.15, sat_px=20.0, read_s=0.055)),
+])
+def test_portal_switch_stops_inside_the_portal_and_switches(monkeypatch, start, vel, kw):
+    sim = _PortalSim(start, vel, **kw)
+    seen = _portal_sim_env(monkeypatch, sim)
+    t0 = sim.t
+    assert main._switch_server_via_portal("garden", (121, 102)) is True
+    assert seen["switch"] == ["garden"]
+    assert sim.t - t0 < 20.0
+
+
+def test_portal_walk_loop_skips_the_pyautogui_pause_and_rarely_screenshots(monkeypatch):
+    # 第六份录像: 每拍 ~0.2 秒(moveTo 后白睡 0.1 秒 + 每拍截图查死亡), 刹车来回振荡
+    sim = _PortalSim((-381.0, 188.0))
+    seen = _portal_sim_env(monkeypatch, sim)
+    pauses, deaths = [], []
+    monkeypatch.setattr(main.pyautogui, "PAUSE", 0.1)
+    monkeypatch.setattr(main, "_move_mouse_safely",
+                        lambda pos: (pauses.append(main.pyautogui.PAUSE), sim.mouse(pos)))
+    monkeypatch.setattr(main, "on_death_screen", lambda: deaths.append(1) or False)
+    assert main._switch_server_via_portal("garden", (121, 102)) is True
+    assert pauses and set(pauses) == {0}
+    assert main.pyautogui.PAUSE == 0.1                  # 用完还回去, 寻路那边的节奏不变
+    assert len(deaths) < len(pauses) / 5
+
+
+def test_reset_keyboard_does_not_sleep_between_keys(monkeypatch):
+    # 6 次 pyautogui 调用 × 0.1 秒 = 每次交班 / 每段路结束原地停 0.6 秒
+    seen = []
+    monkeypatch.setattr(main.pyautogui, "PAUSE", 0.1)
+    monkeypatch.setattr(main.pyautogui, "keyUp", lambda k: seen.append(main.pyautogui.PAUSE))
+    monkeypatch.setattr(main, "keyup", lambda d: seen.append(main.pyautogui.PAUSE))
+    main.reset_keyboard()
+    assert seen == [0] * 6 and main.pyautogui.PAUSE == 0.1
+
+
+def test_portal_switch_steps_out_and_back_in_then_gives_up(monkeypatch):
+    # 站在门里就是不传送(比如刚落地时那样): 出去再进两次, 然后交回调用方直接换服
+    sim = _PortalSim((-381.0, 188.0), teleports=False)
+    seen = _portal_sim_env(monkeypatch, sim)
+    t0 = sim.t
+    assert main._switch_server_via_portal("garden", (121, 102)) is False
+    assert seen["switch"] == []
+    spent = sim.t - t0
+    assert spent >= (main.PORTAL_REENTRY_MAX + 1) * main.PORTAL_DWELL_MAX_S
+    assert spent < main.PORTAL_SWITCH_TIMEOUT
+
+
+def test_portal_switch_is_only_for_anthell():
+    assert main._portal_switch_target({"map_name": "anthell"}) == map_routes.ANTHELL_TO_GARDEN_PORTAL
+    assert main._portal_switch_target({"map_name": "desert"}) is None
+
+
+def _anthell_switch_worker(monkeypatch, portal_result):
+    _stub_run_worker_env(monkeypatch)
+    cfg = main._apply_worker_config({})
+    monkeypatch.setattr(main, "_apply_worker_config", lambda c: dict(
+        cfg, map_name="anthell", biome="garden", auto_switch_server=True, short_round_limit=1))
+    monkeypatch.setattr(main, "on_start_screen", lambda: True)
+    monkeypatch.setattr(main, "click_start_game", lambda: True)
+    monkeypatch.setattr(main, "_reassert_florr_toggles", lambda *a, **k: {})
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda *a, **k: False)   # 短局
+    log = []
+    monkeypatch.setattr(main, "switch_server", lambda b: log.append(("direct", b)) or "srv")
+
+    def via_portal(biome, portal, **kw):
+        log.append(("portal", biome, portal))
+        if len([e for e in log if e[0] == "portal"]) >= 1 and len(log) >= 3:
+            raise KeyboardInterrupt
+        return portal_result
+    monkeypatch.setattr(main, "_switch_server_via_portal", via_portal)
+    return log
+
+
+def test_anthell_switch_waits_for_the_portal_instead_of_switching_on_the_spot(monkeypatch):
+    log = _anthell_switch_worker(monkeypatch, portal_result=True)
+    rounds = {"n": 0}
+    orig = main._run_entry_route
+
+    def entry(*a, **k):
+        rounds["n"] += 1
+        if rounds["n"] > 3:
+            raise KeyboardInterrupt
+        return orig(*a, **k)
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert log[0] == ("portal", "garden", map_routes.ANTHELL_TO_GARDEN_PORTAL)
+    assert ("direct", "garden") not in log
+
+
+def test_anthell_switch_falls_back_to_a_direct_switch(monkeypatch):
+    log = _anthell_switch_worker(monkeypatch, portal_result=False)
+    rounds = {"n": 0}
+    orig = main._run_entry_route
+
+    def entry(*a, **k):
+        rounds["n"] += 1
+        if rounds["n"] > 2:
+            raise KeyboardInterrupt
+        return orig(*a, **k)
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert log[:2] == [("portal", "garden", map_routes.ANTHELL_TO_GARDEN_PORTAL),
+                       ("direct", "garden")]
+
+
+def test_anthell_portal_switch_pending_but_stuck_outside_switches_directly(monkeypatch):
+    log = _anthell_switch_worker(monkeypatch, portal_result=True)
+    results = iter(["arrived", "timeout"])
+
+    def entry(*a, **k):
+        try:
+            return next(results)
+        except StopIteration:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    # 第 1 轮进了蚁穴、没到刷怪区 -> 记下"走门换服"; 第 2 轮人卡在外面 -> 当场直接换
+    assert log == [("direct", "garden")]
+
+
+def _teleported_rounds(monkeypatch, entries_see_garden):
+    log = _anthell_switch_worker(monkeypatch, portal_result=True)
+
+    def pathing(*a, **k):
+        main._WRONG_MAP_SEEN = "garden"          # 去刷怪区的路上发现人在花园
+        return False
+    monkeypatch.setattr(main, "lazy_theta_pathing", pathing)
+    rounds = {"n": 0}
+
+    def entry(route, stage_state, **k):
+        rounds["n"] += 1
+        if rounds["n"] > 3:
+            raise KeyboardInterrupt
+        if entries_see_garden:
+            main._WRONG_MAP_SEEN = "anthell"     # 进场本身在花园走着被洞口传进蚁穴 —— 正常进场
+        return "arrived"
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    return log
+
+
+def test_a_round_ended_by_a_teleport_is_not_a_short_round(monkeypatch):
+    # 第六份录像: 蚁穴复活后站进回花园的门被传走。不是死了也不是洞口进不去, 不该攒换服次数
+    assert _teleported_rounds(monkeypatch, entries_see_garden=False) == []
+
+
+def test_the_entry_route_walking_through_the_hole_does_not_count_as_a_teleport(monkeypatch):
+    # 只有进场之后再被传走才算: 进场路线自己被洞口传进蚁穴时寻路也会说"不在这张图"
+    orig = main.lazy_theta_pathing
+    log = _anthell_switch_worker(monkeypatch, portal_result=True)
+    rounds = {"n": 0}
+
+    def entry(route, stage_state, **k):
+        rounds["n"] += 1
+        if rounds["n"] > 3:
+            raise KeyboardInterrupt
+        main._WRONG_MAP_SEEN = "anthell"
+        return "arrived"
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert log and log[0][0] == "portal"          # 短局照常攒, 攒够了照常走门换服
+
+
+def test_portal_switch_turns_off_invert_defense_and_restores_it_when_it_fails(monkeypatch):
+    # 第三份录像: 开着反转防御, 泡泡把人推来推去, 两次都在门边晃、没踩上(最近 ~130 世界单位)。
+    # 花园进场贴洞口时就会先关掉它, 这里同理。
+    seen = _portal_env(monkeypatch, dead=True)             # 没走进去
+    flags = []
+    monkeypatch.setattr(main.florr_settings, "ensure_flag",
+                        lambda ev, addr, want: flags.append((addr, want)) or ("changed", ""))
+    assert main._switch_server_via_portal("garden", (121, 102), want_defense=True) is False
+    addr = main.florr_settings.INVERT_DEFENSE_ADDR
+    assert flags == [(addr, 0), (addr, 1)]
+
+
+def test_portal_switch_leaves_defense_off_once_it_switched(monkeypatch):
+    # 换成了就不用恢复: 新服进局后每轮开头 _reassert_florr_toggles 会按时块配置写回
+    _portal_env(monkeypatch, worlds=[None, None])
+    flags = []
+    monkeypatch.setattr(main.florr_settings, "ensure_flag",
+                        lambda ev, addr, want: flags.append(want) or ("changed", ""))
+    assert main._switch_server_via_portal("garden", (121, 102), want_defense=True) is True
+    assert flags == [0]
+
+
+def test_portal_switch_does_not_touch_defense_when_it_is_not_inverted(monkeypatch):
+    _portal_env(monkeypatch, worlds=[None, None])
+    monkeypatch.setattr(main.florr_settings, "ensure_flag",
+                        lambda *a: pytest.fail("没开反转防御就别碰它"))
+    assert main._switch_server_via_portal("garden", (121, 102), want_defense=False) is True
+
+
+def test_portal_switch_staging_box_is_not_pixel_tight(monkeypatch):
+    # 第三份录像: ±1 格的框让它在集结点附近来回重规划了 16 秒
+    _portal_env(monkeypatch, worlds=[None, None], here=(60, 95))
+    boxes = []
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda target, area, **kw: boxes.append(area) or True)
+    main._switch_server_via_portal("garden", (121, 102))
+    (x0, y0), (x1, y1) = boxes[0][0]
+    assert x1 - x0 >= 4 and y1 - y0 >= 4
+
+
+# ── 躲开了就多躲一会儿 (第三份录像: 究极一退出 200px 就不躲了, 漫游/寻路又走回它身边,
+#    躲 -> 走回去 -> 躲, 来回四次把血磨光) ────────────────────────────────────
+
+def _ultra_det(x, y=540):
+    return {"species": "soldier_ant", "rarity": "Ultra", "screen_pos": (x, y)}
+
+
+def test_flee_latch_keeps_fleeing_until_the_ultra_is_far_enough():
+    latch = main._FleeLatch()
+    c = (960.0, 540.0)
+    assert latch.apply(("flee", [(1100, 540)]), [_ultra_det(1100)], c, 10.0)[0] == "flee"
+    # 退到 300px: 原决策已经不躲了, 滞回接着躲
+    got = latch.apply(("wander", None), [_ultra_det(1260)], c, 10.5)
+    assert got == ("flee", [(1260, 540)])
+    # 退到 FLEE_RELEASE_PX 外: 放开
+    far = 960 + main.FLEE_RELEASE_PX + 20
+    assert latch.apply(("chase", "x", 1, []), [_ultra_det(far)], c, 11.0) == ("chase", "x", 1, [])
+
+
+def test_flee_latch_gives_up_after_a_while():
+    latch = main._FleeLatch()
+    c = (960.0, 540.0)
+    latch.apply(("flee", [(1100, 540)]), [_ultra_det(1100)], c, 10.0)
+    later = 10.0 + main.FLEE_LATCH_MAX_S + 0.1
+    assert latch.apply(("wander", None), [_ultra_det(1260)], c, later) == ("wander", None)
+
+
+def test_flee_latch_without_a_recent_flee_changes_nothing():
+    latch = main._FleeLatch()
+    assert latch.apply(("wander", None), [_ultra_det(1100)], (960.0, 540.0), 10.0) == ("wander", None)
+
+
+def test_flee_latch_ignores_non_avoid_mobs():
+    latch = main._FleeLatch()
+    c = (960.0, 540.0)
+    latch.apply(("flee", [(1100, 540)]), [_ultra_det(1100)], c, 10.0)
+    mythic = {"species": "soldier_ant", "rarity": "Mythic", "screen_pos": (1100, 540)}
+    assert latch.apply(("chase", mythic, 120, []), [mythic], c, 10.5)[0] == "chase"
+
+
+def test_maybe_scan_enemies_applies_the_flee_latch(monkeypatch):
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [_ultra_det(1260)])
+    monkeypatch.setattr(main.enemy_detect, "select_action", lambda d, **k: ("wander", None))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960.0, 540.0))
+    latch = main._FleeLatch()
+    latch.last_flee = 99.9
+    monkeypatch.setattr(main, "_FLEE_LATCH", latch)
+    monkeypatch.setattr(main.time, "time", lambda: 100.0)
+    decision = main._maybe_scan_enemies(True, 100.0, 0.0, ("wander", None), [])[0]
+    assert decision == ("flee", [(1260, 540)])
+
+
+def _band(y0=85, y1=96):
+    m = np.zeros((300, 300), dtype=np.uint8)
+    m[y0:y1 + 1, 5:200] = 255
+    return m
+
+
+def test_line_walkable_sees_a_clear_corridor():
+    assert main._line_walkable(_band(), (20, 90), (60, 92)) is True
+
+
+def test_line_walkable_is_blocked_by_a_wall():
+    m = _band()
+    m[85:97, 40] = 0                                    # 一堵竖墙
+    assert main._line_walkable(m, (20, 90), (60, 92)) is False
+
+
+def test_line_of_sight_reach_checks_area_and_walls(monkeypatch):
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    s = main.utils.MINIMAP_WORLD_SCALE["anthell"]
+
+    def at(mx, my):
+        return {"world": (mx / s - 1000, my / s - 1000)}
+
+    reach = main._line_of_sight_reach(_band(), [(7, 85), (61, 96)], (20, 90))
+    assert reach(at(50, 92)) is True                    # 区里、直线可走
+    assert reach(at(80, 92)) is False                   # 出了刷怪区
+    m = _band()
+    m[85:97, 40] = 0
+    walled = main._line_of_sight_reach(m, [(7, 85), (61, 96)], (20, 90))
+    assert walled(at(50, 92)) is False                  # 隔着墙
+    assert reach({}) is False                           # 没有世界坐标
+
+
+def test_line_of_sight_reach_needs_a_measured_map(monkeypatch):
+    monkeypatch.setattr(main.utils, "MAP", "sewers")     # 没实测过缩放的图(海洋/丛林现在有了)
+    assert main._line_of_sight_reach(_band(), [(7, 85), (61, 96)], (20, 90)) is None
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    assert main._line_of_sight_reach(_band(), [(7, 85), (61, 96)], None) is None
+
+
+def test_maybe_scan_enemies_passes_can_reach_through(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [])
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda d, **k: seen.update(k) or ("wander", None))
+    probe = lambda det: True
+    main._maybe_scan_enemies(True, main.ENEMY_SCAN_INTERVAL + 1.0, 0.0, ("wander", None), [],
+                             can_reach=probe)
+    assert seen["can_reach"] is probe
+
+
+def test_auto_farming_scans_with_a_reach_check(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    seen = {}
+
+    class Done(Exception):
+        pass
+
+    def scan(*a, **k):
+        seen["can_reach"] = k.get("can_reach")
+        raise Done
+    monkeypatch.setattr(main, "_maybe_scan_enemies", scan)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    assert callable(seen["can_reach"])
+
+
+# ── 位置在两点之间来回跳, 也要判卡住 (第四份录像: 人卡在墙角 3 分钟没动, 读到的位置被
+#    吸附到两个不同的可走点上来回跳, 离目标的距离一会儿大一会儿小, 老判据每次"缩短"都
+#    把停滞计数清零, 这一段路一直走不完) ──────────────────────────────────────────
+
+def test_move_to_position_calls_a_jittering_standstill_stuck(monkeypatch):
+    _stub_move_env(monkeypatch)
+    seq = iter([(125, 103), (129, 101)] * 200)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: next(seq))
+    result = main.move_to_position((127, 103), (123, 115), max_attempts=400, stall_limit=13)
+    assert result == "stuck"
+
+
+def test_move_to_position_real_progress_is_not_stuck(monkeypatch):
+    _stub_move_env(monkeypatch)
+    ys = iter(range(100, 0, -1))
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (10, next(ys)))
+    assert main.move_to_position((10, 100), (10, 20), max_attempts=400, stall_limit=13) is True
+
+
+def test_execute_path_honours_the_deadline_inside_a_leg():
+    orig = main.move_to_position
+    clock = {"t": 100.0}
+    ticks = []
+
+    def move(a, b, on_tick=None, **kw):
+        for _ in range(1000):                      # 一段路走很久
+            clock["t"] += 1.0
+            ticks.append(1)
+            sig = on_tick(b) if on_tick else None
+            if sig:
+                return sig
+        return True
+
+    main.move_to_position = move
+    orig_time = main.time.time
+    main.time.time = lambda: clock["t"]
+    try:
+        got = main.execute_path([(0, 0), (1, 1)], deadline=110.0)
+    finally:
+        main.move_to_position = orig
+        main.time.time = orig_time
+    assert got == "timeout" and len(ticks) <= 11
+
+
+def test_lazy_theta_pathing_passes_its_deadline_down(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
+    monkeypatch.setattr(main, "get_player_position", lambda: (30, 30))
+    seen = {}
+    monkeypatch.setattr(main, "execute_path",
+                        lambda path, **kw: seen.update(kw) or "timeout")
+    deadline = main.time.time() + 1000
+    calls = {"n": 0}
+    orig_time = main.time.time
+
+    def fake_time():
+        calls["n"] += 1
+        return orig_time() + (0 if calls["n"] < 5 else 2000)
+    monkeypatch.setattr(main.time, "time", fake_time)
+    assert main.lazy_theta_pathing((40, 40), [[(35, 35), (45, 45)]], deadline=deadline) is False
+    assert seen["deadline"] == deadline
+
+
+def test_in_farm_area_predicate(monkeypatch):
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    s = main.utils.MINIMAP_WORLD_SCALE["anthell"]
+    inside = main._in_farm_area([(7, 85), (61, 96)])
+    assert inside({"world": (40 / s - 1000, 90 / s - 1000)}) is True
+    assert inside({"world": (40 / s - 1000, 84 / s - 1000)}) is False
+    assert inside({}) is True                      # 不知道在哪的不拦
+    monkeypatch.setattr(main.utils, "MAP", "sewers")     # 没实测过缩放的图(海洋/丛林现在有了)
+    assert main._in_farm_area([(7, 85), (61, 96)]) is None
+
+
+def test_auto_farming_passes_the_area_filter(monkeypatch):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
+    seen = {}
+
+    class Done(Exception):
+        pass
+
+    def scan(*a, **k):
+        seen["in_area"] = k.get("in_area")
+        raise Done
+    monkeypatch.setattr(main, "_maybe_scan_enemies", scan)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    assert callable(seen["in_area"])
+
+
+
+def test_move_to_position_progress_then_standstill_is_stuck(monkeypatch):
+    # 先真走了一段(80 -> 40), 再顶住不动: 参照距离得跟着进展往下挪, 不然永远"比开头近"
+    _stub_move_env(monkeypatch)
+    ys = list(range(100, 60, -2)) + [60] * 100
+    it = iter(ys)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (10, next(it)))
+    assert main.move_to_position((10, 100), (10, 20), max_attempts=200, stall_limit=13) == "stuck"

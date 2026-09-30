@@ -26,6 +26,7 @@ import gui_theme as theme
 import gui_update
 import telemetry
 import version
+import worker_log
 
 _IS_WINDOWS = sys.platform == "win32"
 _LOG_MAX_LINES = 2000  # 日志框最多留这么多行, 再多就从头截掉
@@ -82,6 +83,35 @@ def resolve_point_and_area(point, area):
         (x1, y1), (x2, y2) = area
         point = ((int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2)
     return point, area
+
+
+# CTkToplevel 在 Windows 上一创建就排了几个延时回调: 10ms 改标题栏颜色(resizable() 也会再排
+# 一次)、再 5ms 恢复显示、200ms 设图标、1000ms 设最小/最大尺寸 —— 里面的 withdraw / update /
+# deiconify / minsize 大都没套 try。窗口在这之前被 destroy, 回调就对着一个不存在的窗口报
+# TclError: bad window path name ".!ctktoplevelN"(用户 2026-09-30: AFK 一直提示这个)。
+# florr-auto-afk 已经装好时, "请稍候"小窗检查不到 1 秒就关, 正好撞上。
+MODAL_DESTROY_DELAY_MS = 1500
+
+
+def close_busy_modal(modal, schedule):
+    """先停进度条动画、把窗口藏起来(用户眼里它已经关了), 等 CTk 那些延时回调都跑完再真销毁。
+    schedule(ms, fn) 就是 widget.after。藏起来之后 CTk 的"恢复显示"回调会看到窗口是自己藏的,
+    不会再把它弹出来。任何一步出错都不往外抛 —— 窗口可能已经被别处关了。"""
+    bar = getattr(modal, "busy_bar", None)
+    for step in ((bar.stop if bar is not None else None), modal.withdraw):
+        if step is None:
+            continue
+        try:
+            step()
+        except Exception:
+            pass
+
+    def _destroy():
+        try:
+            modal.destroy()
+        except Exception:
+            pass
+    schedule(MODAL_DESTROY_DELAY_MS, _destroy)
 
 
 def start_afk(*, exe_exists, running, confirm_download):
@@ -561,15 +591,24 @@ class App(ctk.CTk):
             text=True, encoding="utf-8", errors="replace",
             bufsize=1, **kwargs)
         self._log_line("—— worker 已启动 ——\n")
-        self._reader = threading.Thread(target=self._pump_log, args=(self.proc,),
+        # 另存一份带时间戳的到 logs/ (面板只留 2000 行、没时间戳; record_session.py 录像按
+        # 墙钟和它对齐)。写盘在泵线程里做, 不占界面线程。
+        wlog = worker_log.WorkerLog(os.path.dirname(app_config.CONFIG_PATH))
+        self._reader = threading.Thread(target=self._pump_log, args=(self.proc, wlog),
                                         daemon=True)
         self._reader.start()
 
-    def _pump_log(self, proc):
-        for line in proc.stdout:
-            if self._closing:
-                return
-            self.after(0, self._log_line, line)
+    def _pump_log(self, proc, wlog=None):
+        try:
+            for line in proc.stdout:
+                if wlog is not None:
+                    wlog.write(line)
+                if self._closing:
+                    return
+                self.after(0, self._log_line, line)
+        finally:
+            if wlog is not None:
+                wlog.close()
         code = proc.wait()
         if self._closing:
             return
@@ -638,6 +677,7 @@ class App(ctk.CTk):
                                  progress_color=theme.ACCENT)
         bar.pack(pady=(0, 18))
         bar.start()
+        top.busy_bar = bar          # close_busy_modal 要先停它的动画
         return top
 
     def _ensure_afk(self):
@@ -680,10 +720,7 @@ class App(ctk.CTk):
             self.afk_switch.configure(state="normal")
         except Exception:
             pass
-        try:
-            modal.destroy()
-        except Exception:
-            pass
+        close_busy_modal(modal, self.after)      # 不能直接 destroy, 见 close_busy_modal
         self._log_line(f"AFK: {outcome}\n")
 
     def _on_afk_toggle(self):

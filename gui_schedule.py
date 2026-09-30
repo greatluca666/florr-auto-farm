@@ -70,7 +70,7 @@ def validate_block(block, others):
     if start == end and start != "00:00":
         return "起止时间不能相同(全天请填 00:00–00:00)"
     if block.get("map") not in app_config._GUI_ENABLED_MAPS:
-        return "海洋暂不可用, 请选沙漠或蚁狱"
+        return "这张图暂不可用, 请换一张"
     if not block.get("location") and not block.get("farming_area"):
         return "在地图上点个目标点, 或框个刷怪区"
     if not _positive_int(block.get("farming_duration")):
@@ -92,9 +92,15 @@ def _map_radio_state(map_name):
 
 def _anthell_calibration_hint():
     """蚁狱没标定时会被 main._route_blocker 拦停 —— worker 一启动就退出。
-    编辑器里提前提个醒, 不弹窗、不挡保存, 真正把关的还是 worker 自己。"""
-    return ("蚁狱暂缺标定: maps/garden.png(跑 capture_map.py garden 生成)、"
-            "传送点坐标 map_routes.ANTHELL_PORTAL —— 缺了 worker 启动即退出。")
+    编辑器里提前提个醒, 不弹窗、不挡保存, 真正把关的还是 worker 自己。
+
+    操作步骤直接用 map_routes 里那一份(跟 _route_blocker 的报错同源): 以前这里自己写了
+    "跑 capture_map.py garden 生成 maps/garden.png", 而那张图现在是仓库自带的, 那条命令
+    会把它覆盖掉。"""
+    import map_routes
+    return ("蚁狱暂缺标定: maps/garden.png(仓库自带, 丢了用 "
+            "`git checkout -- maps/garden.png` 恢复)、传送点坐标 map_routes.ANTHELL_PORTAL "
+            "—— 缺了 worker 启动即退出。" + map_routes.PORTAL_RECALIBRATION_RECIPE)
 
 
 def _anthell_blocker():
@@ -225,7 +231,7 @@ class TimeBlockEditor(ctk.CTkToplevel):
         super().__init__(master, fg_color=theme.BG)
         self.title("新建时块" if is_new else f"编辑时块 · {block.get('id', '')}")
         theme.center_on(self, master, 640, 780)
-        self.minsize(560, 480)
+        self.minsize(520, 360)
         self.resizable(True, True)
         self.transient(master)
         self._block = dict(block)
@@ -358,15 +364,18 @@ class TimeBlockEditor(ctk.CTkToplevel):
 
         self._map = tk.StringVar(value=self._block.get("map", "desert"))
         map_row = self._form_row(sec, "地图", pady=(0, 0))
-        for m in app_config._VALID_MAPS:
+        radios = ctk.CTkFrame(map_row, fg_color="transparent")
+        radios.pack(side="left")
+        for i, m in enumerate(app_config._VALID_MAPS):
             state = _map_radio_state(m)
             text = theme.map_label(m)
             if state == "disabled":
                 text += "(暂不可用)"
-            ctk.CTkRadioButton(map_row, text=text, variable=self._map, value=m,
+            ctk.CTkRadioButton(radios, text=text, variable=self._map, value=m,
                                state=state, font=theme.font(13),
                                fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
-                               command=self._on_map_change).pack(side="left", padx=(0, 16))
+                               command=self._on_map_change).grid(
+                row=i // 4, column=i % 4, sticky="w", padx=(0, 16), pady=(0, 6))
         self._map_hint = theme.hint(sec, wraplength=520, text_color=theme.WARN)
         self._sync_map_hint()
 

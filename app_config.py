@@ -41,16 +41,15 @@ DEFAULTS = {
     "afk_enabled": False,
 }
 
-# maps/ 下的 3 个 png(去扩展名). 新增地图要同步这里 —— 跟 utils.check_map_border()
-# 那种"就地写死一小张表"的仓库既有做法一致, 不在 import 时去 listdir.
-_VALID_MAPS = ("desert", "ocean", "anthell")
+# maps/ 下的 png(去扩展名), 顺序 = 时块编辑器里单选按钮的顺序(按游戏里的进度排)。新增地图要同步这里 ——
+# 跟 utils.check_map_border() 那种"就地写死一小张表"的仓库既有做法一致, 不在 import 时去 listdir。
+_VALID_MAPS = ("garden", "desert", "ocean", "jungle", "anthell", "sewers", "factory")
 
-# GUI 时块编辑器里实际可选的地图。不在这里的(ocean)在界面上置灰、标「暂不可用」。
-# anthell 2026-09-11 解锁 —— 它走的是"先进花园再踩洞口传送"的多阶段进场路线
-# (见 map_routes.py), 不是标题页直接选生态区。ocean 仍不放开: 没有任何人验证过
-# 它的寻路图和墙壁色。coerce 层(_VALID_MAPS)不受影响, 手写 config.json / 旧时块
-# 里的 ocean 仍能跑。
-_GUI_ENABLED_MAPS = ("desert", "anthell")
+# GUI 时块编辑器里实际可选的地图。2026-09-29 五张图一起放开(花园/海洋/丛林/下水道/工厂):
+# 海洋、丛林走标题页按钮, 下水道、工厂走"先进花园再踩门"的多阶段路线(见 map_routes.py)。
+# 丛林/下水道/工厂的寻路图是按官方 .tmj 推导的, 没有实机截图核对过(tmj_maps.py)。
+# 冥界没有小地图, 不支持。
+_GUI_ENABLED_MAPS = ("garden", "desert", "ocean", "jungle", "anthell", "sewers", "factory")
 
 # 一个时块 / active 切片里的刷怪参数键(不含 afk_enabled —— 那是 GUI 全局的).
 _ACTIVE_KEYS = (

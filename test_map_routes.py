@@ -1,3 +1,4 @@
+import pytest
 import map_routes
 
 
@@ -32,7 +33,7 @@ def test_stage_without_world_position_defaults_to_none():
 
 
 def test_single_stage_maps_are_their_own_final_map_and_own_server():
-    for name in ("desert", "ocean"):
+    for name in ("garden", "desert", "ocean", "jungle"):
         r = map_routes.route_for(name)
         assert len(r.stages) == 1
         assert r.final_map == name
@@ -40,9 +41,8 @@ def test_single_stage_maps_are_their_own_final_map_and_own_server():
 
 
 def test_unknown_map_falls_back_to_desert():
-    # 跟 server_lookup.biome_key_for_map 同样的容错. "garden" 也走这条 —— 它是
-    # 蚁穴路线的内部阶段名, 不是 config 里能选的 map.
-    for bad in ("garden", "", None, "jungle"):
+    # 跟 server_lookup.biome_key_for_map 同样的容错. 冥界(hel)没有小地图, 不支持.
+    for bad in ("", None, "nope", "hel"):
         assert map_routes.route_for(bad).final_map == "desert"
 
 
@@ -95,87 +95,84 @@ def test_portal_tolerance_is_wide_enough_for_move_to_positions_arrival_radius():
     assert map_routes.PORTAL_TOLERANCE >= 5
 
 
-def test_portal_is_walkable_on_the_shipped_garden_map():
-    """洞口在 maps/garden.png 上必须是可走像素, 而且连在主迷宫上。
+# 花园图上 7 个传送门绿斑的中心(2026-09-15 实测, debug_garden_raw.png)。
+# 官方 garden.tmj 的 warps 里正好 7 个: to_desert / to_sewers / to_ant_hell / to_ocean /
+# to_jungle / to_factory / to_crystal_room。
+_GARDEN_DOORS = {"anthell": (133, 234), "sewers": (86, 185), "factory": (215, 150),
+                 "desert": (156, 294), "ocean": (291, 158), "jungle": (294, 211),
+                 "crystal_room": (152, 102)}
 
-    这条盯的是一个会静默坏掉的组合: 洞口在小地图上是亮绿色圆点, 灰度 179, 低于
-    preprocess_map 的 200 阈值 —— 没有 utils._PORTAL_GREEN_HSV_* 那条补救 mask
-    的话它就是一堵墙。而寻路目标是墙时 lazy_theta_star 只会报笼统的"路径规划
-    失败", 看不出是地图的问题, bot 会一轮一轮空转到超时。
-    所以只要有人用旧逻辑重新生成 garden.png, 这条就得红。
+
+def test_every_garden_door_is_a_wall_on_the_shipped_map():
+    """maps/garden.png 上 7 个传送门都必须是墙。
+
+    花园现在既是刷怪图、也是去蚁穴/下水道/工厂的第一段。门要是烤成可走, 刷怪时寻路会
+    大方地从上面穿过去, 踩上去人就被传走了 —— 所以去哪个门, 就在**那一段**里运行时
+    只挖开那一个(map_routes.PORTAL_OPENINGS + utils.open_map_rects)。
     """
+    import cv2
+
+    binary = cv2.imread("./maps/garden.png", cv2.IMREAD_GRAYSCALE)
+    assert binary is not None and binary.shape == (300, 300)
+    for name, (x, y) in _GARDEN_DOORS.items():
+        assert binary[y, x] == 0, f"花园的门 {name} ({x},{y}) 是可走的 —— garden.png 是不是带 --portal 重新生成的?"
+
+
+_OPENED = [("anthell", 28), ("sewers", 25), ("factory", 25)]
+
+
+@pytest.mark.parametrize("name, pixels", _OPENED)
+def test_opening_rects_are_exactly_the_door_marker_blob(name, pixels):
+    import cv2
+
+    rects = map_routes.PORTAL_OPENINGS[("garden", _GARDEN_DOORS[name])]
+    mask = _shortcut_mask(rects)
+    assert int(mask.sum()) == pixels
+    assert sum((x1 - x0 + 1) * (y1 - y0 + 1) for x0, y0, x1, y1 in rects) == pixels   # 矩形不重叠
+    binary = cv2.imread("./maps/garden.png", cv2.IMREAD_GRAYSCALE)
+    assert (binary[mask] == 0).all(), "要挖开的全是门标记(墙)"
+    # 上面几条整体平移一格都还成立(门标记带粗黑描边, 平移后落的还是墙, 中心像素也还在矩形里),
+    # 所以再对着原色小地图逐像素比: 矩形 == 门中心所在的那一整团绿斑(旧版 --portal 开的那团)。
+    import numpy as np
+    import utils
+
+    raw = cv2.imread("./debug_garden_raw.png")
+    assert raw is not None, "debug_garden_raw.png 不在仓库根目录"
+    x, y = _GARDEN_DOORS[name]
+    blob = utils._open_portal_blob(np.zeros((300, 300), np.uint8),
+                                   cv2.cvtColor(raw, cv2.COLOR_BGR2HSV), (x, y)) == 255
+    assert int(blob.sum()) == pixels
+    assert (mask == blob).all(), f"{name} 的挖门矩形跟原色图上的绿斑对不上(平移/漏像素?)"
+
+
+@pytest.mark.parametrize("name, pixels", _OPENED)
+def test_opening_a_door_makes_only_that_door_walkable_and_reachable(name, pixels):
     import cv2
     import numpy as np
+    import utils
 
     binary = cv2.imread("./maps/garden.png", cv2.IMREAD_GRAYSCALE)
-    assert binary is not None, "maps/garden.png 不存在或读不出来"
-    assert binary.shape == (300, 300)
-
-    x, y = map_routes.ANTHELL_PORTAL
-    assert binary[y, x] == 255, "洞口落在墙上 —— garden.png 是不是用旧的阈值逻辑生成的?"
-
-    walkable = (binary == 255).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(walkable, 4)
+    x, y = _GARDEN_DOORS[name]
+    opened = utils._open_shortcut_rects(binary.copy(),
+                                        map_routes.PORTAL_OPENINGS[("garden", (x, y))])
+    assert opened[y, x] == 255
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((opened == 255).astype(np.uint8), 8)
     main = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
-    assert labels[y, x] == main, "洞口可走但跟主迷宫不连通, bot 走不过去"
+    assert labels[y, x] == main, "门开了但跟主迷宫不连通, bot 走不过去"
+    for other, (ox, oy) in _GARDEN_DOORS.items():
+        if other != name:
+            assert opened[oy, ox] == 0, f"挖 {name} 的门把 {other} 的门也挖开了"
 
 
-# 花园图上另外 6 个传送点绿斑(2026-09-15 实测). 只有 ANTHELL_PORTAL 是蚁穴入口,
-# 这几个通向别处 —— 用户确认过。
-_OTHER_PORTALS = [(152, 102), (215, 150), (291, 158), (86, 185), (294, 211), (156, 294)]
+def test_stage_opening_rects_come_from_the_table():
+    r = map_routes.route_for("anthell")
+    assert r.stage_for("garden").opening_rects() == map_routes.PORTAL_OPENINGS[("garden", (133, 234))]
+    assert not r.stage_for("anthell").opening_rects()        # 最后一段没有门要走
 
 
-def test_garden_shortcuts_are_the_calibrated_rects():
-    # 改这两个数字等于改密道打通的位置 —— 跟 test_portal_is_the_calibrated_
-    # constant 同一个把关思路, 锁死具体数值, 不满足于"随便什么矩形都行".
-    assert map_routes.GARDEN_SHORTCUTS == [
-        (28, 127, 68, 139),
-        (179, 82, 211, 115),
-    ]
-
-
-def test_garden_shortcuts_are_valid_rects():
-    # (x0,y0,x1,y1) 都得在 300x300 地图坐标系里, 而且是正经矩形(x0<x1, y0<y1),
-    # 不然 utils._open_shortcut_rects 的切片会静默切出空区域或者反着切.
-    assert len(map_routes.GARDEN_SHORTCUTS) == 2
-    for x0, y0, x1, y1 in map_routes.GARDEN_SHORTCUTS:
-        assert 0 <= x0 < x1 < 300
-        assert 0 <= y0 < y1 < 300
-
-
-def test_garden_shortcuts_are_walkable_and_connected_on_the_shipped_map():
-    """密道矩形在 maps/garden.png 上必须是可走的, 而且连在主迷宫上 —— 跟
-    test_portal_is_walkable_on_the_shipped_garden_map 是同一类回归: 只要有人
-    用没带 open_shortcuts_at 的旧逻辑重新生成 garden.png, 这条就得红。
-    """
-    import cv2
-    import numpy as np
-
-    binary = cv2.imread("./maps/garden.png", cv2.IMREAD_GRAYSCALE)
-    assert binary is not None
-    walkable = (binary == 255).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(walkable, 4)
-    main = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
-
-    for x0, y0, x1, y1 in map_routes.GARDEN_SHORTCUTS:
-        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
-        assert binary[cy, cx] == 255, f"密道 ({cx},{cy}) 落在墙上"
-        assert labels[cy, cx] == main, f"密道 ({cx},{cy}) 可走但跟主迷宫不连通"
-
-
-def test_other_portals_stay_walls_on_the_shipped_garden_map():
-    """别的传送点必须还是墙。
-
-    它们要是也被打通成可走, 寻路就会大方地从上面穿过去 —— 而踩上传送点是会把人
-    传走的, bot 去蚁穴的半路上就被拽到别的地方了。留成墙, 寻路自然绕开。
-    utils.preprocess_map 默认一个都不开, 只有 open_portal_at 点名的那个才打通。
-    """
-    import cv2
-
-    binary = cv2.imread("./maps/garden.png", cv2.IMREAD_GRAYSCALE)
-    assert binary is not None
-    for x, y in _OTHER_PORTALS:
-        assert binary[y, x] == 0, f"传送点 ({x},{y}) 被打通了 —— bot 会在半路被传走"
+def test_stage_without_a_table_entry_has_no_opening(monkeypatch):
+    monkeypatch.setattr(map_routes, "ANTHELL_PORTAL", (150, 40))
+    assert not map_routes.route_for("anthell").stage_for("garden").opening_rects()
 
 
 # 蚁穴图上的 3 个传送点(2026-09-15 实测)。蚁穴里是去刷怪的, 一个都不该踩,
@@ -221,34 +218,6 @@ def test_anthell_portals_stay_walls():
         assert binary[y, x] == 0, f"蚁穴传送点 ({x},{y}) 是可走的 —— 刷怪会被传走"
 
 
-def test_anthell_shortcuts_are_the_calibrated_rects():
-    # 每个元素是同一行的一段像素, 90 个像素拼出 3 条 2~3 像素宽的弯通道 —— 按
-    # florr 自己的 ant_hell.tmj 瓦片形状算出来的, 推导见 map_routes.ANTHELL_SHORTCUTS
-    # 上面的注释. 改这些数字等于改密道打通的位置/形状.
-    assert map_routes.ANTHELL_SHORTCUTS == [
-        (83, 84, 87, 84), (83, 85, 87, 85), (86, 86, 93, 86), (86, 87, 93, 87),
-        (89, 88, 89, 88), (91, 88, 93, 88), (91, 89, 93, 89), (91, 90, 93, 90),
-        (100, 107, 100, 107), (100, 108, 104, 108), (100, 109, 104, 109),
-        (103, 110, 109, 110), (103, 111, 109, 111),
-        (85, 178, 86, 178), (84, 179, 86, 179), (76, 180, 76, 180), (84, 180, 86, 180),
-        (76, 181, 85, 181), (76, 182, 85, 182),
-    ]
-
-
-def test_anthell_shortcuts_are_valid_rects():
-    total = 0
-    for x0, y0, x1, y1 in map_routes.ANTHELL_SHORTCUTS:
-        assert 0 <= x0 <= x1 < 300
-        assert 0 <= y0 <= y1 < 300
-        total += (x1 - x0 + 1) * (y1 - y0 + 1)
-    # 上一版按"整格 + 取整外扩"打通了 274 个像素, 其中 169 个按 florr 地图数据是真墙.
-    assert total == 90
-
-
-# 3 条密道各自两头的通道口(maps/anthell.png 坐标, 密道外侧紧挨着的可走像素).
-_ANTHELL_SHORTCUT_MOUTHS = [((82, 83), (94, 91)), ((99, 106), (110, 112)), ((87, 177), (75, 183))]
-
-
 def _bfs_steps(binary, start, goal):
     from collections import deque
     h, w = binary.shape
@@ -267,37 +236,190 @@ def _bfs_steps(binary, start, goal):
     return None
 
 
-def test_anthell_shortcuts_are_real_short_passages_on_the_shipped_map():
-    """每条密道都得是一条真的能穿过去的近路: 打通后两头之间十几步就到, 不打通
-    要绕 100 多步. 密道形状要是算歪了(没接上某一头、或者中间断了), 打通后的距离
-    会跟没打通一样长. "不打通"= 把已发布地图上的密道像素抹回墙 —— 这些像素在小地图
-    截图里本来就是墙(推导时就是按"小地图画成墙"筛的), 不用依赖调试截图."""
+# ── 密道(推导见 map_routes.GARDEN_SHORTCUTS 上面那段注释) ──────────────────────
+# 地图名: (常量名, 坐标指纹, 像素数, [(通道口a, 通道口b, 走密道最多几步, 不走密道至少几步)])
+# 通道口 = 密道两头外侧紧挨着的可走像素; 步数是 8 邻接 BFS, 推导时在 maps/*.png 上量的
+# (走密道 14/11/16... 步, 不走 106/147/137... 步), 这里各留一点余量.
+_SHORTCUTS = {
+    "garden": ("GARDEN_SHORTCUTS", "deefa96ad0c52e16", 240,
+               [((178, 107), (203, 77), 35, 300), ((31, 129), (62, 132), 38, 330)]),
+    "anthell": ("ANTHELL_SHORTCUTS", "aebf254d028a89d8", 107,
+                [((82, 81), (95, 86), 16, 95), ((99, 106), (110, 109), 13, 130),
+                 ((75, 177), (87, 175), 18, 120)]),
+    "desert": ("DESERT_SHORTCUTS", "2e7b09afa2a187ae", 143,
+               [((94, 105), (102, 92), 15, 20), ((167, 138), (194, 142), 30, 300)]),
+    "ocean": ("OCEAN_SHORTCUTS", "e98ed2c7e1b614fd", 185,
+              [((75, 76), (95, 90), 25, 150), ((170, 184), (192, 186), 24, 550),
+               ((68, 243), (72, 268), 27, 420)]),
+}
+
+
+def _shortcut_mask(rects):
+    import numpy as np
+    mask = np.zeros((300, 300), bool)
+    for x0, y0, x1, y1 in rects:
+        mask[y0:y1 + 1, x0:x1 + 1] = True
+    return mask
+
+
+@pytest.mark.parametrize("name", sorted(_SHORTCUTS))
+def test_shortcut_coordinates_are_the_derived_ones(name):
+    # 改坐标等于改密道打通的位置/形状 —— 按 map_routes 那段注释重新推导过, 再改这里的指纹.
+    import hashlib
+    const, fingerprint, _, _ = _SHORTCUTS[name]
+    rects = getattr(map_routes, const)
+    assert hashlib.sha256(repr(rects).encode()).hexdigest()[:16] == fingerprint
+
+
+@pytest.mark.parametrize("name", sorted(_SHORTCUTS))
+def test_shortcut_rects_are_in_bounds_and_do_not_overlap(name):
+    const, _, pixels, _ = _SHORTCUTS[name]
+    rects = getattr(map_routes, const)
+    for x0, y0, x1, y1 in rects:
+        assert 0 <= x0 <= x1 < 300 and 0 <= y0 <= y1 < 300
+    area = sum((x1 - x0 + 1) * (y1 - y0 + 1) for x0, y0, x1, y1 in rects)
+    assert area == pixels == int(_shortcut_mask(rects).sum())
+
+
+@pytest.mark.parametrize("name", sorted(_SHORTCUTS))
+def test_shortcuts_are_real_short_passages_on_the_shipped_map(name):
+    """每条密道都得是真的能穿过去的近路: 打通后两头十几二十步, 不打通要绕远(沙漠金字塔
+    旁那条本来就只绕 22 步). 形状算歪了(没接上某一头 / 中间断了), 打通后的距离会跟没打通
+    一样长. "不打通" = 把已发布地图上的密道像素抹回墙 —— 它们在小地图截图里本来就是墙."""
     import cv2
 
-    shipped = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    const, _, _, passages = _SHORTCUTS[name]
+    shipped = cv2.imread(f"./maps/{name}.png", cv2.IMREAD_GRAYSCALE)
+    mask = _shortcut_mask(getattr(map_routes, const))
+    assert (shipped[mask] == 255).all(), "密道像素在 maps/*.png 上不可走 —— 生成地图时没打通"
     minimap_only = shipped.copy()
-    for x0, y0, x1, y1 in map_routes.ANTHELL_SHORTCUTS:
-        minimap_only[y0:y1 + 1, x0:x1 + 1] = 0
-    for a, b in _ANTHELL_SHORTCUT_MOUTHS:
+    minimap_only[mask] = 0
+    for a, b, max_with, min_without in passages:
         assert shipped[a[1], a[0]] == 255 and shipped[b[1], b[0]] == 255
-        assert _bfs_steps(shipped, a, b) <= 15, f"密道 {a}<->{b} 没打通"
-        assert _bfs_steps(minimap_only, a, b) >= 100, f"{a}<->{b} 本来就近, 不是密道"
+        with_ = _bfs_steps(shipped, a, b)
+        without = _bfs_steps(minimap_only, a, b)
+        assert with_ is not None and with_ <= max_with, f"密道 {a}<->{b} 没打通 ({with_} 步)"
+        assert without is None or without >= min_without, f"{a}<->{b} 本来就近, 不是密道"
 
 
-def test_anthell_shortcuts_are_walkable_and_connected_on_the_shipped_map():
-    """密道矩形在 maps/anthell.png 上必须是可走的, 而且连在主迷宫上 —— 跟花园那条
-    同一类回归: 只要有人用没带 open_shortcuts_at 的旧逻辑重新生成 anthell.png,
-    这条就得红。"""
+@pytest.mark.parametrize("name", sorted(_SHORTCUTS))
+def test_shortcuts_are_part_of_the_main_walkable_area(name):
     import cv2
     import numpy as np
 
-    binary = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
-    assert binary is not None
-    walkable = (binary == 255).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(walkable, 4)
+    const, _, _, _ = _SHORTCUTS[name]
+    binary = cv2.imread(f"./maps/{name}.png", cv2.IMREAD_GRAYSCALE)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((binary == 255).astype(np.uint8), 8)
     main = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    mask = _shortcut_mask(getattr(map_routes, const))
+    assert (labels[mask] == main).all(), "有密道像素跟主迷宫不连通"
 
-    for x0, y0, x1, y1 in map_routes.ANTHELL_SHORTCUTS:
-        cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
-        assert binary[cy, cx] == 255, f"密道 ({cx},{cy}) 落在墙上"
-        assert labels[cy, cx] == main, f"密道 ({cx},{cy}) 可走但跟主迷宫不连通"
+
+# ── 蚁穴传送门周围被门标记盖掉的空地 (用户 2026-09-29: "那个小部分管道是密道") ──────
+
+def _clearing_mask():
+    return _shortcut_mask(map_routes.ANTHELL_PORTAL_CLEARINGS)
+
+
+def test_portal_clearings_are_open_on_the_shipped_anthell_map():
+    import cv2
+    shipped = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    assert (shipped[_clearing_mask()] == 255).all(), "门口空地在 maps/anthell.png 上还是墙 —— 地图没重新生成"
+
+
+def test_portal_clearings_never_open_a_portal_itself():
+    mask = _clearing_mask()
+    for x, y in _ANTHELL_PORTALS:
+        assert not mask[y, x], f"门口空地把传送门 ({x},{y}) 本身也打通了 —— 寻路会踩进门被传走"
+
+
+def test_portal_clearings_are_part_of_the_main_walkable_area():
+    import cv2
+    import numpy as np
+    binary = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((binary == 255).astype(np.uint8), 8)
+    main = max(range(1, count), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    assert (labels[_clearing_mask()] == main).all()
+
+
+def test_respawn_point_walks_straight_past_the_garden_portal():
+    # 第四份录像: 复活点(~128,101)在门东边, 旧图上那是墙 —— 位置被吸附到 (134,103), 往门/往西
+    # 走要先往下绕到 y=115, 在墙角卡了 3 分钟。打通后几步就到。
+    import cv2
+    shipped = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
+    assert shipped[101, 127] == 255
+    steps = _bfs_steps(shipped, (127, 101), (116, 104))
+    assert steps is not None and steps <= 14
+    closed = shipped.copy()
+    closed[_clearing_mask()] = 0
+    without = _bfs_steps(closed, (134, 103), (116, 104))
+    assert without is None or without >= 25
+
+
+def test_portal_clearings_do_not_overlap_the_shortcuts():
+    assert not (_clearing_mask() & _shortcut_mask(map_routes.ANTHELL_SHORTCUTS)).any()
+
+
+def _garden_px(x, y):
+    """花园(121 格 = 61952 世界单位)里世界坐标 -> 小地图像素(浮点)。"""
+    s = 300.0 / (121 * 512 + 2000.0)
+    return (s * (x + 1000) - 0.5, s * (y + 1000) - 0.5)
+
+
+@pytest.mark.parametrize("name, portal, world", [
+    ("anthell", (133, 234), (27392.0, 48896.0)),
+    ("sewers", (86, 185), (17408.0, 38600.0)),
+    ("factory", (215, 150), (44987.8787878788, 30975.7575757576)),
+])
+def test_door_routes_go_through_the_garden_to_the_official_door(name, portal, world):
+    # 官方 garden.tmj 的 warps: to_ant_hell / to_sewers / to_factory. 下水道和工厂在标题页
+    # 没有格子, 只有这一条路. walk_to 是 debug_garden_raw.png 上绿斑的中心, 跟官方世界坐标
+    # 换算出来的像素差不到 1 格。
+    r = map_routes.route_for(name)
+    assert [s.map_name for s in r.stages] == ["garden", name]
+    assert r.server_biome == "garden" and r.final_map == name
+    stage = r.stage_for("garden")
+    assert stage.walk_to == portal and stage.walk_to_world == world
+    px, py = _garden_px(*world)
+    assert abs(px - portal[0]) <= 1.0 and abs(py - portal[1]) <= 1.0
+    assert r.is_calibrated() is True
+    assert r.stages[-1].walk_to is None
+
+
+def test_ocean_and_jungle_are_entered_from_their_own_title_button():
+    # 用户 2026-09-29 定: 海洋、丛林按标题页按钮进(不走花园门).
+    for name in ("ocean", "jungle"):
+        r = map_routes.route_for(name)
+        assert r.server_biome == name and len(r.stages) == 1
+        assert r.stages[0].walk_to is None
+
+
+def test_every_route_server_biome_has_a_title_screen_button():
+    """server_biome 是给 utils.select_biome_on_title() / switch_server() 的 key —— 没有对应的
+    标题页按钮坐标, select_biome_on_title 是静默 no-op(pos is None 就 return), 那一轮照旧落进
+    florr 默认的花园, 而路线拿的是别的图。单图路线靠按钮进; 两段路线一律先进花园再走门。"""
+    import utils
+    for name, route in map_routes._routes().items():
+        assert route.server_biome in utils._BIOME_BUTTON_POS, name
+        if len(route.stages) == 1:
+            # 单图路线 = 标题页格子里选得到的那四张, biome 就是它自己
+            assert route.server_biome == name, name
+            assert name in ("garden", "desert", "ocean", "jungle"), name
+        else:
+            # 蚁穴/下水道/工厂在标题页没有格子, 只有"先进花园再踩门"这一条路
+            assert route.server_biome == "garden", name
+            assert route.stages[0].map_name == "garden", name
+
+
+def test_every_walk_to_stage_has_a_portal_opening():
+    # 每个要走去踩门的阶段, 运行时都得能把那个门挖开(utils.open_map_rects); 漏登记 =
+    # 那个门在二值图上是墙, 寻路永远到不了 —— 静默失败, 所以盯住键对得上。
+    checked = 0
+    for name, route in map_routes._routes().items():
+        for stage in route.stages:
+            if stage.walk_to is None:
+                continue
+            checked += 1
+            assert (stage.map_name, stage.walk_to) in map_routes.PORTAL_OPENINGS, name
+            assert stage.opening_rects(), name
+    assert checked >= 3       # anthell / sewers / factory

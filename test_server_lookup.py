@@ -49,7 +49,10 @@ def test_fetch_server_ids_rejects_unknown_biome():
     ("desert", "desert"),
     ("ocean", "ocean"),
     ("anthell", "ant_hell"),      # config 用 anthell, 接口 key 是 ant_hell
-    ("garden", "desert"),         # 不是 config 里会出现的 map —— 回退
+    ("garden", "garden"),
+    ("jungle", "jungle"),
+    ("sewers", "sewers"),         # 下水道有自己的服务器池(BIOME_INDEX 6)
+    ("factory", "desert"),        # 工厂没有服务器池 —— 回退(生产代码不用这个函数)
     ("", "desert"),
 ])
 def test_biome_key_for_map(map_name, expected):
@@ -80,12 +83,13 @@ def test_biome_for_index_unknown_is_none():
 @pytest.mark.parametrize("biome,map_name", [
     ("desert", "desert"), ("ocean", "ocean"),
     ("ant_hell", "anthell"),     # 接口 key -> config/文件名
-    ("garden", "garden"),        # 蚁穴路线的第一段, 不是 config 里能选的 map
+    ("garden", "garden"),        # 花园既是刷怪图也是蚁穴/下水道/工厂路线的第一段
+    ("jungle", "jungle"), ("sewers", "sewers"),
 ])
 def test_map_name_for_biome_reverses_biome_key_for_map(biome, map_name):
     assert server_lookup.map_name_for_biome(biome) == map_name
 
 
 def test_map_name_for_biome_is_none_without_a_pathing_map():
-    for biome in ("jungle", "hel", "sewers", "nope", None):
+    for biome in ("hel", "nope", None):
         assert server_lookup.map_name_for_biome(biome) is None

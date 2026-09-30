@@ -88,6 +88,27 @@ def ensure_probe_installed(eval_js):
         return False
 
 
+# window.__florrAutoLastServerId 活在**页面**里, 不在我们的进程里 —— worker 重启、时块切换都
+# 不会清掉它, 它记的是"探针见过的最后一次 WebSocket 连接"。main 的落地核对(_LANDING_CHECK_MAPS)
+# 恰恰在 worker 刚起来那一轮读它: 时块从花园/蚁穴切到海洋时, florr 还连着上一台花园服务器(或者
+# 刚断开还没重连), 读出来的号翻成 garden -> 核对判"标题页按钮点偏了", 白跳一轮。
+# 点「开始」之前先把它清掉: 清了就是读不到(None), 核对照旧往下走, 不比以前更差。
+_CLEAR_SERVER_ID_JS = "window.__florrAutoLastServerId = null"
+
+
+def clear_last_server_id(eval_js):
+    """把探针记的"上一次连接的服务器短码"清掉(为什么要清见上面的注释).
+
+    返回 True/False(清没清成功), 不抛异常 —— 跟本模块其它函数同一个约定: 读不到/清不掉
+    都只是退化成"号读不出来", 不该因为这个把 worker 撂倒。
+    """
+    try:
+        eval_js(_CLEAR_SERVER_ID_JS)
+        return True
+    except Exception:
+        return False
+
+
 def current_server_id(eval_js, expr=None):
     """当前连的服务器短码(如 "25jl"). 探针没装 / CDP 出错 / 拿到的不是字符串
     -> None(不抛)。

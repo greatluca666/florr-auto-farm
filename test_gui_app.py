@@ -146,3 +146,90 @@ def test_app_does_not_shadow_tkinter_report_exception():
     # tkinter 的 CallWrapper 出错时无参调用 widget._report_exception(); App 以前
     # 自己定义了一个同名 3 参方法, App.after() 回调一抛异常就变成 TypeError.
     assert "_report_exception" not in gui_app.App.__dict__
+
+
+def test_pump_log_tees_worker_output_to_the_log_file():
+    import types
+    shown, written = [], []
+
+    class FakeLog:
+        closed = False
+
+        def write(self, line):
+            written.append(line)
+
+        def close(self):
+            FakeLog.closed = True
+
+    proc = types.SimpleNamespace(stdout=iter(["a\n", "b\n"]), wait=lambda: 0)
+    app = types.SimpleNamespace(_closing=False,
+                                after=lambda ms, fn, *a: shown.append((fn, a)),
+                                _log_line="log_line", _on_worker_exit="exit")
+    gui_app.App._pump_log(app, proc, FakeLog())
+    assert written == ["a\n", "b\n"]
+    assert [a for fn, a in shown if fn == "log_line"] == [("a\n",), ("b\n",)]
+    assert FakeLog.closed
+
+
+def test_pump_log_closes_the_file_when_the_gui_is_closing():
+    import types
+
+    class FakeLog:
+        lines, closed = [], False
+
+        def write(self, line):
+            FakeLog.lines.append(line)
+
+        def close(self):
+            FakeLog.closed = True
+
+    proc = types.SimpleNamespace(stdout=iter(["a\n", "b\n"]), wait=lambda: 0)
+    app = types.SimpleNamespace(_closing=True, after=lambda *a: None)
+    gui_app.App._pump_log(app, proc, FakeLog())
+    assert FakeLog.lines == ["a\n"] and FakeLog.closed
+
+
+# ── AFK "请稍候"小窗秒关: TclError: bad window path name ".!ctktoplevel2"(用户 2026-09-30) ──
+
+class _FakeModal:
+    def __init__(self, fail_withdraw=False):
+        self.calls = []
+        self.fail_withdraw = fail_withdraw
+        self.busy_bar = type("Bar", (), {"stop": lambda _s: self.calls.append("bar.stop")})()
+
+    def withdraw(self):
+        self.calls.append("withdraw")
+        if self.fail_withdraw:
+            raise RuntimeError("窗口已经没了")
+
+    def destroy(self):
+        self.calls.append("destroy")
+
+
+def test_busy_modal_hides_now_and_destroys_after_ctk_callbacks_ran():
+    # CTkToplevel 在 Windows 上 1000ms 内还有延时回调要碰这个窗口, 立刻 destroy 它们就报错
+    modal, scheduled = _FakeModal(), []
+    gui_app.close_busy_modal(modal, lambda ms, fn: scheduled.append((ms, fn)))
+    assert modal.calls == ["bar.stop", "withdraw"]
+    assert len(scheduled) == 1 and scheduled[0][0] > 1000
+    scheduled[0][1]()
+    assert modal.calls[-1] == "destroy"
+
+
+def test_busy_modal_close_never_raises():
+    modal, scheduled = _FakeModal(fail_withdraw=True), []
+    modal.destroy = lambda: (_ for _ in ()).throw(RuntimeError("早就关了"))
+    gui_app.close_busy_modal(modal, lambda ms, fn: scheduled.append(fn))
+    scheduled[0]()                      # 销毁时窗口已经没了也不往外抛
+
+
+def test_finish_ensure_afk_does_not_destroy_the_modal_on_the_spot():
+    modal, scheduled, logged = _FakeModal(), [], []
+    fake = type("App", (), {})()
+    fake._afk_busy = True
+    fake.afk_switch = type("Sw", (), {"configure": lambda _s, **k: None})()
+    fake.after = lambda ms, fn: scheduled.append((ms, fn))
+    fake._log_line = logged.append
+    gui_app.App._finish_ensure_afk(fake, modal, "started")
+    assert "destroy" not in modal.calls and scheduled
+    assert logged == ["AFK: started\n"]

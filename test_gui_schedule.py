@@ -42,10 +42,9 @@ def test_block_to_active_shapes():
 
 
 def test_map_radio_state():
-    # 蚁狱已解锁(本支的目的), 海洋继续置灰 —— 这次没有任何理由去验证它.
-    assert gs._map_radio_state("desert") == "normal"
-    assert gs._map_radio_state("ocean") == "disabled"
-    assert gs._map_radio_state("anthell") == "normal"
+    for name in ("garden", "desert", "ocean", "jungle", "anthell", "sewers", "factory"):
+        assert gs._map_radio_state(name) == "normal"
+    assert gs._map_radio_state("hel") == "disabled"       # 冥界没有小地图
 
 
 def test_enemy_switch_is_only_enabled_where_species_are_known(monkeypatch):
@@ -96,11 +95,22 @@ def test_anthell_calibration_hint_names_both_missing_pieces():
     assert "garden.png" in hint
     assert "capture_map.py" in hint
     assert "ANTHELL_PORTAL" in hint
+    # maps/garden.png 现在是仓库自带的(门全是墙那张) —— 别再叫人跑 `capture_map.py garden`
+    # 去"生成"它, 那是当场覆盖。步骤跟 main._route_blocker 共用 map_routes 那一份。
+    assert "capture_map.py garden`" not in hint and "capture_map.py garden " not in hint
+    assert "git checkout -- maps/garden.png" in hint
+    assert "PORTAL_OPENINGS" in hint
 
 
 def test_validate_rejects_disabled_map():
-    msg = gs.validate_block(_blk(map="ocean"), [])
+    msg = gs.validate_block(_blk(map="hel"), [])
     assert msg is not None and "暂不可用" in msg
+
+
+def test_every_map_has_a_chinese_label():
+    import gui_theme
+    assert [gui_theme.map_label(m) for m in ("garden", "desert", "ocean", "jungle", "anthell", "sewers", "factory")] \
+        == ["花园", "沙漠", "海洋", "丛林", "蚁狱", "下水道", "工厂"]
 
 
 def test_validate_accepts_desert_map():

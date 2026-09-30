@@ -26,6 +26,21 @@ def test_ensure_probe_installed_returns_false_on_eval_exception():
     assert fsv.ensure_probe_installed(boom) is False
 
 
+def test_clear_last_server_id_nulls_the_probe_variable():
+    # 号活在页面里, worker 重启也不会没 —— 海洋/丛林那一轮的落地核对会读到上一个时块那台
+    # 花园服务器的号, 白跳一轮。清成 null 之后核对读不到, 照旧往下走。
+    calls = []
+    assert fsv.clear_last_server_id(lambda e: calls.append(e)) is True
+    assert calls == [fsv._CLEAR_SERVER_ID_JS]
+    assert "__florrAutoLastServerId" in calls[0] and "null" in calls[0]
+
+
+def test_clear_last_server_id_returns_false_on_eval_exception():
+    def boom(_expr):
+        raise RuntimeError("no florr tab")
+    assert fsv.clear_last_server_id(boom) is False
+
+
 def test_current_server_id_reads_string_through_json_stringify():
     seen = []
 
@@ -142,17 +157,27 @@ def test_current_map_name_end_to_end(monkeypatch):
 
 
 def test_current_map_name_is_none_for_biomes_without_a_pathing_map(monkeypatch):
-    # jungle/hel/sewers 没有 maps/*.png, 读到也没法用 -> None, 调用方退回自己的
-    # 阶段推断.
+    # hel(冥界)没有小地图, 不支持 -> None, 调用方退回自己的阶段推断.
     _reset_biome_cache(monkeypatch)
     fake_pools = {
         "garden": [], "desert": [], "ocean": [],
-        "jungle": ["25a1"], "ant_hell": [], "hel": ["25a2"], "sewers": ["25a3"],
+        "jungle": [], "ant_hell": [], "hel": ["25a2"], "sewers": [],
     }
     monkeypatch.setattr(fsv.server_lookup, "fetch_server_ids",
                          lambda biome, timeout=5: fake_pools[biome])
-    for sid in ("25a1", "25a2", "25a3"):
-        assert fsv.current_map_name(lambda e, sid=sid: _resp(sid)) is None
+    assert fsv.current_map_name(lambda e: _resp("25a2")) is None
+
+
+def test_current_map_name_knows_jungle_and_sewers_servers(monkeypatch):
+    _reset_biome_cache(monkeypatch)
+    fake_pools = {
+        "garden": [], "desert": [], "ocean": [],
+        "jungle": ["25a1"], "ant_hell": [], "hel": [], "sewers": ["25a3"],
+    }
+    monkeypatch.setattr(fsv.server_lookup, "fetch_server_ids",
+                         lambda biome, timeout=5: fake_pools[biome])
+    assert fsv.current_map_name(lambda e: _resp("25a1")) == "jungle"
+    assert fsv.current_map_name(lambda e: _resp("25a3")) == "sewers"
 
 
 def test_current_map_name_is_none_when_unreadable(monkeypatch):

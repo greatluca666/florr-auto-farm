@@ -86,9 +86,14 @@ def _is_summon_block(texts):
     return any(str(t) in SUMMON_LABELS for t in texts)
 
 
-# HUD 上的区域名 -> 寻路图名。只收实机帧里核对过的: 蚁穴的抓帧里一直有 "蚂蚁地狱",
-# 沙漠的抓帧里一直有 "沙漠" (2026-09-27)。花园/海洋的字样没见过, 不猜。
-ZONE_LABELS = {"蚂蚁地狱": "anthell", "沙漠": "desert"}
+# HUD 小地图下面的区域名 -> 寻路图名。前三个是实机帧里核对过的: 蚁穴的抓帧里一直有 "蚂蚁地狱",
+# 沙漠的抓帧里一直有 "沙漠" (2026-09-27); "花园" 是 2026-09-30 第六份录像补的: 人在蚁穴复活点
+# 旁边站进回花园的门, 被传回花园, 程序认不出花园, 拿蚁穴的图在花园里寻路卡了 13 分钟。标题页
+# 生态区按钮是 "\u3000花园\u3000"(两边全角空格), 跟这里不是一个字符串。
+# 后两个没在实机帧里见过, 是按中文客户端译名猜的 —— 下水道/工厂不在标题页格子里, 没法从标题页
+# 按钮名推断。猜错没有副作用(永远不匹配); 认不出时 main 靠 minimap_scale_from_frame 兜底。
+ZONE_LABELS = {"蚂蚁地狱": "anthell", "沙漠": "desert", "花园": "garden",
+               "下水道": "sewers", "工厂": "factory"}
 
 
 def zone_map_from_frame(records):
@@ -113,6 +118,17 @@ def zone_map_from_frame(records):
         if zoom is not None and r.get("m") is not None and abs(_scale(r) - zoom) < 1e-6:
             continue
         return zone
+    return None
+
+
+def minimap_scale_from_frame(records):
+    """小地图 CTM 的缩放比(1920x1080 下 = 300/(世界宽+2000)); 这一帧没画出自己的金点 -> None。
+    只跟世界大小有关: 花园 61952 -> 0.004691, 下水道/工厂 46080 -> 0.006240, 一读就分得开。
+    跟 utils._CANVAS_SELF_DOT_JS 认自己金点是同一条: 小地图 CTM 下的 #FFE763 圆。"""
+    for r in records:
+        if (r["op"] == "fill" and r.get("fill") == PLAYER_BODY_COLOR
+                and r.get("r") is not None and _is_minimap(r)):
+            return float(r["m"][0])
     return None
 
 
@@ -203,6 +219,11 @@ def _median_bar_anchor(records):
     return (xs[len(xs) // 2], ys[len(ys) // 2])
 
 
+_SAME_RADIUS_REL = 1e-3           # 半径相对差在这以内 = 一样大(浮点噪声), 见 camera_from_frame
+# 别的玩家的「NNN级」锚点 = 身体锚点 + 这个 × 身体半径。2026-09-28 蚁穴录像 4150 条里
+# 4142 条正好是 (0.39, 2.40)。容差也按半径算。
+_LEVEL_LABEL_OFFSET = (0.39, 2.40)
+_LEVEL_LABEL_TOL = 0.5
 _SELF_ANCHOR_OUTLIER_PX = 600.0   # a resolved player anchor further than this from the mob
                                   # cluster's median bar anchor is not the local player
 
@@ -260,6 +281,20 @@ def _self_bar_anchor(records):
     return min(pool, key=lambda a: math.hypot(a[0] - med[0], a[1] - med[1]))
 
 
+def _has_outline_ring(records, body, tol=0.5):
+    """body 同一个锚点上有没有一圈半径是它 _AVATAR_RING_RATIO 倍的填充(花身的描边)。"""
+    ax, ay = _anchor(body)
+    lo, hi = _AVATAR_RING_RATIO
+    for r in records:
+        if (r is body or r.get("op") != "fill" or r.get("r") is None or r.get("m") is None
+                or _is_minimap(r)):
+            continue
+        rx, ry = _anchor(r)
+        if abs(rx - ax) <= tol and abs(ry - ay) <= tol and lo <= r["r"] / body["r"] <= hi:
+            return True
+    return False
+
+
 def camera_from_frame(records, best_effort=False):
     """Read the camera for one frame: {"zoom", "player_world", "player_screen"}.
 
@@ -300,44 +335,60 @@ def camera_from_frame(records, best_effort=False):
                           # 转着画的怪 —— 跟头像同色的是自己, 放行。
                           and not _is_minimap(r) and (r.get("fill") == tint or not _is_rotated(r))
                           and abs(_scale(r) - zoom) < 1e-6)]   # excludes the larger UI-card avatar
+        # 真花身(自己和别的玩家)前面都紧挨着画一圈同心描边, 半径是身体的 1.128 倍(头像识别
+        # 用的同一个比例)。2026-09-29 第四份录像 42 帧认错: 一个 #FFE51C 的金色圆(不是花身,
+        # "往红闪"那条颜色放宽让它过了关)比花身大, 被当成"最大的那个"选中 —— 它没有描边圈。
+        # 一个带描边圈的都没有(老的合成帧)就不筛, 行为不变。
+        ringed = [c for c in candidates if _has_outline_ring(records, c)]
+        if ringed:
+            candidates = ringed
+        # 别的玩家身体正下方画着「NNN级」, 自己没有。等级字认领它下面那具身体, 被认领的就是
+        # 别人 —— **先排除别人再比半径**。2026-09-28 蚁穴录像 1013 帧里 178 帧认错人, 全是
+        # 这一种: 别人的身体半径带浮点噪声(10.575015 对自己的 10.575000), 成了唯一"最大"
+        # 的那个, 下面那道 tie-break 根本轮不到。
+        # 认领按等级字**该在的位置**(身体锚点 + _LEVEL_LABEL_OFFSET × 半径)对, 不按"离谁
+        # 最近": 玩家挤在一起时, 别人的等级字可能离自己的身体只有 5px(同一段录像)。
+        # 只认画在世界缩放上的等级字 —— 左上角头像卡上自己的「121级」是 UI 缩放(1.25)。
+        lvl = [_anchor(r) for r in records
+               if r["op"] == "text" and PLAYER_RARITY_PATTERN.match(str(r.get("text", "")))
+               and r.get("m") is not None and abs(_scale(r) - zoom) < 1e-6]
+        ox, oy = _LEVEL_LABEL_OFFSET
+
+        def _label_miss(c, lx, ly):
+            return math.hypot(lx - (c["m"][4] + ox * c["r"]), ly - (c["m"][5] + oy * c["r"]))
+
+        owned = set()
+        for lx, ly in lvl:
+            if not candidates:
+                break
+            owner = min(candidates, key=lambda c: _label_miss(c, lx, ly))
+            if _label_miss(owner, lx, ly) <= _LEVEL_LABEL_TOL * owner["r"]:
+                owned.add(id(owner))
+        candidates = [c for c in candidates if id(c) not in owned]
         if candidates:
             max_r = max(c["r"] for c in candidates)
-            largest = [c for c in candidates if abs(c["r"] - max_r) < 1e-6]
+            # 相对容差: 同一套外观的身体半径只差浮点噪声(~1e-6 相对), 真正更大的差好几成
+            largest = [c for c in candidates if c["r"] >= max_r * (1 - _SAME_RADIUS_REL)]
             if len(largest) > 1:
-                # A same-radius tie: other real players can share the exact default flower
-                # appearance (confirmed live 2026-08-19, main account, a crowded area -- three
-                # identical gold bodies at once). Break it: OTHER players draw a floating "NNN级"
-                # level label near their own body; the env's own player does not. Scan the raw
-                # text records for it -- NOT _bar_blocks, because another player's HP bar often
-                # lacks the #222222 background so no block (hence no captured level text) is
-                # built for them.
-                lvl = [_anchor(r) for r in records
-                       if r["op"] == "text"
-                       and PLAYER_RARITY_PATTERN.match(str(r.get("text", "")))]
-                without = [
-                    c for c in largest
-                    if not any(math.hypot(lx - c["m"][4], ly - c["m"][5]) <= SELF_DISAMBIGUATION_RADIUS
-                               for lx, ly in lvl)
-                ]
-                if len(without) == 1:
-                    largest = without
-                elif without:
-                    # Still ambiguous. The player is camera-locked near the centre of the mob
-                    # cluster; pick the candidate closest to the centroid of all nameplate bar
-                    # anchors. Best-effort -- an approximate self-anchor beats losing the whole
-                    # frame's detections (only _is_player_anchor filtering depends on it being
-                    # pixel-exact; screen_pos comes straight from each mob's own anchor).
-                    bars = [_anchor(r) for r in records
-                            if r["op"] == "stroke" and r.get("stroke") == HEALTHBAR_BG
-                            and not _is_minimap(r)]
-                    if bars:
-                        cx = sum(a[0] for a in bars) / len(bars)
-                        cy = sum(a[1] for a in bars) / len(bars)
-                        largest = [min(without,
-                                       key=lambda c: math.hypot(c["m"][4] - cx, c["m"][5] - cy))]
+                # Still a same-radius tie after every body that owns a level label is gone:
+                # other real players can share the exact default flower appearance (confirmed
+                # live 2026-08-19, three identical gold bodies at once) and a label is not always
+                # captured for them. The player is camera-locked near the centre of the mob
+                # cluster; pick the candidate closest to the centroid of all nameplate bar
+                # anchors. Best-effort -- an approximate self-anchor beats losing the whole
+                # frame's detections (only _is_player_anchor filtering depends on it being
+                # pixel-exact; screen_pos comes straight from each mob's own anchor).
+                bars = [_anchor(r) for r in records
+                        if r["op"] == "stroke" and r.get("stroke") == HEALTHBAR_BG
+                        and not _is_minimap(r)]
+                if bars:
+                    cx = sum(a[0] for a in bars) / len(bars)
+                    cy = sum(a[1] for a in bars) / len(bars)
+                    largest = [min(largest,
+                                   key=lambda c: math.hypot(c["m"][4] - cx, c["m"][5] - cy))]
             # Exactly one candidate (after the tie-break) is genuinely our own player. A tie
-            # that STILL isn't resolved (every candidate has a level label nearby -- shouldn't
-            # happen for self) can't be broken -- fail loud rather than pick by draw order.
+            # that STILL isn't resolved (no nameplate bar to take a centroid of) can't be
+            # broken -- fail loud rather than pick by draw order.
             if len(largest) == 1:
                 player_screen = _anchor(largest[0])
                 self_confirmed = largest[0].get("fill") == tint
@@ -617,6 +668,17 @@ def _split_mob_texts(texts, colors):
             colors[1] if len(colors) > 1 else None)
 
 
+def _hud_fraction(rec):
+    """头像卡上一段条的比例: 宽度 / 满长, 满长 = 2 × (锚点 x - 起点 x)(条以锚点为中心画)。"""
+    bbox = rec.get("bbox")
+    if not bbox:
+        return None
+    full = 2.0 * (rec["m"][4] - bbox[0])
+    if full <= 0:
+        return None
+    return max(0.0, min(1.0, (bbox[2] - bbox[0]) / full))
+
+
 _AVATAR_RING_RATIO = (1.10, 1.16)   # 头像/花身: 描边圈半径 ÷ 身体圈半径, 实测 1.128
 
 
@@ -624,7 +686,7 @@ def _hud_avatar(records, scale, row_y, left_of_x, row_tol=2.0):
     """头像卡上自己的头像(身体圈那条 fill 记录); 没有返回 None。
 
     **按几何认, 不按颜色**: 头像跟花身一起随状态变色(中毒紫 #CE76DA、#F9D970、
-    #E2658C …… 实机里几十种), 按色认会整张卡跳过。认法: 血条左边、同一行、
+    #E2658C …… 实机存下的帧里几十种), 按色认会整张卡跳过。认法: 血条左边、同一行、
     同缩放, 同一锚点上一对"描边圈 + 身体圈", 半径比 1.128。
     """
     by_anchor = {}
@@ -672,7 +734,35 @@ def _hud_bar(records, row_tol=2.0):
 
 
 def hud_self_colour(records):
-    """这一帧自己花身的颜色 —— 从左上角头像读。头像和世界里的花身同色(实机
+    """这一帧自己花身的颜色 —— 从左上角头像读。头像和世界里的花身同色(实机存下的帧
     60 帧逐帧对得上), 相机拿它去世界里找自己。认不出返回 None。"""
     found = _hud_bar(records)
     return found[1].get("fill") if found else None
+
+
+def hud_self_from_frame(records, row_tol=2.0, shield_row_tol=20.0):
+    """左上角头像卡上自己的血量和护甲: {"hp", "hp_secondary"}; 认不出返回 None。
+
+    为什么要它: 世界里脚下那条血条要先找到自己的花身才能对上号 —— 挨打闪色、中毒变色、
+    被怪挤住都会丢。头像卡画在固定位置, 跟世界里发生什么无关。实拍帧跟脚下血条对得上
+    (0.748/0.749、0.834/0.837)。认法见 _hud_bar / _hud_avatar。
+
+    护甲: 同缩放、附近几行(shield_row_tol)的一条 #42E3F5, 按它自己的锚点算比例。
+    标题页卡片上是这么画的; 游戏里带护甲的帧还没抓到过, 没有就报 0.0。
+    """
+    found = _hud_bar(records, row_tol)
+    if found is None:
+        return None
+    value, _ = found
+    hp = _hud_fraction(value)
+    if hp is None:
+        return None
+    scale, row_y = _scale(value), value["m"][5]
+    shield = 0.0
+    for sh in records:
+        if (sh["op"] == "stroke" and sh.get("stroke") == HEALTHBAR_SECONDARY
+                and sh.get("m") and abs(_scale(sh) - scale) < 1e-6
+                and abs(sh["m"][5] - row_y) <= shield_row_tol):
+            shield = _hud_fraction(sh) or 0.0
+            break
+    return {"hp": hp, "hp_secondary": shield}

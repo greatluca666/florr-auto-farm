@@ -40,11 +40,12 @@ BIOME_INDEX = {
     "sewers": 6,
 }
 
-# config.json 的 map 名 -> 本模块 BIOME_INDEX 的 key. 目前只差 anthell/ant_hell
-# 这一个不一致; desert/ocean 一模一样. 未知名回退 desert —— 调用方
-# (main._apply_worker_config) 已保证传的是 app_config._VALID_MAPS 之一, 这里只是
-# 多一层不炸.
-_MAP_TO_BIOME = {"desert": "desert", "ocean": "ocean", "anthell": "ant_hell"}
+# config.json 的 map 名 -> 本模块 BIOME_INDEX 的 key(这张图自己的服务器池)。只有 anthell/ant_hell
+# 名字不一致。下水道有自己的池(sewers, 6); 工厂没有(BIOME_INDEX 里没它, 它只能从花园服走门进),
+# 所以不在表里 —— biome_key_for_map("factory") 回退 desert 没意义, 生产代码也不用这个函数。
+# 未知名回退 desert —— 调用方(main._apply_worker_config)已保证传的是 app_config._VALID_MAPS 之一。
+_MAP_TO_BIOME = {"garden": "garden", "desert": "desert", "ocean": "ocean", "jungle": "jungle",
+                 "sewers": "sewers", "anthell": "ant_hell"}
 
 
 def biome_key_for_map(map_name):
@@ -55,12 +56,9 @@ def biome_key_for_map(map_name):
 # BIOME_INDEX 的反表: florr 服务器码里的那个数字 -> 生态区 key.
 _BIOME_BY_INDEX = {v: k for k, v in BIOME_INDEX.items()}
 
-# _MAP_TO_BIOME 的反表, 外加 garden。garden 不是 config 里能选的刷怪图(所以不在
-# _MAP_TO_BIOME 里), 但它是蚁穴路线的第一段(见 map_routes.py), 必须认得出来。
-# 从 _MAP_TO_BIOME 推导而不是另抄一份, 是为了让 anthell<->ant_hell 这种不一致
-# 只存在于一个地方。jungle / hel / sewers 没有 maps/*.png, 不在表里 -> None.
+# _MAP_TO_BIOME 的反表。从它推导而不是另抄一份, 是为了让 anthell<->ant_hell 这种不一致
+# 只存在于一个地方。hel 没有 maps/*.png, 不在表里 -> None.
 _BIOME_TO_MAP = {v: k for k, v in _MAP_TO_BIOME.items()}
-_BIOME_TO_MAP["garden"] = "garden"
 
 
 def biome_for_index(index):
@@ -70,7 +68,7 @@ def biome_for_index(index):
 
 def map_name_for_biome(biome):
     """biome_key_for_map() 的反向: 生态区 key -> maps/<name>.png 的名字。
-    没有寻路图的生态区(jungle / hel / sewers)-> None。"""
+    没有寻路图的生态区(hel)-> None。"""
     return _BIOME_TO_MAP.get(biome)
 
 

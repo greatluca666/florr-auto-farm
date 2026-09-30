@@ -51,3 +51,82 @@ def test_settings_js_template_parses(tmp_path):
     """_JS_TEMPLATE 带 {addr}/{want} 占位符, 填完才是合法 JS。"""
     import florr_settings
     _check(florr_settings._js(0x53430E, 1), "florr_settings._JS_TEMPLATE", tmp_path)
+
+
+def test_canvas_self_dot_js_parses(tmp_path):
+    import utils
+    _check(utils._CANVAS_SELF_DOT_JS, "utils._CANVAS_SELF_DOT_JS", tmp_path)
+
+
+@pytest.mark.skipif(NODE is None, reason="没装 node")
+def test_canvas_self_dot_js_reads_the_newest_minimap_dot_without_draining(tmp_path):
+    import json
+    import utils
+    log = [
+        {"frame": 1, "op": "fill", "fill": "#FFE763", "r": 3.0, "x": 1640.0, "y": 108.0,
+         "m": [0.005, 0, 0, 0.005, 1600.0, 20.0]},
+        {"frame": 2, "op": "fill", "fill": "#FFE763", "r": 10.5, "x": 960.0, "y": 540.0,
+         "m": [0.45, 0, 0, 0.45, 960.0, 540.0]},                          # 世界里的花身, 不是小地图
+        {"frame": 2, "op": "fill", "fill": "#FFE763", "r": 3.0, "x": 1650.0, "y": 110.0,
+         "m": [0.005, 0, 0, 0.005, 1600.0, 20.0]},
+        {"frame": 2, "op": "fill", "fill": "#000000", "r": 3.6, "x": 1700.0, "y": 110.0,
+         "m": [0.005, 0, 0, 0.005, 1600.0, 20.0]},
+    ]
+    f = tmp_path / "t.js"
+    f.write_text(f"globalThis.window = {{__canvasLog: {json.dumps(log)}}};\n"
+                 f"var before = window.__canvasLog.length;\n"
+                 f"var out = {utils._CANVAS_SELF_DOT_JS};\n"
+                 f"console.log(JSON.stringify([out, window.__canvasLog.length === before]));",
+                 encoding="utf-8")
+    r = subprocess.run([NODE, str(f)], capture_output=True, text=True)
+    out, untouched = json.loads(r.stdout)
+    assert untouched
+    assert out == pytest.approx([10000.0, 18000.0])       # 最新那帧的小地图点
+
+
+def test_afk_canvas_js_parses(tmp_path):
+    import afk_watch
+    _check(afk_watch._AFK_CANVAS_JS, "afk_watch._AFK_CANVAS_JS", tmp_path)
+
+
+@pytest.mark.skipif(NODE is None, reason="没装 node")
+def test_afk_canvas_js_finds_the_popup_text_in_real_frames(tmp_path):
+    import json
+    import afk_watch
+    for name, want in (("test_frames/afk_popup_20260920.json", True),
+                       ("test_frames/anthell_other_player_radius_noise.json", False)):
+        raw = json.loads((ROOT / name).read_text(encoding="utf-8"))["raw"]
+        f = tmp_path / "t.js"
+        f.write_text(f"globalThis.window = {{__canvasLog: {json.dumps(raw, ensure_ascii=False)}}};\n"
+                     f"console.log(JSON.stringify({afk_watch._AFK_CANVAS_JS}));", encoding="utf-8")
+        r = subprocess.run([NODE, str(f)], capture_output=True, text=True)
+        out = json.loads(r.stdout)
+        assert out["popup"] is want and out["cjk"] is True and out["n"] >= 1, name
+
+
+def test_canvas_zone_js_parses(tmp_path):
+    import canvas_decode
+    import utils
+    _check(utils._CANVAS_ZONE_JS % canvas_decode.HEALTHBAR_BG, "utils._CANVAS_ZONE_JS", tmp_path)
+
+
+@pytest.mark.skipif(NODE is None, reason="没装 node")
+@pytest.mark.parametrize("name, want", [("test_frames/zone_garden_20260930.json", "garden"),
+                                        ("test_frames/zone_anthell_20260930.json", "anthell")])
+def test_canvas_zone_js_reads_the_hud_zone_from_real_frames_without_draining(name, want, tmp_path):
+    # 第六份录像: 人在蚁穴复活点旁被传回花园, 程序认不出花园, 拿蚁穴的图寻路卡了 13 分钟
+    import json
+    import canvas_decode
+    import utils
+    raw = json.loads((ROOT / name).read_text(encoding="utf-8"))["raw"]
+    f = tmp_path / "t.js"
+    f.write_text(f"globalThis.window = {{__canvasLog: {json.dumps(raw, ensure_ascii=False)}}};\n"
+                 f"var before = window.__canvasLog.length;\n"
+                 f"var out = {utils._CANVAS_ZONE_JS % canvas_decode.HEALTHBAR_BG};\n"
+                 f"console.log(JSON.stringify([out, window.__canvasLog.length === before]));",
+                 encoding="utf-8")
+    r = subprocess.run([NODE, str(f)], capture_output=True, text=True)
+    out, untouched = json.loads(r.stdout)
+    assert untouched
+    assert len(out) < len(raw)                       # 只带文字和血条底回来
+    assert canvas_decode.zone_map_from_frame(out) == want
