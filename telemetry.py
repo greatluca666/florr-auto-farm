@@ -3,6 +3,7 @@
 
 上报内容: 随机生成的安装 ID(每台电脑每个系统用户一个, 存在用户目录里, 同一台电脑上的
 打包版、源码版、新旧版本文件夹共用)、版本号、系统、地图、刷怪区坐标. 不报账号名、不报 Chrome 里的任何东西.
+心跳 v2 另带两项: dur(这一窗口里刷怪进程活着的秒数)和 ph(其中刷怪 / 赶路 / 其他各几秒, 见 telemetry_clock.py).
 
 全部在后台线程里发, 5 秒超时, 失败就算了、不重试 —— 统计丢几条无所谓, 绝不能反过来
 卡住或弄崩控制面板. FLORR_TELEMETRY=0 关掉(给测试和开发机用).
@@ -90,12 +91,18 @@ def start_event():
     return {**_base("start"), "os": f"{platform.system()} {platform.release()}"[:64]}
 
 
-def heartbeat_event(block):
-    """block: 时间表里正在跑的时块(app_config 的 schedule 条目)."""
+def heartbeat_event(block, window=None):
+    """block: 时间表里正在跑的时块(app_config 的 schedule 条目).
+    window: TelemetryClock.take_window() 的结果 —— 有就发 v2(带 dur / ph), 没有还是老的 v1 载荷."""
     area = block.get("farming_area")
     if area is not None:
         area = [[int(area[0][0]), int(area[0][1])], [int(area[1][0]), int(area[1][1])]]
-    return {**_base("hb"), "map": block.get("map"), "area": area}
+    event = {**_base("hb"), "map": block.get("map"), "area": area}
+    if window is not None:
+        ph = window["ph"]
+        event.update({"v": 2, "dur": int(window["dur"]),
+                      "ph": {"farm": int(ph["farm"]), "travel": int(ph["travel"]), "other": int(ph["other"])}})
+    return event
 
 
 def _post(payload):

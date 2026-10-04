@@ -11,6 +11,8 @@ import os
 import re
 import sys
 
+import enemy_species
+
 CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(sys.argv[0])), "config.json"
 )
@@ -39,6 +41,8 @@ DEFAULTS = {
     "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
     "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
     "afk_enabled": False,
+    # 索敌用户规则(见 enemy_detect.set_rules / _coerce_enemy_rules): 每个时块一份。空 = 内置行为。
+    "enemy_rules": {"species": {}, "knobs": {}},
 }
 
 # maps/ 下的 png(去扩展名), 顺序 = 时块编辑器里单选按钮的顺序(按游戏里的进度排)。新增地图要同步这里 ——
@@ -57,6 +61,7 @@ _ACTIVE_KEYS = (
     "consecutive_short_round_limit", "enemy_ai_enabled", "auto_switch_server",
     "enter_game_swap", "reach_area_swap",
     "invert_attack", "invert_defense",
+    "enemy_rules",
 )
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -65,6 +70,110 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # 子串匹配误判成合法, tuple 成员判定才对.
 _SWAP_MODS = ("none", "k", "l")
 _SWAP_DIGITS = tuple("1234567890")
+
+# 索敌用户规则: 每个物种(可逐稀有度)四种打法 + 数值旋钮。范围只防手滑(填 1 / 99999), 单位是屏幕像素。
+# 打法: fight 打 / cautious 谨慎(打, 但保持距离) / avoid 躲 / ignore 忽略。
+# species[slug] 是打法字符串(所有稀有度), 或 {稀有度: 打法} 字典; 字典的键是稀有度档名, "*" = 没单独配的稀有度的默认。
+_ENEMY_RULE_VALUES = ("fight", "cautious", "avoid", "ignore")
+_ENEMY_RARITY_KEYS = ("*",) + tuple(enemy_species.RARITY_ORDER)
+ENEMY_KNOB_RANGES = {
+    "hold_active_px": (10, 3000),    # 主动怪停步半径
+    "hold_passive_px": (10, 3000),   # 被动 / 不动怪停步半径
+    "chase_max_px": (10, 3000),      # 追击上限
+    "far_chase_px": (10, 3000),      # 远距追击上限
+    "avoid_px": (10, 3000),          # 躲避半径
+    "cautious_px": (10, 3000),       # 谨慎怪保持距离: 追到这个距离停, 比它的 85% 还近就后退
+}
+# 不在整数范围表里的两个旋钮: swarm 是布尔, avoid_min_rarity 是档名(可选值见 enemy_species)。
+ENEMY_KNOB_KEYS = tuple(ENEMY_KNOB_RANGES) + ("swarm", "avoid_min_rarity")
+
+
+def _enemy_species_for(map_name):
+    """这张图上认得的物种 slug 集; 地图不认识 -> 空集。读纯数据模块 enemy_species, 不碰 enemy_detect
+    (cv2 / cdp_bridge / pyautogui)—— load_config 在 GUI 启动路径上, validate_config 跑在无显示器的服务器里。"""
+    return enemy_species.MAP_SPECIES.get(map_name, frozenset())
+
+
+def _enemy_knob_ok(key, val):
+    if key == "swarm":
+        return isinstance(val, bool)
+    if key == "avoid_min_rarity":
+        return val in enemy_species.AVOID_MIN_RARITY_CHOICES      # tuple 成员判定: 非字符串一律 False
+    lo, hi = ENEMY_KNOB_RANGES[key]
+    return isinstance(val, int) and not isinstance(val, bool) and lo <= val <= hi
+
+
+def _clean_species_rule(slug, rule):
+    """一个物种的规则 -> 规整后的值(打法字符串 / {稀有度: 打法} 字典), 整条不能要返回 None。
+    宽松: 字典里不认识的稀有度键 / 不合法的打法逐条丢弃并 print 警告, 剩下的照留; 丢光了整个物种就丢;
+    只剩 "*" 的字典折回成字符串(跟老写法是同一个意思)。键按稀有度从低到高排, 存盘顺序固定。"""
+    if isinstance(rule, str):
+        if rule in _ENEMY_RULE_VALUES:
+            return rule
+        print(f"⚠️ config.json enemy_rules.species.{slug} 的值 {rule!r} 不是 "
+              f"{'/'.join(_ENEMY_RULE_VALUES)}, 已丢弃")
+        return None
+    if not isinstance(rule, dict):
+        print(f"⚠️ config.json enemy_rules.species.{slug} 应是打法字符串或 {{稀有度: 打法}} 对象, "
+              f"实际是 {type(rule).__name__}, 已丢弃")
+        return None
+    kept = {}
+    for key, action in rule.items():
+        if key not in _ENEMY_RARITY_KEYS:
+            print(f"⚠️ config.json enemy_rules.species.{slug} 里的稀有度 {key!r} 不认识, 已丢弃")
+        elif not isinstance(action, str) or action not in _ENEMY_RULE_VALUES:
+            print(f"⚠️ config.json enemy_rules.species.{slug}.{key} 的值 {action!r} 不是 "
+                  f"{'/'.join(_ENEMY_RULE_VALUES)}, 已丢弃")
+        else:
+            kept[key] = action
+    if not kept:
+        if not rule:
+            print(f"⚠️ config.json enemy_rules.species.{slug} 是空的, 已丢弃")
+        return None
+    if set(kept) == {"*"}:
+        return kept["*"]
+    return {k: kept[k] for k in _ENEMY_RARITY_KEYS if k in kept}
+
+
+def _coerce_enemy_rules(v, map_name):
+    """把任意值规整成 {"species": {...}, "knobs": {...}}(永远返回这个形状, 可为空)。
+
+    宽松: 不是 dict → 空; 物种(未知 slug / 不属于 map_name / 值不是三选一)和旋钮(未知键 / 类型或范围
+    不对)逐条丢弃并 print 警告, 绝不因此丢整个时块。整个 enemy_rules / species / knobs 类型不对
+    (非 dict)同样 print 警告再当空处理; 缺键或 None = 没设, 不警告(现存配置都没有这个键)。
+    返回的是新 dict, 不引用入参。"""
+    out = {"species": {}, "knobs": {}}
+    if v is None:
+        return out
+    if not isinstance(v, dict):
+        print(f"⚠️ config.json enemy_rules 应是对象 {{species, knobs}}, 实际是 {type(v).__name__}, 已丢弃")
+        return out
+    species = v.get("species")
+    if species is not None and not isinstance(species, dict):
+        print(f"⚠️ config.json enemy_rules.species 应是对象 {{物种: 打法}}, 实际是 "
+              f"{type(species).__name__}, 已丢弃")
+    elif isinstance(species, dict) and species:
+        known = _enemy_species_for(map_name)
+        for slug, rule in species.items():
+            if slug not in known:
+                print(f"⚠️ config.json enemy_rules.species 里的 {slug!r} 不属于地图 {map_name!r}, 已丢弃")
+                continue
+            cleaned = _clean_species_rule(slug, rule)
+            if cleaned is not None:
+                out["species"][slug] = cleaned
+    knobs = v.get("knobs")
+    if knobs is not None and not isinstance(knobs, dict):
+        print(f"⚠️ config.json enemy_rules.knobs 应是对象 {{旋钮: 值}}, 实际是 "
+              f"{type(knobs).__name__}, 已丢弃")
+    elif isinstance(knobs, dict):
+        for key, val in knobs.items():
+            if key not in ENEMY_KNOB_KEYS:
+                print(f"⚠️ config.json enemy_rules.knobs 里的 {key!r} 不是合法旋钮, 已丢弃")
+            elif not _enemy_knob_ok(key, val):
+                print(f"⚠️ config.json enemy_rules.knobs.{key} 的值 {val!r} 不合法, 已丢弃")
+            else:
+                out["knobs"][key] = val
+    return out
 
 
 def _coerce_swap_obj(v):
@@ -107,6 +216,9 @@ def _coerce_v1(raw):
         val = raw[key]
         if key in ("enter_game_swap", "reach_area_swap"):
             cfg[key] = _coerce_swap_obj(val)
+            continue
+        if key == "enemy_rules":
+            cfg[key] = _coerce_enemy_rules(val, cfg.get("map"))
             continue
         ok = False
         if key == "map":
@@ -241,6 +353,8 @@ def _coerce_block(raw, aliases, n):
         "reach_area_swap": _coerce_swap_obj(raw.get("reach_area_swap")),
         "invert_attack": _bool_or("invert_attack", DEFAULTS["invert_attack"]),
         "invert_defense": _bool_or("invert_defense", DEFAULTS["invert_defense"]),
+        # 后加的键: 缺了 / 写坏了一律回落空规则(逐条丢坏条目), 不丢整块 —— 同 invert / swap / combat。
+        "enemy_rules": _coerce_enemy_rules(raw.get("enemy_rules"), raw["map"]),
     }
 
 
@@ -277,6 +391,65 @@ def _is_valid_swap_obj(v):
         and v.get("mod") in _SWAP_MODS
         and isinstance(v.get("digit"), str) and v.get("digit") in _SWAP_DIGITS
     )
+
+
+def _validate_enemy_rules(v, map_name, prefix):
+    """enemy_rules 可缺(None); 存在则必须是 {species?, knobs?}。每条错误带路径。
+    物种 slug 只在地图合法时才对照该图的物种表(地图本身的错误已经由 _validate_shared_fields 报了,
+    不要连带刷一屏物种错误)。"""
+    if v is None:
+        return []
+    p = f"{prefix}.enemy_rules"
+    if not isinstance(v, dict):
+        return [f"{p} 必须是对象 {{species, knobs}}"]
+    errs = []
+    extra = sorted(str(k) for k in v if k not in ("species", "knobs"))
+    if extra:
+        errs.append(f"{p} 多出了不认识的键: {', '.join(extra)}")
+    species = v.get("species")
+    if species is not None:
+        if not isinstance(species, dict):
+            errs.append(f"{p}.species 必须是对象 {{物种: 打法 或 {{稀有度: 打法}}}}")
+        elif species and map_name in _VALID_MAPS:
+            known = _enemy_species_for(map_name)
+            actions = "/".join(repr(a) for a in _ENEMY_RULE_VALUES)
+            for slug, rule in species.items():
+                if slug not in known:
+                    errs.append(f"{p}.species.{slug} 不是地图 {map_name!r} 上的物种")
+                elif isinstance(rule, str):
+                    if rule not in _ENEMY_RULE_VALUES:
+                        errs.append(f"{p}.species.{slug} 必须是 {actions}, 实际是 {rule!r}")
+                elif isinstance(rule, dict):
+                    if not rule:
+                        errs.append(f"{p}.species.{slug} 不能是空对象, 至少配一个稀有度(或直接写打法字符串)")
+                    for key, action in rule.items():
+                        if key not in _ENEMY_RARITY_KEYS:
+                            errs.append(f"{p}.species.{slug}.{key} 不是稀有度档名, 可选: "
+                                        f"{', '.join(_ENEMY_RARITY_KEYS)}")
+                        elif not isinstance(action, str) or action not in _ENEMY_RULE_VALUES:
+                            errs.append(f"{p}.species.{slug}.{key} 必须是 {actions}, 实际是 {action!r}")
+                else:
+                    errs.append(f"{p}.species.{slug} 必须是打法字符串或 {{稀有度: 打法}} 对象, "
+                                f"实际是 {rule!r}")
+    knobs = v.get("knobs")
+    if knobs is not None:
+        if not isinstance(knobs, dict):
+            errs.append(f"{p}.knobs 必须是对象")
+        else:
+            for key, val in knobs.items():
+                if key not in ENEMY_KNOB_KEYS:
+                    errs.append(f"{p}.knobs.{key} 不是合法旋钮, 可选: {', '.join(ENEMY_KNOB_KEYS)}")
+                elif not _enemy_knob_ok(key, val):
+                    if key == "swarm":
+                        errs.append(f"{p}.knobs.swarm 必须是布尔值")
+                    elif key == "avoid_min_rarity":
+                        errs.append(f"{p}.knobs.avoid_min_rarity 必须是 "
+                                    f"{' / '.join(enemy_species.AVOID_MIN_RARITY_CHOICES)} 之一, "
+                                    f"实际是 {val!r}")
+                    else:
+                        lo, hi = ENEMY_KNOB_RANGES[key]
+                        errs.append(f"{p}.knobs.{key} 必须是 {lo}–{hi} 之间的整数, 实际是 {val!r}")
+    return errs
 
 
 def _validate_shared_fields(raw, prefix):
@@ -344,6 +517,7 @@ def _validate_block(raw, aliases, i):
         v = raw.get(key)
         if v is not None and not isinstance(v, bool):
             errs.append(f"{p}.{key} 必须是布尔值")
+    errs.extend(_validate_enemy_rules(raw.get("enemy_rules"), raw.get("map"), p))
     return errs
 
 
@@ -360,6 +534,7 @@ def _validate_active(raw):
     for key in ("invert_attack", "invert_defense"):
         if not isinstance(raw.get(key), bool):
             errs.append(f"active.{key} 必须是布尔值")
+    errs.extend(_validate_enemy_rules(raw.get("enemy_rules"), raw.get("map"), "active"))
     return errs
 
 

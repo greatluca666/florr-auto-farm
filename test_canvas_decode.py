@@ -420,6 +420,26 @@ def _secondary_stroke(frame, ax, ay, frac, width=60.0):
             "m": [ZOOM, 0, 0, ZOOM, ax, ay]}
 
 
+@pytest.mark.parametrize("text, is_level", [
+    ("37级", True), ("Lvl 37", True), ("Lvl 5", True),
+    ("Lvl 37 Flower", False), ("lvl 37", False), ("Lvl", False), ("37", False),
+    ("神话", False), ("Mythic", False), ("Ultra", False),
+])
+def test_player_rarity_pattern_matches_levels_not_rarity_words(text, is_level):
+    from canvas_decode import PLAYER_RARITY_PATTERN
+    assert bool(PLAYER_RARITY_PATTERN.match(text)) is is_level
+
+
+def test_english_client_players_carry_level_and_are_not_mobs():
+    """英文客户端的名牌第二格是 "Lvl 37"(游戏本地化表 UI/Flower/Level)。"""
+    recs = gameplay_frame(0, mobs=[(800.0, -60.0, "Rock", 1.0)])
+    recs += nameplate(0, 300.0, 200.0, "Alice", rarity="Lvl 37",
+                      rarity_color="#FFFFFF", hp=0.8)
+    cam = camera_from_frame(recs)
+    names = [m["name"] for m in mobs_from_frame(recs, cam)]
+    assert "Rock" in names and "Alice" not in names
+
+
 # ── 回归: 相机认错玩家 / 名牌文字按位置取值 (2026-09-21 实测帧根因) ──────────
 
 def _stroke(frame, ax, ay, color, width, lw=8):
@@ -530,11 +550,12 @@ def test_text_above_the_bar_is_not_claimed():
     assert [m for m in mobs_from_frame(recs, cam) if m["name"] == "上面的字"] == []
 
 
-def _summon_nameplate(frame, ax, ay, name, rarity, rarity_color, hp=1.0):
-    """玩家召唤物的名牌: [名字, "召唤"(金色 #FFE763), 稀有度词] —— 2026-09-25 实机帧的排布."""
+def _summon_nameplate(frame, ax, ay, name, rarity, rarity_color, hp=1.0, label="召唤"):
+    """玩家召唤物的名牌: [名字, "召唤"(金色 #FFE763), 稀有度词] —— 2026-09-25 实机帧的排布.
+    label 默认中文 "召唤", 英文客户端传 "Summon"。"""
     return (healthbar_recs(frame, ax, ay, hp)
             + [text_rec(frame, ax - 27.0, ay + 42.0, name)] * 2
-            + [text_rec(frame, ax - 27.0, ay + 53.0, "召唤", "#FFE763")] * 2
+            + [text_rec(frame, ax - 27.0, ay + 53.0, label, "#FFE763")] * 2
             + [text_rec(frame, ax + 14.0, ay + 53.0, rarity, rarity_color)] * 2)
 
 
@@ -556,6 +577,24 @@ def test_wild_mob_next_to_summon_is_still_detected():
     assert len(mobs) == 1
     assert mobs[0]["rarity"] == "神话"
     assert abs(mobs[0]["sx"] - 900.0) < 1.0
+
+
+def test_english_client_summon_is_ignored_and_wild_mob_next_to_it_is_not():
+    """英文客户端的召唤标签是 "Summon"(游戏本地化表 UI/Mob/Summon)。"""
+    recs = gameplay_frame(0)
+    recs += _summon_nameplate(0, 400.0, 300.0, "Sandstorm", "Ultra", "#FF2B75", label="Summon")
+    recs += _big_mob_nameplate(0, 900.0, 200.0, "Sandstorm", "Mythic", "#1FDBDE", dy_name=59.0)
+    cam = camera_from_frame(recs)
+    mobs = [m for m in mobs_from_frame(recs, cam) if m["name"] == "Sandstorm"]
+    assert len(mobs) == 1 and mobs[0]["rarity"] == "Mythic"
+    assert abs(mobs[0]["sx"] - 900.0) < 1.0
+
+
+def test_summon_block_gate_knows_both_labels():
+    from canvas_decode import _is_summon_block
+    assert _is_summon_block(["沙尘暴", "召唤", "究极"])
+    assert _is_summon_block(["Sandstorm", "Summon", "Ultra"])
+    assert not _is_summon_block(["Sandstorm", "Mythic"])
 
 
 def test_hook_label_gate_matches_python_side():
@@ -581,9 +620,28 @@ def test_zone_map_reads_the_zone_label():
     recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "沙漠", scale=1.0)] * 2
     assert zone_map_from_frame(recs) == "desert"
     recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "下水道", scale=1.0)] * 2
-    assert zone_map_from_frame(recs) == "sewers"      # 中文译名是猜的, 没在实机帧里见过
+    assert zone_map_from_frame(recs) == "sewers"      # 译名已按游戏本地化表核对(没在实机帧里见过)
     recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, "工厂", scale=1.0)] * 2
     assert zone_map_from_frame(recs) == "factory"
+
+
+@pytest.mark.parametrize("text, zone", [
+    ("Ant Hell", "anthell"), ("Desert", "desert"), ("Garden", "garden"),
+    ("Sewers", "sewers"), ("Factory", "factory"),
+])
+def test_zone_map_reads_the_english_zone_label(text, zone):
+    from canvas_decode import zone_map_from_frame
+    recs = gameplay_frame(0) + [text_rec(0, 960.0, 40.0, text, scale=1.0)] * 2
+    assert zone_map_from_frame(recs) == zone
+
+
+def test_zone_map_english_label_is_not_fooled_by_a_nameplate_or_the_title_button():
+    from canvas_decode import zone_map_from_frame
+    recs = (gameplay_frame(0) + healthbar_recs(0, 400.0, 300.0)
+            + [text_rec(0, 400.0, 330.0, "Garden")] * 2)         # 名牌缩放, 不是 HUD
+    assert zone_map_from_frame(recs) is None
+    title = [{"op": "text", "text": "　Garden　", "m": [1, 0, 0, 1, 0, 0], "x": 861, "y": 599}]
+    assert zone_map_from_frame(title) is None
 
 
 def test_zone_map_is_none_without_a_known_label():

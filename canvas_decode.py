@@ -35,7 +35,9 @@ ABSORB_FRACTION = 1.0         # sub-anchors within this fraction of a body's rad
 # name would occupy. No real mob rarity name has this shape (they're all quality words --
 # 普通/不凡/稀有/etc. -- never a bare number). See
 # docs/superpowers/specs/2026-08-18-alone-and-danger-awareness-design.md.
-PLAYER_RARITY_PATTERN = re.compile(r"^\d+级$")
+# 英文客户端写成 "Lvl 37"(游戏本地化表 UI/Flower/Level = "Lvl {0}" / "{0}级", 2026-10-01 从
+# client.wasm 读出; 还没有英文实机帧核对过)。HUD 里带尾巴的 "Lvl 37 Flower" 不匹配。
+PLAYER_RARITY_PATTERN = re.compile(r"^(\d+级|Lvl \d+)$")
 
 # UI-space fills (the petal inventory bar, HUD icons) render at CTM scale ~1.0, distinct from
 # the world/camera zoom (measured 0.7-0.95 throughout this project) and the minimap's ~0.01.
@@ -77,12 +79,12 @@ RARITY_TEXT_COLORS = frozenset({
 # 玩家生成的召唤物(2026-09-25 实机确认): 名牌是 [名字, "召唤", 稀有度词] 三行, 多出来的
 # "召唤" 用的是金色 #FFE763。它们是别的玩家放出来的, 不是野怪 —— 从不主动打人, 追它们纯属
 # 白费时间(实测一帧里围着玩家有 30 多只"神话/究极沙尘暴"召唤物, 全是这种)。
-# 目前只认中文客户端的写法; 英文客户端这个词长什么样没在实机上见过。
-SUMMON_LABELS = frozenset({"召唤"})
+# 中文 "召唤" 是实机确认的; 英文 "Summon" 取自游戏本地化表(UI/Mob/Summon), 没有英文实机帧核对过。
+SUMMON_LABELS = frozenset({"召唤", "Summon"})
 
 
 def _is_summon_block(texts):
-    """名牌块里有"召唤"这一行 = 玩家生成的召唤物, 不是野怪."""
+    """名牌块里有"召唤"(英文 "Summon")这一行 = 玩家生成的召唤物, 不是野怪."""
     return any(str(t) in SUMMON_LABELS for t in texts)
 
 
@@ -90,10 +92,15 @@ def _is_summon_block(texts):
 # 沙漠的抓帧里一直有 "沙漠" (2026-09-27); "花园" 是 2026-09-30 第六份录像补的: 人在蚁穴复活点
 # 旁边站进回花园的门, 被传回花园, 程序认不出花园, 拿蚁穴的图在花园里寻路卡了 13 分钟。标题页
 # 生态区按钮是 "\u3000花园\u3000"(两边全角空格), 跟这里不是一个字符串。
-# 后两个没在实机帧里见过, 是按中文客户端译名猜的 —— 下水道/工厂不在标题页格子里, 没法从标题页
-# 按钮名推断。猜错没有副作用(永远不匹配); 认不出时 main 靠 minimap_scale_from_frame 兜底。
+# "下水道" / "工厂" 没在实机帧里见过, 但 2026-10-01 从 client.wasm 的本地化表
+# (Maps/<key>/Name)核对过译名是对的。认不出时 main 靠 minimap_scale_from_frame 兜底。
+# 英文客户端的区域名(Ant Hell / Desert / Garden / Sewers / Factory)同取自那张表, 没有英文
+# 实机帧核对过; 标题页按钮是 "　Garden　" 这种带全角空格的, 照样不会匹配。
+# 只放这五个: 海洋 / 丛林不加(单图路线不需要"我在哪张图"的核对)。
 ZONE_LABELS = {"蚂蚁地狱": "anthell", "沙漠": "desert", "花园": "garden",
-               "下水道": "sewers", "工厂": "factory"}
+               "下水道": "sewers", "工厂": "factory",
+               "Ant Hell": "anthell", "Desert": "desert", "Garden": "garden",
+               "Sewers": "sewers", "Factory": "factory"}
 
 
 def zone_map_from_frame(records):

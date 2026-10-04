@@ -10,11 +10,30 @@ florrfarm.cc.cd {
 		reverse_proxy 127.0.0.1:8787
 	}
 
+	# 问题报告: 用户在程序里点了「上报」才会发来(脱敏过的错误信息)。用户的程序没有后台密码, 所以
+	# 不放在 /admin 后面; 体积上限在这一层先挡一道(florr-stats 自己也限, stats_server.BUG_BODY_LIMIT)
+	handle /api/bug {
+		request_body {
+			max_size 40KB
+		}
+		reverse_proxy 127.0.0.1:8787
+	}
+
 	# 后台面板. 密码文件由 deploy/stats/install.sh 生成; 没装统计时 deploy/mirror/install.sh
 	# 放一个一律 403 的占位 —— 宁可打不开, 也不能不设密码就对外
 	handle /admin* {
 		import /etc/caddy/florrfarm-admin.auth
 		reverse_proxy 127.0.0.1:8787
+	}
+
+	# florr-auto-afk 的安装包(只有 v1.1.1 一个版本, 不再更新): 国内直连 GitHub 下不动,
+	# 走这里。文件由 deploy/mirror/fetch_afk.sh 放进来, 不在 download/ 里(那里会被
+	# mirror_sync.py 的 prune 清理). 只给真存在的文件加 immutable, 理由同 /download/*
+	handle /afk/* {
+		root * /var/lib/florrfarm
+		@found file
+		header @found Cache-Control "public, max-age=31536000, immutable"
+		file_server
 	}
 
 	# 版本清单: 不缓存, 新版本一发布就能看到

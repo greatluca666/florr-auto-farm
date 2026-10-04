@@ -1,4 +1,5 @@
 import builtins
+import copy
 import json
 import os
 import pytest
@@ -372,6 +373,49 @@ class TestConfigEndpoints:
         assert resp.status_code == 400
         assert resp.get_json()["errors"]
         assert cfg_path.read_text(encoding="utf-8") == "original"
+
+    @staticmethod
+    def _cfg_with_rules(rules):
+        cfg = copy.deepcopy(app_config.DEFAULTS_V2)
+        cfg["schedule"] = [{
+            "id": "blk-1", "enabled": True, "days": [0, 1, 2, 3, 4, 5, 6],
+            "start": "00:00", "end": "00:00", "profile": "默认", "map": "ocean",
+            "location": [22, 32], "farming_area": [[9, 8], [51, 56]],
+            "farming_duration": 300, "consecutive_short_round_limit": 2,
+            "enemy_ai_enabled": True, "auto_switch_server": True,
+            "enemy_rules": rules,
+        }]
+        return cfg
+
+    def test_post_config_with_enemy_rules_is_accepted_and_written_verbatim(
+            self, client, auth_headers, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "config.json"
+        monkeypatch.setattr(webctl.app_config, "CONFIG_PATH", str(cfg_path))
+        body = json.dumps(self._cfg_with_rules(
+            {"species": {"bubble": "ignore"}, "knobs": {"chase_max_px": 400, "swarm": False}}))
+        resp = client.post("/api/config", headers=auth_headers, data=body,
+                           content_type="application/json")
+        assert resp.status_code == 200 and resp.get_json() == {"ok": True}
+        assert cfg_path.read_text(encoding="utf-8") == body
+        # 读回来 enemy_rules 原样在
+        loaded = app_config.load_config()
+        assert loaded["schedule"][0]["enemy_rules"] == {
+            "species": {"bubble": "ignore"}, "knobs": {"chase_max_px": 400, "swarm": False}}
+
+    def test_post_config_with_bad_enemy_rules_is_rejected_with_paths(
+            self, client, auth_headers, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text("original", encoding="utf-8")
+        monkeypatch.setattr(webctl.app_config, "CONFIG_PATH", str(cfg_path))
+        body = json.dumps(self._cfg_with_rules(
+            {"species": {"scorpion": "ignore"}, "knobs": {"swarm": 1}}))
+        resp = client.post("/api/config", headers=auth_headers, data=body,
+                           content_type="application/json")
+        assert resp.status_code == 400
+        errs = resp.get_json()["errors"]
+        assert any("schedule[0].enemy_rules.species.scorpion" in e for e in errs)
+        assert any("schedule[0].enemy_rules.knobs.swarm" in e for e in errs)
+        assert cfg_path.read_text(encoding="utf-8") == "original"      # 没落盘
 
 
 class TestControlEndpoint:

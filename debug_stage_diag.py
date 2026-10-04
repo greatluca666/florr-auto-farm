@@ -17,7 +17,7 @@ from utils import (
     _START_BUTTON_POS, _CONTINUE_BUTTON_POS,
     _DEATH_SCREEN_SAMPLE_HALF_W, _DEATH_SCREEN_SAMPLE_HALF_H,
     _green_button_ratio, on_start_screen, on_death_screen, check_stage,
-    scale_point,
+    find_start_button, scale_point,
 )
 
 
@@ -43,6 +43,8 @@ def main():
     print(f"\non_start_screen(): {is_start}  (绿色占比={start_ratio:.4f}, 阈值>0.1)")
     print(f"on_death_screen(): {is_death}  (绿色占比={death_ratio:.4f}, 阈值>0.15)")
     print(f"check_stage(): {stage!r}")
+    found = find_start_button()
+    print(f"find_start_button() (按颜色在屏幕中间一条横带里找「开始」按钮, 不靠固定坐标): {found}")
 
     p1 = scale_point(316, 32)
     p2 = scale_point(156, 35)
@@ -65,12 +67,14 @@ def main():
             cv2.rectangle(img, (x - hw, y - hh), (x + hw, y + hh), color, 1)
 
     mark(_START_BUTTON_POS, (0, 255, 0), "START", half_w=15, half_h=10)
+    if found is not None:
+        mark(found, (255, 255, 0), "FOUND")
     mark(_CONTINUE_BUTTON_POS, (0, 165, 255), "CONTINUE", half_w=_DEATH_SCREEN_SAMPLE_HALF_W, half_h=_DEATH_SCREEN_SAMPLE_HALF_H)
     mark(p1, (0, 0, 255), "check_stage#1")
     mark(p2, (255, 0, 255), "check_stage#2")
 
     cv2.imwrite("./debug_stage_diag_marked.png", img)
-    print("\n✅ 已保存 debug_stage_diag_marked.png —— 绿框=开始按钮采样区, 橙框=继续按钮采样区, 红/品红十字=check_stage探测点. 发这张图 + 上面打印的内容过来.")
+    print("\n✅ 已保存 debug_stage_diag_marked.png —— 绿框=开始按钮固定点采样区, 青黄十字=按颜色找到的开始按钮, 橙框=继续按钮采样区, 红/品红十字=check_stage探测点. 发这张图 + 上面打印的内容过来.")
 
 
 if __name__ == "__main__":

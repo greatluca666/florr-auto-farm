@@ -560,6 +560,222 @@ def test_click_start_game_parks_the_mouse_right_after_clicking(monkeypatch):
                          (utils.SCREEN_WIDTH // 2, utils.SCREEN_HEIGHT // 2)]
 
 
+# ── 开局菜单的「开始」按钮: 按颜色找, 不靠固定坐标 ──────────────────────────────
+# 2026-10-04 有粉丝 2K 屏上认不出开局菜单。「开始」按钮左边是玩家名, 名字 + 按钮这一组是水平居中的,
+# 所以按钮离屏幕中心多远取决于名字多长(再乘上 UI 缩放); 固定坐标 (1059,527) 只在名字长度跟量坐标那个号
+# 差不多、而且屏幕是 16:9 时才对得上。现在: 先试老的固定点(快路, 行为不变), 不中再在屏幕中间一条横带里
+# 找一块「确认绿」的按钮形色块, 点击也点它的中心。下面的按钮像素是 2026-10-04 真录像截图里抠的。
+from pathlib import Path as _Path
+
+_TITLE_BG = (28, 168, 95)          # 标题页背景绿(同一张截图里量的)
+_START_CROP = cv2.cvtColor(
+    cv2.imread(str(_Path(__file__).parent / "test_frames" / "start_button_1080p_half.png")),
+    cv2.COLOR_BGR2RGB)            # 半分辨率截图里抠的「开始」按钮, 72x48, 按钮约在正中
+
+
+class _ScreenStub:
+    """pyautogui 的替身: screenshot(region) 从一张预先画好的整屏图里截。"""
+
+    def __init__(self, frame):
+        self.frame = frame
+        self.shots = []
+
+    def screenshot(self, region=None):
+        x, y, w, h = region
+        self.shots.append((x, y, w, h))
+        return Image.fromarray(self.frame[y:y + h, x:x + w].copy())
+
+
+def _screen(monkeypatch, w, h, frame):
+    monkeypatch.setattr(utils, "SCREEN_WIDTH", w)
+    monkeypatch.setattr(utils, "SCREEN_HEIGHT", h)
+    # 这两个固定点是 import 时按真屏幕算的常量; 换了屏幕大小就得跟着换, 不然采样框落在屏幕外
+    monkeypatch.setattr(utils, "_START_BUTTON_POS", utils.scale_point(1059, 527))
+    monkeypatch.setattr(utils, "_CONTINUE_BUTTON_POS", utils.scale_point(959, 634))
+    stub = _ScreenStub(frame)
+    monkeypatch.setattr(utils, "pyautogui", stub)
+    return stub
+
+
+def _title_frame(w, h, ui, offset_ref=99, y_ref=527):
+    """w x h 的标题页: 背景绿 + 真「开始」按钮(按 UI 缩放 ui 放大), 按钮中心在屏幕中心 +
+    (offset_ref, y_ref-540)*ui —— 1080p 下默认值就是量坐标那个号(1059, 527)。返回 (整屏图, 按钮中心)。"""
+    frame = np.zeros((h, w, 3), np.uint8)
+    frame[:] = _TITLE_BG
+    k = 2.0 * ui
+    btn = cv2.resize(_START_CROP, None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR)
+    bh, bw = btn.shape[:2]
+    cx, cy = round(w / 2 + offset_ref * ui), round(h / 2 + (y_ref - 540) * ui)
+    x0, y0 = cx - bw // 2, cy - bh // 2
+    frame[y0:y0 + bh, x0:x0 + bw] = btn
+    return frame, (cx, cy)
+
+
+_SCREENS = [   # (宽, 高, UI 缩放)。超宽屏两种缩放都测: florr 按高还是按宽缩放没实机量过
+    (1920, 1080, 1.0), (2560, 1440, 4 / 3), (3840, 2160, 2.0), (1366, 768, 768 / 1080),
+    (1024, 768, 768 / 1080), (3440, 1440, 4 / 3), (3440, 1440, 3440 / 1920),
+]
+
+
+@pytest.mark.parametrize("w,h,ui", _SCREENS)
+@pytest.mark.parametrize("offset_ref", [-60, 20, 99, 220])      # 玩家名长短不同 -> 按钮离屏幕中心的距离不同
+def test_start_button_is_found_wherever_the_layout_puts_it(monkeypatch, w, h, ui, offset_ref):
+    frame, (cx, cy) = _title_frame(w, h, ui, offset_ref)
+    _screen(monkeypatch, w, h, frame)
+    monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+    found = utils.find_start_button()
+    assert found is not None
+    assert abs(found[0] - cx) <= 4 * ui and abs(found[1] - cy) <= 4 * ui
+    assert utils.on_start_screen() is True
+
+
+def test_the_old_fixed_point_still_works_and_skips_the_search(monkeypatch):
+    # 名字长度跟量坐标那个号差不多、16:9 的人行为不变: 固定点命中就不再截那条带
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    frame[:] = _TITLE_BG
+    frame[527 - 24:527 + 24, 1059 - 57:1059 + 57] = utils._BUTTON_GREEN_RGB     # 固定点正落在纯绿底上
+    stub = _screen(monkeypatch, 1920, 1080, frame)
+    monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+    monkeypatch.setattr(utils, "find_start_button", lambda: pytest.fail("固定点命中就不该再找"))
+    assert utils.on_start_screen() is True
+    assert len(stub.shots) == 1
+
+
+def _gameplay_frame(w, h):
+    frame = np.zeros((h, w, 3), np.uint8)
+    frame[:] = _TITLE_BG                                  # 花园游戏里的背景跟标题页同一种绿
+    rng = np.random.default_rng(7)
+    for _ in range(40):                                   # 零星的怪 / 花瓣 / 血条(颜色各异, 都不是确认绿)
+        x, y = int(rng.integers(0, w - 30)), int(rng.integers(0, h - 30))
+        frame[y:y + 14, x:x + 24] = rng.integers(0, 255, 3)
+    return frame
+
+
+@pytest.mark.parametrize("w,h", [(1920, 1080), (2560, 1440), (3440, 1440)])
+def test_gameplay_is_not_the_start_menu(monkeypatch, w, h):
+    _screen(monkeypatch, w, h, _gameplay_frame(w, h))
+    monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+    assert utils.find_start_button() is None
+    assert utils.on_start_screen() is False
+
+
+def test_green_blobs_that_are_not_button_shaped_are_not_the_start_button(monkeypatch):
+    w, h = 2560, 1440
+    ui = h / 1080
+
+    def blob(frame, cx, cy, bw, bh):
+        frame[cy - bh // 2:cy + bh // 2, cx - bw // 2:cx + bw // 2] = utils._BUTTON_GREEN_RGB
+
+    for label, (bw, bh) in {"小圆点": (8, 8), "游客页那种又宽又扁的按钮": (round(207 * ui), round(32 * ui)),
+                            "竖条": (round(20 * ui), round(120 * ui)),
+                            "整面绿墙": (round(600 * ui), round(240 * ui))}.items():
+        frame = _gameplay_frame(w, h)
+        blob(frame, w // 2 + 100, h // 2 - 20, bw, bh)
+        _screen(monkeypatch, w, h, frame)
+        monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+        assert utils.find_start_button() is None, label
+
+
+def test_text_and_arrow_inside_the_button_do_not_split_it_into_pieces(monkeypatch):
+    # 高分辨率下按钮里的字 / 箭头笔画更粗更利, 会把绿底割开; 闭运算要能把它们合回一块
+    w, h, ui = 2560, 1440, 4 / 3
+    frame, (cx, cy) = _title_frame(w, h, ui)
+    stripe = round(3 * ui)
+    frame[cy - 40:cy + 40, cx - stripe // 2:cx - stripe // 2 + stripe] = (255, 255, 255)   # 贯穿整个按钮的白竖线
+    _screen(monkeypatch, w, h, frame)
+    found = utils.find_start_button()
+    assert found is not None and abs(found[1] - cy) <= 4 * ui
+
+
+@pytest.mark.parametrize("bw,bh,why", [
+    (60, 45, "太窄(只有宽度不够)"), (120, 30, "太矮(只有高度不够)"),
+    (400, 110, "太宽(只有宽度超标)"), (300, 150, "太高(只有高度超标)"),
+])
+def test_each_size_limit_of_the_button_matters_on_its_own(monkeypatch, bw, bh, why):
+    # 2560x1440 下(ui=4/3)按钮合理范围: 宽 93~346, 高 37~120, 宽高比 1.3~4.2 —— 这几个尺寸各只踩破一条尺寸线
+    w, h = 2560, 1440
+    frame = _gameplay_frame(w, h)
+    cx, cy = w // 2 + 100, 705
+    frame[cy - bh // 2:cy - bh // 2 + bh, cx - bw // 2:cx - bw // 2 + bw] = utils._BUTTON_GREEN_RGB
+    _screen(monkeypatch, w, h, frame)
+    assert utils.find_start_button() is None, why
+    ok_w, ok_h = 150, 60                                   # 同一个位置换成合格尺寸就找得到
+    frame[cy - bh // 2:cy - bh // 2 + bh, cx - bw // 2:cx - bw // 2 + bw] = _TITLE_BG
+    frame[cy - ok_h // 2:cy + ok_h // 2, cx - ok_w // 2:cx + ok_w // 2] = utils._BUTTON_GREEN_RGB
+    _screen(monkeypatch, w, h, frame)
+    assert utils.find_start_button() is not None
+
+
+def test_when_several_blobs_look_like_the_button_the_biggest_one_wins(monkeypatch):
+    w, h = 1920, 1080
+    frame = _gameplay_frame(w, h)
+    frame[500:500 + 34, 700:700 + 80] = utils._BUTTON_GREEN_RGB          # 小的, 先被扫到(靠上靠左)
+    frame[520:520 + 52, 1000:1000 + 120] = utils._BUTTON_GREEN_RGB       # 大的
+    _screen(monkeypatch, w, h, frame)
+    x, y = utils.find_start_button()
+    assert abs(x - 1060) <= 2 and abs(y - 546) <= 2
+
+
+def test_a_hollow_green_outline_is_not_a_button(monkeypatch):
+    w, h = 1920, 1080
+    frame = _gameplay_frame(w, h)
+    x0, y0, bw, bh, t = 1000, 503, 115, 48, 3
+    frame[y0:y0 + bh, x0:x0 + bw] = utils._BUTTON_GREEN_RGB
+    frame[y0 + t:y0 + bh - t, x0 + t:x0 + bw - t] = _TITLE_BG        # 只剩 3px 的框: 填充率远低于按钮
+    _screen(monkeypatch, w, h, frame)
+    assert utils.find_start_button() is None
+
+
+def test_a_button_outside_the_title_row_is_ignored(monkeypatch):
+    # 死亡页的「继续」在 (959,634), 比「开始」那一行低一截 —— 不在找按钮的那条带里
+    w, h = 1920, 1080
+    frame = _gameplay_frame(w, h)
+    frame[634 - 19:634 + 19, 959 - 50:959 + 50] = utils._BUTTON_GREEN_RGB
+    _screen(monkeypatch, w, h, frame)
+    monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+    assert utils.find_start_button() is None
+
+
+def test_the_death_screen_is_never_reported_as_the_start_menu(monkeypatch):
+    frame, _ = _title_frame(2560, 1440, 4 / 3, offset_ref=220)     # 固定点够不着, 走找按钮那条路
+    _screen(monkeypatch, 2560, 1440, frame)
+    monkeypatch.setattr(utils, "on_death_screen", lambda: True)
+    assert utils.find_start_button() is not None
+    assert utils.on_start_screen() is False
+
+
+def test_finding_the_start_button_never_raises(monkeypatch):
+    class Boom:
+        def screenshot(self, region=None):
+            raise OSError("截屏失败")
+
+    monkeypatch.setattr(utils, "pyautogui", Boom())
+    assert utils.find_start_button() is None
+
+
+def test_click_start_game_clicks_the_button_it_found(monkeypatch):
+    spy = _MoveClickSpy()
+    monkeypatch.setattr(utils, "pyautogui", spy)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr(utils, "on_start_screen", lambda: False)
+    monkeypatch.setattr(utils, "find_start_button", lambda: (1852, 702))
+    assert utils.click_start_game() is True
+    assert spy.moves[0] == (1852, 702)
+
+
+def test_click_start_game_falls_back_to_the_fixed_point_and_researches_every_attempt(monkeypatch):
+    spy = _MoveClickSpy()
+    monkeypatch.setattr(utils, "pyautogui", spy)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    shown = iter([True, False])
+    monkeypatch.setattr(utils, "on_start_screen", lambda: next(shown))
+    found = iter([None, (1500, 700)])                  # 第一次没找到 -> 固定点; 第二次找到了 -> 点它
+    monkeypatch.setattr(utils, "find_start_button", lambda: next(found))
+    assert utils.click_start_game() is True
+    clicked = [m for m in spy.moves if m != (utils.SCREEN_WIDTH // 2, utils.SCREEN_HEIGHT // 2)]
+    assert clicked == [tuple(utils._START_BUTTON_POS), (1500, 700)]
+
+
 def test_select_biome_on_title_clicks_desert_button(monkeypatch):
     spy = _MoveClickSpy()
     monkeypatch.setattr(utils, "pyautogui", spy)
@@ -974,6 +1190,41 @@ def test_canvas_position_gives_up_quietly(monkeypatch, value):
     assert utils.canvas_player_position(precise=True) is None
 
 
+# 工厂(2026-10-04 录像): 画布里小地图的 CTM 缩放实测 0.0062396, 跟预测 300/(46080+2000) 在 7 位上一样。
+# 之前它不在 MINIMAP_WORLD_SCALE 里 -> 位置只能走截图认金点, 12 分钟里读丢 46 次(每次寻路当"卡住"乱冲脱困、
+# 刷怪整轮停 1 秒), 而这 46 次丢的当口画布里那个点都在。下面是同一份录像里 worker 日志(截图读的位置)
+# 和同一刻画布世界坐标的对照, 差都在 1.5 像素以内。
+@pytest.mark.parametrize("world,screenshot_pos", [
+    ((15167.6, 40999.7), (101, 262)),
+    ((26270.0, 25576.9), (170, 165)),
+    ((25368.1, 14906.9), (164, 99)),
+    ((21047.5, 9642.6), (137, 66)),
+    ((25750.8, 8990.4), (167, 62)),
+    ((22048.4, 9914.8), (144, 68)),
+    ((20287.8, 12304.8), (132, 82)),
+])
+def test_factory_canvas_position_matches_what_the_screenshot_path_read_in_the_real_recording(
+        monkeypatch, world, screenshot_pos):
+    monkeypatch.setattr(utils, "MAP", "factory")
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", lambda js, timeout=5: list(world))
+    x, y = utils.canvas_player_position(precise=True)
+    assert abs(x - screenshot_pos[0]) <= 1.5 and abs(y - screenshot_pos[1]) <= 1.5
+
+
+def test_factory_scale_is_the_measured_one():
+    assert utils.MINIMAP_WORLD_SCALE["factory"] == pytest.approx(300.0 / (90 * 512 + 2000), rel=1e-9)
+    assert utils.MINIMAP_WORLD_SCALE["factory"] == pytest.approx(0.0062396, abs=1e-7)   # 录像里画布的值
+
+
+def test_factory_position_goes_through_the_canvas_not_the_screenshot(monkeypatch):
+    monkeypatch.setattr(utils, "MAP", "factory")
+    monkeypatch.setattr(utils.cdp_bridge, "_eval_value", lambda js, timeout=5: [26270.0, 25576.9])
+    monkeypatch.setattr(utils, "load_binary_map", lambda: "map")
+    monkeypatch.setattr(utils, "calibrate_player", lambda m, pos: pos)
+    monkeypatch.setattr(utils, "get_map", lambda: pytest.fail("画布有就不截图"))
+    assert utils.get_player_position() == (170, 166)
+
+
 def test_canvas_position_needs_a_measured_scale_for_the_map(monkeypatch):
     monkeypatch.setattr(utils, "MAP", "sewers")       # 没实测过缩放的图 -> 不猜(海洋/丛林现在有了)
     monkeypatch.setattr(utils.cdp_bridge, "_eval_value",
@@ -1026,7 +1277,7 @@ def test_fast_calibrate_matches_the_bruteforce_one_including_ties():
 
 def test_fast_calibrate_on_the_real_anthell_map():
     import cv2 as _cv2
-    m = _cv2.imread("./maps/anthell.png", _cv2.IMREAD_GRAYSCALE)
+    m = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
     for pos in [(47, 99), (121, 102), (18, 91), (200, 5)]:
         got = utils.calibrate_player(m, pos)
         assert got == _calibrate_bruteforce(m, pos)
@@ -1036,7 +1287,7 @@ def test_fast_calibrate_on_the_real_anthell_map():
 def test_fast_calibrate_is_fast():
     import time
     import cv2 as _cv2
-    m = _cv2.imread("./maps/anthell.png", _cv2.IMREAD_GRAYSCALE)
+    m = cv2.imread("./maps/anthell.png", cv2.IMREAD_GRAYSCALE)
     utils.calibrate_player(m, (47, 99))               # 第一次建缓存
     t = time.time()
     for _ in range(50):
@@ -1071,8 +1322,10 @@ def test_open_map_rects_with_nothing_is_a_no_op(monkeypatch):
 def test_minimap_scale_hints_agree_with_the_measured_scales():
     for name in ("garden", "anthell"):
         assert abs(utils.MINIMAP_SCALE_HINTS[name] - utils.MINIMAP_WORLD_SCALE[name]) < 1e-9
-    # 下水道/工厂只是按同一条公式预测的, 没实测 —— 只能用来分类, 不能进"位置读数信画布"的那张表
-    assert "sewers" not in utils.MINIMAP_WORLD_SCALE and "factory" not in utils.MINIMAP_WORLD_SCALE
+    # 工厂 2026-10-04 实测过了(下面那几条); 下水道只是按同一条公式预测的, 没实测 —— 只能用来分类,
+    # 不能进"位置读数信画布"的那张表
+    assert abs(utils.MINIMAP_SCALE_HINTS["factory"] - utils.MINIMAP_WORLD_SCALE["factory"]) < 1e-9
+    assert "sewers" not in utils.MINIMAP_WORLD_SCALE
     assert abs(utils.minimap_scale_for_world(90) - 300.0 / (46080 + 2000)) < 1e-12
 
 

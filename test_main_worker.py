@@ -1660,16 +1660,26 @@ def test_maybe_scan_enemies_passes_target_policy_for_current_map(monkeypatch):
         assert seen["target_policy"] == want
 
 
-def test_apply_worker_config_force_disables_enemy_ai_on_unsupported_map(monkeypatch):
-    # 海洋没做索敌(MAP_SPECIES["ocean"] 是空集), config 里写 true 也得关掉 ——
-    # priority_score() 对表外 slug 会 KeyError.
+def test_apply_worker_config_force_disables_enemy_ai_on_a_map_without_species(monkeypatch):
+    # 现在七张图都有物种表; "没做索敌的图要强制关"这条机制靠合成一张空表图来测 ——
+    # priority_score() 对表外 slug 会 KeyError, 不能指望 config 里不写 true.
     monkeypatch.setattr(main, "apply_map", lambda name: None)
+    monkeypatch.setitem(main.enemy_detect.MAP_SPECIES, "ocean", frozenset())
     w = main._apply_worker_config(
         {"version": 2, "active": {"map": "ocean", "enemy_ai_enabled": True}})
     assert w["enemy_ai_enabled"] is False
-    w2 = main._apply_worker_config(
-        {"version": 2, "active": {"map": "desert", "enemy_ai_enabled": True}})
-    assert w2["enemy_ai_enabled"] is True
+
+
+@pytest.mark.parametrize("name", ["garden", "desert", "ocean", "jungle", "anthell",
+                                  "sewers", "factory"])
+def test_apply_worker_config_keeps_enemy_ai_on_for_every_map_with_species(monkeypatch, name):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    on = main._apply_worker_config(
+        {"version": 2, "active": {"map": name, "enemy_ai_enabled": True}})
+    assert on["enemy_ai_enabled"] is True
+    off = main._apply_worker_config(
+        {"version": 2, "active": {"map": name, "enemy_ai_enabled": False}})
+    assert off["enemy_ai_enabled"] is False
 
 
 def test_route_blocker_names_the_route_when_a_portal_is_uncalibrated(monkeypatch):
@@ -3500,8 +3510,12 @@ def test_auto_farming_chase_moves_by_species(monkeypatch):
     assert moved == {"args": (target, 60, [(1, 2)]), "target": (1234.0, 567.0)}
 
 
-@pytest.mark.parametrize("species, want_track", [("worm", False), ("soldier_ant", True)])
-def test_auto_farming_only_circling_skips_stall_tracking(monkeypatch, species, want_track):
+@pytest.mark.parametrize("species, want_track", [
+    ("worm", False),                                            # 蠕虫: stall_exempt, 不记卡住样本
+    ("hornet", True), ("wasp", True), ("mantis", True),         # 射手绕圈照样记: 绕进墙角要能脱困
+    ("soldier_ant", True), ("spider", True), ("rock", True)])
+def test_auto_farming_only_stall_exempt_species_skip_stall_tracking(monkeypatch, species, want_track):
+    # 是否记卡住样本看特性表的 stall_exempt(目前只有蠕虫), 不看 tactic: 射手绕圈也要能脱困。
     _pathing_env(monkeypatch)
     monkeypatch.setattr(main, "get_player_position", lambda: (20, 40))
     target = {"species": species, "rarity": "Mythic", "screen_pos": (1000, 540)}
@@ -4571,3 +4585,434 @@ def test_move_to_position_progress_then_standstill_is_stuck(monkeypatch):
     it = iter(ys)
     monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (10, next(it)))
     assert main.move_to_position((10, 100), (10, 20), max_attempts=200, stall_limit=13) == "stuck"
+
+
+# ── 统计的阶段标记: worker 在哪些调用点套了 phase_marks.phase(...) ─────────────
+
+def _phase_round_env(monkeypatch):
+    _stub_run_worker_env(monkeypatch)
+    monkeypatch.setattr(main, "on_start_screen", lambda: True)
+    monkeypatch.setattr(main, "click_start_game", lambda: True)
+    monkeypatch.setattr(main, "_reassert_florr_toggles",
+                        lambda *a, **k: {"attack": "unchanged", "defense": "unchanged"})
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "load_binary_map", lambda: None)
+
+
+def test_run_worker_marks_entry_and_pathing_as_travel_and_farming_as_farm(monkeypatch):
+    import phase_marks
+    phase_marks._reset_for_tests()
+    _phase_round_env(monkeypatch)
+    seen = []
+
+    def entry(*a, **k):
+        seen.append(("entry", phase_marks.current()))
+        return "arrived"
+
+    def path(*a, **k):
+        seen.append(("path", phase_marks.current()))
+        return True
+
+    def farm(*a, **k):
+        seen.append(("farm", phase_marks.current()))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    monkeypatch.setattr(main, "lazy_theta_pathing", path)
+    monkeypatch.setattr(main, "auto_farming", farm)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == [("entry", "travel"), ("path", "travel"), ("farm", "farm")]
+    assert phase_marks.current() == "other"            # 异常冒出来也恢复了
+
+
+def test_run_worker_marks_the_short_round_server_switch_as_travel(monkeypatch):
+    import phase_marks
+    phase_marks._reset_for_tests()
+    _stub_run_worker_env(monkeypatch)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+        "location": (1, 2), "farming_area": [(0, 0), (9, 9)], "farming_duration": 9999,
+        "short_round_limit": 1, "enemy_ai_enabled": False, "auto_switch_server": True,
+        "biome": "ocean", "map_name": "ocean", "route": map_routes.route_for("ocean"),
+        "enter_game_swap": "none", "reach_area_swap": "none",
+        "invert_attack": True, "invert_defense": False,
+    })
+    monkeypatch.setattr(main, "on_start_screen", lambda: True)
+    monkeypatch.setattr(main, "click_start_game", lambda: True)
+    monkeypatch.setattr(main, "_reassert_florr_toggles",
+                        lambda *a, **k: {"attack": "unchanged", "defense": "unchanged"})
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda *a, **k: False)   # 没到区 -> 短局
+    seen = []
+
+    def rec(*a, **k):
+        seen.append(phase_marks.current())
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "switch_server", rec)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == ["travel"]
+
+
+def test_every_server_switch_in_run_worker_is_marked_travel():
+    """四处换服(传送门换服 + 三处直接换)都得在 with phase_marks.phase("travel") 里 ——
+    传送门那条要蚁穴路线才走得到, 行为测试够不着, 所以直接查源码."""
+    import re
+    lines = inspect.getsource(main.run_worker).splitlines()
+    hits = [i for i, ln in enumerate(lines)
+            if re.search(r'\bswitch_server\(w\["biome"\]\)|_switch_server_via_portal\(', ln)
+            and not ln.lstrip().startswith("#")]
+    assert len(hits) == 4
+    for i in hits:
+        assert lines[i - 1].strip() == 'with phase_marks.phase("travel"):', lines[i - 1]
+
+
+# ── 第②轮: 用户自配索敌规则 ────────────────────────────────────────────────────
+
+_NO_RULES = {"species": {}, "knobs": {}}
+
+
+def test_avoid_trigger_px_is_the_shared_default():
+    assert main.AVOID_TRIGGER_PX == main.enemy_detect.DEFAULT_AVOID_TRIGGER_PX == 400
+
+
+def test_apply_worker_config_installs_enemy_rules(monkeypatch):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    rules = {"species": {"bubble": "ignore", "shell": "avoid"},
+             "knobs": {"chase_max_px": 420, "swarm": False}}
+    w = main._apply_worker_config(
+        {"version": 2, "active": {"map": "ocean", "enemy_rules": rules}})
+    assert w["enemy_rules"] == rules
+    assert main.enemy_detect.get_rules() == rules
+
+
+def test_apply_worker_config_without_rules_clears_the_previous_ones(monkeypatch):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    main.enemy_detect.set_rules({"species": {"bubble": "ignore"}})
+    w = main._apply_worker_config({"version": 2, "active": {"map": "ocean"}})
+    assert w["enemy_rules"] == _NO_RULES
+    assert main.enemy_detect.get_rules() == _NO_RULES
+
+
+def test_apply_worker_config_drops_rules_for_species_not_on_the_map(monkeypatch, capsys):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    w = main._apply_worker_config({"version": 2, "active": {"map": "ocean", "enemy_rules": {
+        "species": {"scorpion": "ignore", "bubble": "ignore"}}}})
+    assert w["enemy_rules"]["species"] == {"bubble": "ignore"}
+    assert main.enemy_detect.rule_for("scorpion") is None
+    assert "scorpion" in capsys.readouterr().out
+
+
+def test_apply_worker_config_reads_rules_from_a_flat_config_too(monkeypatch):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    w = main._apply_worker_config({"map": "ocean", "enemy_rules": {"knobs": {"avoid_px": 250}}})
+    assert w["enemy_rules"] == {"species": {}, "knobs": {"avoid_px": 250}}
+
+
+def _scan_dets():
+    return [{"species": "rock", "rarity": "Ultra", "screen_pos": (1000, 540), "confidence": 0.9},
+            {"species": "bee", "rarity": "Common", "screen_pos": (1100, 540), "confidence": 0.9}]
+
+
+def test_maybe_scan_enemies_drops_ignored_species_everywhere_downstream(monkeypatch):
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: _scan_dets())
+    seen = {}
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda ds, **k: seen.update(ds=ds) or ("wander", None))
+    main.enemy_detect.set_rules({"species": {"rock": "ignore"}})
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    _decision, dets, _last, scanned = main._maybe_scan_enemies(
+        True, now, 0.0, ("wander", None), [])
+    assert scanned is True
+    assert [d["species"] for d in dets] == ["bee"]            # 回传给 Mythic 锁定 / flee 规划的那份
+    assert [d["species"] for d in seen["ds"]] == ["bee"]      # select_action 看到的那份
+
+
+def test_maybe_scan_enemies_without_rules_keeps_every_detection(monkeypatch):
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: _scan_dets())
+    monkeypatch.setattr(main.enemy_detect, "select_action", lambda ds, **k: ("wander", None))
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    _d, dets, _l, _s = main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
+    assert [d["species"] for d in dets] == ["rock", "bee"]
+
+
+def test_maybe_scan_enemies_passes_builtin_values_when_no_knobs_are_set(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [])
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda ds, **k: seen.update(k) or ("wander", None))
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    for map_name, want_avoid in (("anthell", 200), ("desert", main.AVOID_TRIGGER_PX)):
+        monkeypatch.setattr(main.utils, "MAP", map_name)
+        main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
+        assert seen["avoid_trigger_px"] == want_avoid
+        assert seen["engage_hold_px"] == main.enemy_detect.ENGAGE_HOLD_PX
+        assert seen["chase_max_px"] == main.enemy_detect.CHASE_MAX_PX
+        assert seen["far_chase_px"] == main.enemy_detect.FAR_CHASE_PX
+        assert seen["cautious_hold_px"] == main.CAUTIOUS_HOLD_PX == main.enemy_detect.CAUTIOUS_HOLD_PX
+        assert seen["swarm_enabled"] is True
+
+
+def test_maybe_scan_enemies_passes_user_knobs_to_select_action(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [])
+    monkeypatch.setattr(main.enemy_detect, "select_action",
+                        lambda ds, **k: seen.update(k) or ("wander", None))
+    monkeypatch.setattr(main.utils, "MAP", "anthell")
+    main.enemy_detect.set_rules({"knobs": {
+        "hold_active_px": 111, "chase_max_px": 222, "far_chase_px": 333,
+        "avoid_px": 444, "cautious_px": 555, "swarm": False}})
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
+    assert (seen["engage_hold_px"], seen["chase_max_px"], seen["far_chase_px"],
+            seen["avoid_trigger_px"], seen["cautious_hold_px"]) == (111, 222, 333, 444, 555)
+    assert seen["swarm_enabled"] is False
+
+
+def test_maybe_scan_enemies_disabled_ignores_rules_entirely(monkeypatch):
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies",
+                        lambda **k: (_ for _ in ()).throw(AssertionError("不该扫描")))
+    main.enemy_detect.set_rules({"species": {"rock": "ignore"}})
+    decision, dets, _l, scanned = main._maybe_scan_enemies(
+        False, 1000.0, 0.0, ("chase", "x"), ["old"])
+    assert decision == ("wander", None) and dets == [] and scanned is False
+
+
+def test_an_ignored_ultra_species_does_not_make_the_bot_flee_but_an_unignored_one_does(monkeypatch):
+    # 静止 Ultra 怪是永久逃跑源(第①轮的已知问题); 「忽略」就是它的出路 —— 真 select_action + 真 _FLEE_LATCH。
+    rock = {"species": "rock", "rarity": "Ultra", "screen_pos": (1000, 540), "confidence": 0.9}
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [dict(rock)])
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    monkeypatch.setattr(main.utils, "MAP", "garden")
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+
+    decision, _dets, _last, _scanned = main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
+    assert decision[0] == "flee"                                   # 没规则: 照旧逃
+
+    # 故意不重置 _FLEE_LATCH: 上面那次 flee 已经让它挂上了(last_flee = now), 下面这次扫描
+    # 在 FLEE_LATCH_MAX_S(6 秒)内。滞回此刻会拿「这次的检测」去找还没走远的 AVOID 怪来续躲 ——
+    # 只有喂给它的也是剔除过「忽略」物种的那一份, 才会放开。要是只在 select_action 的入参上
+    # 剔除、滞回拿的是原始检测, 这里就会被续成 flee。
+    later = now + 1.0
+    assert main._FLEE_LATCH.last_flee == now and later - now <= main.FLEE_LATCH_MAX_S
+    main.enemy_detect.set_rules({"species": {"rock": "ignore"}})
+    decision, dets, _last, _scanned = main._maybe_scan_enemies(True, later, 0.0, ("wander", None), [])
+    assert decision == ("wander", None) and dets == []             # 忽略: 不逃, 检测里也没有它
+
+
+# ── 第③轮: 躲避起点稀有度, 配置 → worker → 真 flee 决策 ─────────────────────────────
+
+def _scan_one(monkeypatch, det, map_name="garden"):
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies", lambda **k: [dict(det)])
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    monkeypatch.setattr(main.utils, "MAP", map_name)
+    monkeypatch.setattr(main._FLEE_LATCH, "last_flee", None)     # 每次扫描互相独立, 不吃上一次的滞回
+    return main._maybe_scan_enemies(True, main.ENEMY_SCAN_INTERVAL + 1.0, 0.0, ("wander", None), [])[0]
+
+
+def test_the_rarity_threshold_set_in_config_decides_whether_the_worker_flees(monkeypatch):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    rock = {"species": "rock", "rarity": "Ultra", "screen_pos": (1000, 540), "confidence": 0.9}
+    legendary = dict(rock, rarity="Legendary")
+
+    main._apply_worker_config({"version": 2, "active": {"map": "garden"}})
+    assert _scan_one(monkeypatch, rock)[0] == "flee"                  # 没设: Ultra 躲(第②轮及以前)
+    assert _scan_one(monkeypatch, legendary)[0] != "flee"             # 没设: 传奇不躲
+
+    cfg = lambda tier: {"version": 2, "active": {"map": "garden", "enemy_rules": {
+        "knobs": {"avoid_min_rarity": tier}}}}
+    main._apply_worker_config(cfg("Super"))                           # 调高: Ultra 当普通怪
+    assert _scan_one(monkeypatch, rock)[0] != "flee"
+    main._apply_worker_config(cfg("Legendary"))                       # 调低: 传奇也躲
+    assert _scan_one(monkeypatch, legendary)[0] == "flee"
+    main._apply_worker_config(cfg("never"))
+    assert _scan_one(monkeypatch, dict(rock, rarity="Unique"))[0] != "flee"
+
+    # 换回没有规则的配置: 上一份的起点不能漏到下一轮
+    main._apply_worker_config({"version": 2, "active": {"map": "garden"}})
+    assert _scan_one(monkeypatch, rock)[0] == "flee"
+
+
+def test_per_rarity_rules_set_in_config_decide_each_rarity_separately_in_the_worker(monkeypatch):
+    monkeypatch.setattr(main, "apply_map", lambda name: None)
+    rock = {"species": "rock", "rarity": "Ultra", "screen_pos": (1000, 540), "confidence": 0.9}
+    cfg = lambda species: {"version": 2, "active": {"map": "garden", "enemy_rules": {"species": species}}}
+
+    main._apply_worker_config({"version": 2, "active": {"map": "garden"}})
+    assert _scan_one(monkeypatch, rock)[0] == "flee"                           # 没规则: 静止 Ultra 是逃跑源
+    assert _scan_one(monkeypatch, dict(rock, rarity="Common"))[0] == "chase"   # Common 照打
+
+    main._apply_worker_config(cfg({"rock": {"Ultra": "fight", "Common": "ignore"}}))
+    assert _scan_one(monkeypatch, rock)[0] == "chase"                          # 只有 Ultra 改成打
+    assert _scan_one(monkeypatch, dict(rock, rarity="Common"))[0] == "wander"  # Common 被忽略: 当它不存在
+    assert _scan_one(monkeypatch, dict(rock, rarity="Super"))[0] == "flee"     # 没配的稀有度: 内置兜底
+
+    main._apply_worker_config(cfg({"ladybug": {"Common": "avoid"}}))
+    ladybug = {"species": "ladybug", "rarity": "Common", "screen_pos": (1000, 540), "confidence": 0.9}
+    assert _scan_one(monkeypatch, ladybug)[0] == "flee"
+    assert _scan_one(monkeypatch, dict(ladybug, rarity="Epic"))[0] == "chase"  # 同一物种别的稀有度照打
+
+    main._apply_worker_config(cfg({"bee": {"Common": "cautious"}}))
+    bee = {"species": "bee", "rarity": "Common", "screen_pos": (1240, 540), "confidence": 0.9}
+    got = _scan_one(monkeypatch, bee)
+    assert got[0] == "chase" and got[2] == main.CAUTIOUS_HOLD_PX               # 谨慎: 在谨慎距离外停下
+    plain = _scan_one(monkeypatch, dict(bee, rarity="Epic"))
+    assert plain[0] == "chase" and plain[2] != main.CAUTIOUS_HOLD_PX
+
+    main._apply_worker_config({"version": 2, "active": {"map": "garden"}})     # 换回没规则的配置: 不留尾巴
+    assert _scan_one(monkeypatch, rock)[0] == "flee"
+
+
+def test_tier_tooltip_default_matches_the_engine_default():
+    import gui_schedule
+    import enemy_species
+    tip = gui_schedule.EnemyRulesDialog._TIP_TIER
+    assert f"默认 {enemy_species.AVOID_MIN_RARITY_DEFAULT}" in tip
+    assert main.enemy_detect.AVOID_MIN_RARITY_DEFAULT == enemy_species.AVOID_MIN_RARITY_DEFAULT
+
+
+# ── 面向用户的文案别跟引擎数值漂移(gui_schedule 不导入 enemy_detect, 数字是手写进文案的) ──────
+
+def test_avoid_px_tooltip_numbers_match_the_engine():
+    import gui_schedule
+    tip = gui_schedule.EnemyRulesDialog._TIPS["avoid_px"]
+    ed = main.enemy_detect
+    default = ed.DEFAULT_AVOID_TRIGGER_PX
+    anthell = ed.AVOID_TRIGGER_PX_BY_MAP["anthell"]
+    early = ed.AVOID_EARLY_PX_BY_MAP["anthell"]
+    release = main.FLEE_RELEASE_PX
+    # 带上下文的子串, 不是裸数字: 400 在文案里出现两次(其余图的默认值 / 蚁穴提前躲), 裸 `"400" in tip`
+    # 在默认值改了、提前躲半径没改时仍会过。
+    assert f"蚁穴内置 {anthell}" in tip
+    assert f"其余图 {default}" in tip
+    assert f"{release}px 滞回" in tip
+    assert f"{early}px 的提前躲" in tip
+    for n in (default, anthell, early, release):
+        assert str(n) in tip
+
+
+def test_species_hint_copy_keeps_its_caveats_and_never_promises_always_chase():
+    import gui_schedule
+    hint = gui_schedule.EnemyRulesDialog._HINT_SPECIES
+    # spec §5: 「打」只改分类, 沙漠按稀有度追击, 不能写成「打 = 一直追」
+    assert "一直追" not in hint
+    assert "沙漠" in hint and "不会让低稀有度怪被专门追" in hint
+    # spec §2.1 / §5: 把平时要躲的 Ultra+ 设成「打」后果自负; 「忽略」的怪贴脸也不躲
+    assert "Ultra" in hint and "后果自负" in hint
+    assert "忽略" in hint and "贴脸" in hint
+
+
+# ── 被吞掉的异常要留下 traceback(bug 自动上报靠日志里的 traceback 认问题), 但不能每拍刷屏 ──────
+
+def test_print_exc_once_prints_a_traceback_the_first_time_per_tag_and_exception_type(monkeypatch, capsys):
+    monkeypatch.setattr(main, "_TB_PRINTED", set())
+
+    def blow(exc):
+        try:
+            raise exc
+        except Exception:
+            main._print_exc_once("scan")
+
+    for _ in range(3):
+        blow(ValueError("a"))
+    assert capsys.readouterr().err.count("Traceback (most recent call last)") == 1
+    blow(KeyError("b"))                              # 换了异常类型: 再打一次
+    assert capsys.readouterr().err.count("Traceback (most recent call last)") == 1
+    try:
+        raise ValueError("c")
+    except ValueError:
+        main._print_exc_once("plan")                 # 换了位置标签: 再打一次
+    assert capsys.readouterr().err.count("Traceback (most recent call last)") == 1
+
+
+def test_a_swallowed_scan_error_leaves_one_traceback_in_the_worker_output(monkeypatch, capsys):
+    monkeypatch.setattr(main, "_TB_PRINTED", set())
+    monkeypatch.setattr(main.enemy_detect, "scan_enemies",
+                        lambda **k: (_ for _ in ()).throw(ValueError("扫描炸了")))
+    now = main.ENEMY_SCAN_INTERVAL + 1.0
+    for i in range(3):
+        decision, dets, _last, scanned = main._maybe_scan_enemies(True, now + i * 10, 0.0, ("wander", None), [])
+        assert decision == ("wander", None) and dets == [] and scanned is True     # 行为照旧: 本轮当漫游
+    out = capsys.readouterr()
+    assert out.out.count("索敌出错") == 3                                            # 每拍一行提示照旧
+    assert out.err.count("Traceback (most recent call last)") == 1 and "ValueError: 扫描炸了" in out.err
+
+
+def test_a_swallowed_flee_planner_error_leaves_one_traceback_too(monkeypatch, capsys):
+    monkeypatch.setattr(main, "_TB_PRINTED", set())
+    bm = _flee_plan_env(monkeypatch)
+    monkeypatch.setattr(main.flee_planner, "plan_flee",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError("坏了")))
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    for _ in range(2):
+        main._FLEE_PLAN.goal = main._FLEE_PLAN.dir = None      # 每次都重新规划, 不吃上一拍的缓存
+        main._FLEE_PLAN.target([ultra["screen_pos"]], [ultra], (960.0, 540.0), (150, 150), bm)
+    out = capsys.readouterr()
+    assert out.out.count("躲避规划出错") == 2
+    assert out.err.count("Traceback (most recent call last)") == 1 and "ValueError: 坏了" in out.err
+
+
+
+def test_cautious_px_tooltip_numbers_match_the_engine():
+    import gui_schedule
+    tip = gui_schedule.EnemyRulesDialog._TIPS["cautious_px"]
+    ed = main.enemy_detect
+    assert f"默认 {ed.CAUTIOUS_HOLD_PX}" in tip
+    assert f"{round((1 - ed.CAUTIOUS_RETREAT_BAND) * 100)}%" in tip
+
+
+# ── 谨慎怪太近 → 后退: 后退也别往墙里退(跟躲究极同一个坑: 贴墙站着不动被打死) ───────────────────
+
+def _drive_one_chase_tick(monkeypatch, target, hold_px, *, center=(960.0, 540.0), pos=(20, 40)):
+    """跑一拍追击分支, 返回 (交给 _drive_and_check_stall 的鼠标位置, 它的状态/文案, 避墙函数收到的参数)。"""
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: pos)
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("chase", target, hold_px, []), [], 0.0, True))
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: center)
+    seen = {"steer": []}
+
+    class Done(Exception):
+        pass
+
+    def steer(mouse_target, c, p, binary_map):
+        seen["steer"].append((mouse_target, c, p, binary_map is not None))
+        return (11.0, 22.0)
+
+    def drive(mouse_target, current_pos, hist, state, message, **kw):
+        seen["drive"] = (mouse_target, state, message)
+        raise Done
+
+    monkeypatch.setattr(main, "_steer_clear_of_walls", steer)
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(Done):
+        main.auto_farming(AREA, 30, enemy_ai_enabled=True)
+    return seen
+
+
+def test_auto_farming_cautious_retreat_steers_clear_of_walls_and_says_so(monkeypatch):
+    main.enemy_detect.set_rules({"species": {"spider": "cautious"}})
+    target = {"species": "spider", "rarity": "Mythic", "screen_pos": (1060, 540)}     # 100px: 比 300×0.85 近
+    seen = _drive_one_chase_tick(monkeypatch, target, 300)
+    assert len(seen["steer"]) == 1
+    raw, center, pos, has_map = seen["steer"][0]
+    assert raw[0] < center[0] and pos == (20, 40) and has_map       # 避墙吃的是引擎算出的后退方向
+    mouse_target, state, message = seen["drive"]
+    assert mouse_target == (11.0, 22.0)                              # 交给卡住检测 / moveTo 的是避墙后的
+    assert state == "索敌中" and "后退" in message and "spider" in message
+
+
+def test_auto_farming_cautious_target_inside_the_stand_band_is_not_steered(monkeypatch):
+    main.enemy_detect.set_rules({"species": {"spider": "cautious"}})
+    target = {"species": "spider", "rarity": "Mythic", "screen_pos": (1230, 540)}     # 270px: 站桩带
+    seen = _drive_one_chase_tick(monkeypatch, target, 300)
+    assert seen["steer"] == []
+    assert seen["drive"][0] == (960.0, 540.0) and "后退" not in seen["drive"][2]
+
+
+def test_auto_farming_a_fight_target_close_by_is_still_not_steered(monkeypatch):
+    target = {"species": "soldier_ant", "rarity": "Mythic", "screen_pos": (970, 540)}
+    seen = _drive_one_chase_tick(monkeypatch, target, 120)
+    assert seen["steer"] == [] and seen["drive"][0] == (960.0, 540.0)
+    assert "后退" not in seen["drive"][2] and "追击" in seen["drive"][2]

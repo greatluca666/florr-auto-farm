@@ -23,7 +23,7 @@ echo "==> 建专用用户 florrfarm 和数据目录"
 if ! id florrfarm >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/florrfarm --shell /usr/sbin/nologin florrfarm
 fi
-install -d -o florrfarm -g florrfarm -m 755 /var/lib/florrfarm /var/lib/florrfarm/download
+install -d -o florrfarm -g florrfarm -m 755 /var/lib/florrfarm /var/lib/florrfarm/download /var/lib/florrfarm/afk
 
 echo "==> 装同步脚本和 systemd 定时器"
 install -d -m 755 /opt/florrfarm-mirror
@@ -60,6 +60,12 @@ if systemctl start florr-mirror.service; then
   echo "    同步完成"
 else
   echo "    首次同步失败, 看日志: journalctl -u florr-mirror -n 50" >&2
+fi
+echo "==> florr-auto-afk v1.1.1 的加速下载(固定版本, 已经有就跳过)"
+if bash "$HERE/fetch_afk.sh"; then
+  echo "    /afk/florr-auto-afk-v1.1.1-auto.zip"
+else
+  echo "    florr-auto-afk 包没拉成功, 重试: sudo bash $HERE/fetch_afk.sh" >&2
 fi
 echo "    网站文件: /var/lib/florrfarm/site-repo/site"
 echo "    安装包:   /var/lib/florrfarm/download"

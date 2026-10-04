@@ -18,13 +18,17 @@ import customtkinter as ctk
 
 import app_config
 import afk_watch
+import bug_report
 import cdp_bridge
 import gui_accounts
+import gui_bug_report
 import gui_chrome_flow
 import gui_schedule
 import gui_theme as theme
 import gui_update
+import phase_marks
 import telemetry
+import telemetry_clock
 import version
 import worker_log
 
@@ -148,14 +152,19 @@ def plan_transition(running_id, new_block, chrome_profile):
     }
 
 
+def block_by_id(schedule, block_id):
+    """时间表里 id 对上的时块, 没有返回 None. 纯函数."""
+    for blk in schedule:
+        if blk.get("id") == block_id:
+            return blk
+    return None
+
+
 def heartbeat_block(schedule, running_id, proc):
     """该报心跳的时块: worker 活着且有时块在跑时返回那个时块, 否则 None. 纯函数."""
     if running_id is None or proc is None or proc.poll() is not None:
         return None
-    for blk in schedule:
-        if blk.get("id") == running_id:
-            return blk
-    return None
+    return block_by_id(schedule, running_id)
 
 
 class _GuideHost:
@@ -204,6 +213,9 @@ class App(ctk.CTk):
         self._chrome_profile = None
         self._tick_job = None
         self._telemetry_job = None
+        self._bug_dialog = None                       # 正开着的「要不要上报」弹窗(同一时间最多一个)
+        self._tclock = telemetry_clock.TelemetryClock()   # 统计: worker 活着的秒数 + 各阶段耗时
+        self._hb_thread = None                            # 最近一次心跳的发送线程(关窗口时等它一下)
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -341,8 +353,11 @@ class App(ctk.CTk):
         if not _IS_WINDOWS:
             self.afk_switch.configure(state="disabled")
 
+        theme.ghost_button(side, "反馈问题", self._on_feedback, height=30).grid(
+            row=5, column=0, padx=12, pady=(0, 8), sticky="ew")
+
         ver = ctk.CTkFrame(side, fg_color="transparent")
-        ver.grid(row=5, column=0, padx=18, pady=(0, 14), sticky="ew")
+        ver.grid(row=6, column=0, padx=18, pady=(0, 14), sticky="ew")
         theme.hint(ver, gui_update.version_label(version.__version__)).pack(side="left")
         theme.ghost_button(ver, "检查更新", lambda: self._updates.check(manual=True),
                            width=72, height=24).pack(side="right")
@@ -396,9 +411,17 @@ class App(ctk.CTk):
             return
         blk = heartbeat_block(self._cfg["schedule"], self._running_block_id, self.proc)
         if blk is not None:
-            snapshot = dict(blk)
-            telemetry.send(lambda: telemetry.heartbeat_event(snapshot))
+            self._send_heartbeat(blk)
         self._telemetry_job = self.after(telemetry.HEARTBEAT_S * 1000, self._telemetry_tick)
+
+    def _send_heartbeat(self, blk):
+        """把自上次以来的窗口(worker 活着的秒数 + 各阶段耗时)连同时块的地图/刷怪区报一次.
+        窗口是空的(没在跑、也没有遗留秒数)就什么都不发; 同一个窗口只会被取走一次."""
+        window = self._tclock.take_window()
+        if window is None:
+            return
+        snapshot = dict(blk)
+        self._hb_thread = telemetry.send(lambda: telemetry.heartbeat_event(snapshot, window))
 
     # ---- cfg 读写 ----
     def _get_cfg(self):
@@ -553,6 +576,8 @@ class App(ctk.CTk):
         app_config.save_config(self._cfg)
         self._spawn_worker()
         self._set_running_block(blk["id"])
+        # worker 一起来就报一条(dur≈0): 面板马上看到它在线、在哪张图, 不用等第一个 5 分钟
+        self._send_heartbeat(blk)
         self._log_line(f"▶ 进入时块 {blk['id']}({blk['profile']} / {theme.map_label(blk['map'])}) "
                        f"{blk['start']}–{blk['end']}\n")
 
@@ -584,29 +609,40 @@ class App(ctk.CTk):
         # 这种起法会在启动瞬间读到 EOF 直接退出(Ubuntu 无头部署就是这么跑的)。
         kwargs = {"env": {**os.environ, "PYTHONUNBUFFERED": "1",
                           "PYTHONIOENCODING": "utf-8",
-                          "FLORR_WORKER_STDIN_EOF_EXIT": "1"}}
+                          "FLORR_WORKER_STDIN_EOF_EXIT": "1",
+                          # 让 worker 在阶段切换时打 @@florr-phase: 标记行(telemetry_clock 读来记账)
+                          phase_marks.ENV_VAR: "1"}}
         self.proc = subprocess.Popen(
             worker_command(), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             bufsize=1, **kwargs)
+        self._tclock.worker_started()
         self._log_line("—— worker 已启动 ——\n")
         # 另存一份带时间戳的到 logs/ (面板只留 2000 行、没时间戳; record_session.py 录像按
         # 墙钟和它对齐)。写盘在泵线程里做, 不占界面线程。
         wlog = worker_log.WorkerLog(os.path.dirname(app_config.CONFIG_PATH))
-        self._reader = threading.Thread(target=self._pump_log, args=(self.proc, wlog),
-                                        daemon=True)
+        # 泵线程里顺手留日志尾、从输出流里认 traceback(bug_report.StreamWatcher); 退出时要它的尾巴和计数
+        self._bug_watcher = bug_report.StreamWatcher(self._on_worker_traceback)
+        self._reader = threading.Thread(target=self._pump_log,
+                                        args=(self.proc, wlog, self._bug_watcher), daemon=True)
         self._reader.start()
 
-    def _pump_log(self, proc, wlog=None):
+    def _pump_log(self, proc, wlog=None, watcher=None):
         try:
             for line in proc.stdout:
+                if self._tclock.handle_line(line):    # 阶段标记行: 只记账, 不进日志面板 / logs/
+                    continue
+                if watcher is not None:
+                    watcher.feed(line)
                 if wlog is not None:
                     wlog.write(line)
                 if self._closing:
                     return
                 self.after(0, self._log_line, line)
         finally:
+            if watcher is not None:
+                watcher.flush()                       # 流在 traceback 里结束(崩溃)时把它交出去
             if wlog is not None:
                 wlog.close()
         code = proc.wait()
@@ -621,6 +657,7 @@ class App(ctk.CTk):
         proc = self.proc
         if proc is None:
             return
+        blk = block_by_id(self._cfg["schedule"], self._running_block_id)
         try:
             if proc.stdin:
                 proc.stdin.close()
@@ -638,6 +675,9 @@ class App(ctk.CTk):
         if proc.poll() is None:
             proc.kill()
             self._log_line("—— worker 未响应, 已强制结束 ——\n")
+        self._tclock.worker_stopped()
+        if blk is not None:
+            self._send_heartbeat(blk)             # 补报最后一段(窗口只会被取走一次, 不会重复)
         self.proc = None
 
     def _on_worker_exit(self, proc, code):
@@ -645,6 +685,15 @@ class App(ctk.CTk):
             return
         self._log_line(f"—— worker 结束 (退出码 {code}) ——\n")
         self.proc = None
+        self._tclock.worker_stopped()
+        watcher = getattr(self, "_bug_watcher", None)
+        if bug_report.is_crash_exit(code) and (watcher is None or watcher.fired == 0):
+            # 没有 traceback 的崩溃(访问违规 / 段错误 / 被杀): 带上日志尾报一次; 有 traceback 的
+            # 已经在输出流里报过了, 不重复
+            self._offer_bug_report("worker_exit", tail=watcher.tail() if watcher else [], exit_code=code)
+        blk = block_by_id(self._cfg["schedule"], self._running_block_id)
+        if blk is not None:
+            self._send_heartbeat(blk)             # 崩溃 / 自己退出: 补报最后一段
         if self._sched_running:
             # 崩溃自愈: 清掉当前时块记号, 下次 tick 会重新进这个时块.
             self._set_running_block(None)
@@ -743,6 +792,98 @@ class App(ctk.CTk):
     def _on_callback_exception(self, exc_type, exc_value, exc_tb):
         self._log_line(f"❌ {exc_type.__name__}: {exc_value}\n")
         traceback.print_exception(exc_type, exc_value, exc_tb)
+        self._offer_bug_report("gui_exception",
+                               "".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+
+    # ---- bug 上报(bug_report.py): 出错时自动问 + 侧栏随时主动反馈 ----
+    def _on_worker_traceback(self, tb, tail):
+        """泵线程里认出一个 traceback: 只排队, 真正的上报回界面线程做(读 self._cfg / 当前时块)。"""
+        if self._closing:
+            return
+        self.after(0, self._offer_bug_report, "worker_traceback", tb, tail)
+
+    def _offer_bug_report(self, kind, tb="", tail=(), exit_code=None):
+        """检测到一个问题: 脱敏 + 冷却检查(bug_report.prepare), 通过了就弹窗问用户要不要上报。
+        用户点「上报」才发(见 _submit_bug); 同一时间最多一个弹窗, 已经有一个开着就忽略(也不记冷却,
+        以后再遇到还会问)。跑在 Tk 回调里, 永远不抛。"""
+        try:
+            if self._closing or self._bug_dialog is not None:
+                return
+            cfg = self._cfg
+            payload = bug_report.prepare(
+                kind, tb=tb, log_lines=tail, exit_code=exit_code,
+                ctx=block_by_id(cfg["schedule"], self._running_block_id),
+                aliases=[p.get("alias") for p in cfg.get("profiles", [])])
+            if payload is None:
+                return
+            self._bug_dialog = gui_bug_report.BugReportDialog(
+                self, payload, on_submit=self._submit_bug, on_close=self._on_bug_dialog_closed,
+                aliases=[p.get("alias") for p in cfg.get("profiles", [])])
+            self._log_line("⚠️ 检测到程序出错, 弹窗里可以选择把脱敏后的错误信息上报给开发者(不点就不发)\n")
+        except Exception:
+            pass
+
+    def _log_tail(self):
+        """日志面板最后几行 —— 主动反馈带上的「最近的输出」, 就是用户眼前看到的那些。"""
+        try:
+            return self.log_box.get("1.0", "end-1c").splitlines()[-bug_report.TAIL_LINES:]
+        except Exception:
+            return []
+
+    def _on_feedback(self):
+        """侧栏「反馈问题」: 用户随时主动反馈, 不用等出错。弹窗里先写说明(必填)、看到会发什么, 点「上报」
+        才发。同一时间最多一个窗口: 已经开着(哪怕是自动弹的出错窗)就把它带到前面, 说明可以写在那里。
+        跑在 Tk 回调里, 永远不抛。"""
+        try:
+            if self._bug_dialog is not None:
+                try:
+                    self._bug_dialog.lift()
+                    self._bug_dialog.focus_force()
+                except Exception:
+                    pass
+                return
+            if not bug_report.available():
+                messagebox.showinfo(
+                    "反馈问题",
+                    "你设置了环境变量 FLORR_TELEMETRY=0, 所有对外上报(包括这里的反馈)都关着。\n"
+                    "去掉这个环境变量、重启程序后就能用「反馈问题」了。", parent=self)
+                return
+            cfg = self._cfg
+            aliases = [p.get("alias") for p in cfg.get("profiles", [])]
+            payload = bug_report.prepare_manual(
+                log_lines=self._log_tail(), ctx=block_by_id(cfg["schedule"], self._running_block_id),
+                aliases=aliases)
+            if payload is None:
+                self._log_line("没能打开反馈窗口\n")
+                return
+            self._bug_dialog = gui_bug_report.BugReportDialog(
+                self, payload, on_submit=self._submit_bug, on_close=self._on_bug_dialog_closed, aliases=aliases)
+        except Exception:
+            try:
+                self._log_line("没能打开反馈窗口\n")      # 点了没反应最让人摸不着头脑, 至少留一行
+            except Exception:
+                pass
+
+    def _submit_bug(self, payload, note, done):
+        """弹窗里用户点了「上报」: 后台线程存副本 + 上传, 结果转回界面线程告诉弹窗和日志面板。"""
+        def finish(ok, msg):
+            def on_main():
+                self._log_line(("📮 " if ok else "📮 ⚠ ") + msg + "\n")
+                done(ok, msg)
+            try:
+                self.after(0, on_main)
+            except Exception:
+                pass                          # 窗口已经关了
+
+        try:
+            bug_report.submit(
+                payload, note=note, root=os.path.dirname(app_config.CONFIG_PATH), done=finish,
+                aliases=[p.get("alias") for p in self._cfg.get("profiles", [])])
+        except Exception:
+            finish(False, "上传没能开始")
+
+    def _on_bug_dialog_closed(self):
+        self._bug_dialog = None
 
     def _clear_log(self):
         self.log_box.configure(state="normal")
@@ -772,6 +913,9 @@ class App(ctk.CTk):
             except Exception:
                 pass
         self._stop_worker_sync()
+        t = self._hb_thread
+        if t is not None:
+            t.join(2)      # 最后那条心跳发出去: telemetry.send 是 daemon 线程, 窗口一销毁进程就退
         self.destroy()
 
 

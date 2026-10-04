@@ -367,7 +367,7 @@ def test_on_closing_proceeds_if_user_confirms(monkeypatch):
     calls = []
     fake = types.SimpleNamespace(
         _updates=types.SimpleNamespace(is_updating=lambda: True),
-        _closing=False, _tick_job=None, _telemetry_job=None,
+        _closing=False, _tick_job=None, _telemetry_job=None, _hb_thread=None,
         after_cancel=lambda *_: calls.append("after_cancel"),
         _stop_worker_sync=lambda: calls.append("worker"),
         destroy=lambda: calls.append("destroy"))
@@ -383,7 +383,7 @@ def test_on_closing_skips_prompt_when_not_updating(monkeypatch):
     calls = []
     fake = types.SimpleNamespace(
         _updates=types.SimpleNamespace(is_updating=lambda: False),
-        _closing=False, _tick_job=None, _telemetry_job=None,
+        _closing=False, _tick_job=None, _telemetry_job=None, _hb_thread=None,
         after_cancel=lambda *_: calls.append("after_cancel"),
         _stop_worker_sync=lambda: calls.append("worker"),
         destroy=lambda: calls.append("destroy"))

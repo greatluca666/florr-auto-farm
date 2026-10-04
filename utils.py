@@ -432,13 +432,17 @@ PLAYER_MARKER_COLOR = "f8de60"   # 玩家小地图标记的真实颜色(实测�
 # 实测(2026-09-28 蚁穴录像 + 2026-09-22 沙漠抓帧): 按这个式子换出来的跟截图认出来的
 # 位置差 1px 以内。没实测过的图不在表里 -> 不猜, 只走截图。
 # 海洋/丛林世界宽 61952, 跟花园/沙漠同大小, 缩放 300/(61952+2000) 一样, 没有单独实测。
-# 下水道/工厂(46080)缩放没实测, 不放进来。
+# 工厂(46080)2026-10-04 录像实测: 画布里小地图 CTM 缩放 0.0062396, 跟 300/(46080+2000) 在 7 位上一样;
+# worker 日志里 43 处截图读的位置跟这个式子换出来的差中位 0.9px、p90 1.5px。没进表之前工厂只能走截图认
+# 金点, 12 分钟读丢 46 次, 每次被当成"卡住"去乱冲脱困。
+# 下水道(同样 46080 格, 缩放预测相同)没实测, 不放进来。
 MINIMAP_WORLD_SCALE = {
     "anthell": 0.00461708941,
     "garden": 0.00469101826,
     "desert": 0.00469101826,
     "ocean": 0.00469101826,
     "jungle": 0.00469101826,
+    "factory": 0.006239600665557404,
 }
 _MINIMAP_BORDER_WORLD = 1000.0
 
@@ -710,6 +714,49 @@ def _green_button_ratio(pos, half_w=15, half_h=10):
     return match.sum() / match.size
 
 
+# 「开始」按钮左边是玩家名, 名字 + 按钮这一组水平居中 —— 所以按钮离屏幕中心多远取决于名字多长, 再乘上
+# UI 缩放; 固定坐标 _START_BUTTON_POS 只在名字长度跟量坐标那个号差不多、屏幕又是 16:9 时才对得上
+# (2026-10-04 有粉丝 2K 屏认不出开局菜单)。找法: 在屏幕中间一条横带里找「确认绿」连通块, 形状像按钮的
+# 就是它。尺寸 / 带的范围都是 1080p 参照值(按钮实测约 115x48, 填充率约 0.56, 取自 2026-10-04 的真录像
+# 截图), 按 SCREEN_HEIGHT/1080 缩放; 容差放得很宽, 因为超宽屏上 florr 是按高还是按宽缩放没量过。
+_START_BAND_X = (0.25, 0.75)          # 带占屏宽的比例: 够盖住名字长短带来的偏移
+_START_BAND_Y = (0.40, 0.58)          # 带占屏高的比例: 「开始」那一行在 48.8% ± 2.5%; 死亡页「继续」在 58.7%, 在带外
+_START_BTN_W_REF = (70, 260)
+_START_BTN_H_REF = (28, 90)
+_START_BTN_ASPECT = (1.3, 4.2)        # 宽/高。游客页那颗按钮是 6.5, 排除
+_START_BTN_MIN_FILL = 0.35
+
+
+def find_start_button():
+    """在屏幕中间那条带里找「开始」按钮, 返回它中心的屏幕坐标 (x, y); 找不到(或截屏出错)返回 None。
+    不依赖固定坐标 / 玩家名长度 / 屏幕宽高比。"""
+    try:
+        x0, x1 = int(SCREEN_WIDTH * _START_BAND_X[0]), int(SCREEN_WIDTH * _START_BAND_X[1])
+        y0, y1 = int(SCREEN_HEIGHT * _START_BAND_Y[0]), int(SCREEN_HEIGHT * _START_BAND_Y[1])
+        arr = np.array(pyautogui.screenshot(region=[x0, y0, x1 - x0, y1 - y0]))[:, :, :3]
+        green = np.array(_BUTTON_GREEN_RGB)
+        mask = cv2.inRange(arr, np.clip(green - 25, 0, 255).astype(np.uint8),
+                           np.clip(green + 25, 0, 255).astype(np.uint8))
+        s = SCREEN_HEIGHT / _REF_HEIGHT
+        k = max(3, round(5 * s)) | 1       # 字和箭头可能把绿底割成几块, 先闭运算合上
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+        n, _labels, stats, centers = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        best = None
+        for i in range(1, n):
+            w, h, area = (int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT]),
+                          int(stats[i, cv2.CC_STAT_AREA]))
+            if not (_START_BTN_W_REF[0] * s <= w <= _START_BTN_W_REF[1] * s
+                    and _START_BTN_H_REF[0] * s <= h <= _START_BTN_H_REF[1] * s
+                    and _START_BTN_ASPECT[0] <= w / h <= _START_BTN_ASPECT[1]
+                    and area / (w * h) >= _START_BTN_MIN_FILL):
+                continue
+            if best is None or area > best[0]:
+                best = (area, x0 + float(centers[i][0]), y0 + float(centers[i][1]))
+        return None if best is None else (round(best[1]), round(best[2]))
+    except Exception:
+        return None
+
+
 def on_start_screen():
     """检测屏幕上是不是正显示着开局菜单的绿色"开始"按钮(还没进局, 或已经从
     死亡画面点"继续"回到了这里).
@@ -717,8 +764,16 @@ def on_start_screen():
     check_stage()那套单像素精确匹配是给别的画面校准的, 跟开局菜单对不上号(实测
     这个画面check_stage()只会返回"unknown")。与其猜另一个精确像素签名, 不如直接
     去测"开始"按钮那块是不是真是绿的 —— 检测的就是马上要点的那个东西.
+
+    先看老的固定点(快, 名字长度合适的 16:9 屏行为不变); 不中再按颜色在中间一条带里找按钮
+    (find_start_button) —— 玩家名长短不同 / 2K / 超宽屏时按钮不在固定点上。找到了还要排除死亡页
+    (「继续」也是确认绿)。
     """
-    return _green_button_ratio(_START_BUTTON_POS) > 0.1
+    if _green_button_ratio(_START_BUTTON_POS) > 0.1:
+        return True
+    if find_start_button() is None:
+        return False
+    return not on_death_screen()
 
 
 # "继续"按钮比"开始"按钮小, "继续"两个字相对占比更大 —— 用_green_button_ratio()
@@ -823,7 +878,8 @@ def _click_button_until_gone(button_pos, still_showing, label, park=False):
     花就朝它走, 等画面稳定这一秒够滑出去两三百单位 —— 第六份录像蚁穴复活后就这样滑到回花园的
     门边, 被传回了花园。"""
     for attempt in range(1, _CONFIRM_CLICK_MAX_ATTEMPTS + 1):
-        pyautogui.moveTo(button_pos)
+        # button_pos 可以是个函数: 每次重试都重新找一遍按钮在哪(画面可能还在动 / 上一次点歪了)
+        pyautogui.moveTo(button_pos() if callable(button_pos) else button_pos)
         time.sleep(0.2)
         pyautogui.click()
         time.sleep(0.1)
@@ -841,7 +897,8 @@ def _click_button_until_gone(button_pos, still_showing, label, park=False):
 def click_start_game():
     """确认开局菜单, 真正进入游戏. 连点两下 + 复查on_start_screen()确认菜单消失,
     没消失就重试(理由见_click_button_until_gone上面的注释)."""
-    return _click_button_until_gone(_START_BUTTON_POS, on_start_screen, "开始", park=True)
+    return _click_button_until_gone(lambda: find_start_button() or _START_BUTTON_POS,
+                                    on_start_screen, "开始", park=True)
 
 
 def click_play_as_guest():

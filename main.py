@@ -7,6 +7,7 @@ import signal
 import stat
 import sys
 import threading
+import traceback
 import cdp_bridge
 import canvas_decode
 import time
@@ -21,6 +22,7 @@ import map_routes
 import florr_server
 import loadout_swap
 import flee_planner
+import phase_marks
 
 # ===== 索敌配置 (sszone敌怪检测/追击/规避) =====
 ENEMY_SCAN_INTERVAL = 0.12  # 秒, 索敌扫描节流间隔. 这是"决策新鲜度"的主旋钮:
@@ -31,8 +33,8 @@ ENEMY_SCAN_INTERVAL = 0.12  # 秒, 索敌扫描节流间隔. 这是"决策新鲜
                               # 的机器上循环会被推理本身卡住, 那也没办法, 至少不比
                               # 大间隔更差. 漫游时每腿路另受move_to_position的
                               # max_attempts限制(见下方wander分支).
-AVOID_TRIGGER_PX = 400      # 屏幕像素半径, AVOID怪进入此半径触发逃离
-CAUTIOUS_HOLD_PX = 500      # 屏幕像素, CAUTIOUS怪(U沙尘暴等)保持的最小距离(不继续贴近). 250 实测太近, 等于直接撞上去
+AVOID_TRIGGER_PX = enemy_detect.DEFAULT_AVOID_TRIGGER_PX   # 屏幕像素半径, AVOID怪进入此半径触发逃离
+CAUTIOUS_HOLD_PX = enemy_detect.CAUTIOUS_HOLD_PX   # 屏幕像素, CAUTIOUS怪(U沙尘暴等)保持的距离: 追到这就停, 比它近了就退(用户旋钮 cautious_px 可改)
 CHASE_MIN_CONF = 0.55      # 追击目标的最低置信度(幻影框过滤; 危险怪不受此限)
 MYTHIC_LATCH_ENABLED  = True   # 贴脸有 Mythic 怪 → 锁定优先清掉再继续刷 (总开关)
 MYTHIC_ENGAGE_PX      = 650    # Mythic 怪进此半径 → 锁定. 实测 --watch: 玩家眼里"贴脸"
@@ -875,6 +877,20 @@ class _FleeLatch:
 _FLEE_LATCH = _FleeLatch()
 
 
+_TB_PRINTED = set()
+
+
+def _print_exc_once(tag):
+    """被吞掉的异常: 同一处(tag)同一种异常类型, 第一次出现时把整段 traceback 打进 worker 输出
+    (控制面板的 bug 自动上报是从输出流里认 traceback 的), 之后不再打 —— 这些地方每拍都会跑,
+    不然一个持续的错误会把日志面板和 logs/ 刷满。每拍一行的「⚠️ …出错」提示照旧。"""
+    key = (tag, type(sys.exc_info()[1]).__name__)
+    if key in _TB_PRINTED:
+        return
+    _TB_PRINTED.add(key)
+    traceback.print_exc()
+
+
 def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, prev_detections,
                         can_reach=None, in_area=None):
     """索敌节流 + 总开关. 返回 (decision, detections, last_enemy_scan, scanned).
@@ -893,7 +909,9 @@ def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, p
         return prev_decision, prev_detections, last_enemy_scan, False
     last_enemy_scan = now
     try:
-        detections = enemy_detect.scan_enemies()
+        # 用户设成「忽略」的物种在这里整条剔除 —— 往下的 select_action / _FleeLatch / flee 规划 /
+        # Mythic 锁定拿到的都是过滤后的这一份, 才保证「忽略」是真忽略。
+        detections = enemy_detect.drop_ignored(enemy_detect.scan_enemies())
         # 给究极打"冲过来"标记(跨扫描跟踪), select_action 用它在 avoid_early_px 内提前躲。
         # 跟踪是附加的: 它出错只是这拍不提前躲, 不能把整次决策拖成漫游。
         try:
@@ -902,17 +920,24 @@ def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, p
             pass
         decision = enemy_detect.select_action(
             detections,
-            avoid_trigger_px=enemy_detect.avoid_trigger_px_for(utils.MAP, AVOID_TRIGGER_PX),
+            avoid_trigger_px=enemy_detect.knob(
+                "avoid_px", enemy_detect.avoid_trigger_px_for(utils.MAP, AVOID_TRIGGER_PX)),
             avoid_early_px=enemy_detect.avoid_early_px_for(utils.MAP),
             can_reach=can_reach, in_area=in_area,
-            cautious_hold_px=CAUTIOUS_HOLD_PX,
+            cautious_hold_px=enemy_detect.knob("cautious_px", CAUTIOUS_HOLD_PX),
             center=enemy_detect.current_center(),
             chase_min_conf=CHASE_MIN_CONF,
             target_policy=enemy_detect.target_policy_for(utils.MAP),
+            # 用户旋钮(没设 = 内置值, 跟改动前传给 select_action 的默认值一样)
+            engage_hold_px=enemy_detect.knob("hold_active_px", enemy_detect.ENGAGE_HOLD_PX),
+            chase_max_px=enemy_detect.knob("chase_max_px", enemy_detect.CHASE_MAX_PX),
+            far_chase_px=enemy_detect.knob("far_chase_px", enemy_detect.FAR_CHASE_PX),
+            swarm_enabled=enemy_detect.knob("swarm", True),
         )
         decision = _FLEE_LATCH.apply(decision, detections, enemy_detect.current_center(), now)
     except Exception as e:
         print(f"⚠️ 索敌出错, 本轮当漫游处理: {e}")
+        _print_exc_once("scan")
         decision, detections = ("wander", None), []
     return decision, detections, last_enemy_scan, True
 
@@ -945,9 +970,10 @@ def _drive_and_check_stall(mouse_target, current_pos, chase_pos_history, state, 
     真实锚点在地图边界/非全屏时跟屏幕中心差上百像素, 比错了会把"刻意停住"当成
     "在移动", 于是卡住检测每隔几 tick 就误判一次脱困。
 
-    track_stall=False(绕圈打蠕虫): 不记样本, 还清掉旧的。绕圈的净位移最多一个直径, 蚁穴
-    里半径 60 屏幕像素只合 ~3 格小地图, 低于 chase_is_stalled 的 4 格 —— 喂进去必定误判。
-    代价: 绕圈时真顶在墙上也不脱困, 由蠕虫定时钻地(目标消失)兜底。"""
+    track_stall=False(绕圈打蠕虫, 特性表 stall_exempt): 不记样本, 还清掉旧的。绕圈的净位移最多一个
+    直径, 蚁穴里半径 60 屏幕像素只合 ~3 格小地图, 低于 chase_is_stalled 的 4 格 —— 喂进去必定误判。
+    代价: 绕圈时真顶在墙上也不脱困, 由蠕虫定时钻地(目标消失)兜底。远程射手的绕圈不豁免(见
+    enemy_detect.SPECIES_TRAITS 的 stall_exempt 说明)。"""
     if center is None:
         center = enemy_detect.current_center()
     if not track_stall:
@@ -1066,6 +1092,7 @@ class _FleePlan:
             plan = flee_planner.plan_flee(binary_map, to_map(me), chasers, crowd, prefer=self.goal)
         except Exception as e:
             print(f"⚠️ 躲避规划出错, 这拍按老办法躲: {e}")
+            _print_exc_once("flee-plan")
             plan = None
         self.t = now
         if plan is None:
@@ -1332,18 +1359,24 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
                                    center=center)
             continue
 
-        # 4) 普通追击 —— 不 fleeing 也没锁定 Mythic. 走位按物种(蚁穴蠕虫绕圈不停, 其余到
+        # 4) 普通追击 —— 不 fleeing 也没锁定 Mythic. 走位按物种(蠕虫和远程射手绕圈不停, 其余到
         #    停步半径就停), 见 enemy_detect.chase_move_target。
         if enemy_action == "chase":
             target, hold_px, repel = enemy_decision[1], enemy_decision[2], enemy_decision[3]
             center = enemy_detect.current_center()
             mouse_target = enemy_detect.chase_move_target(
                 target, hold_px, center, repel_positions=repel)
-            circling = target["species"] in enemy_detect.ANTHELL_STRAFE_SPECIES
-            verb = "绕圈打" if circling else "追击"
+            # 谨慎怪太近 → chase_move_target 已经给了背离它的方向; 后退也别往墙里退(退到墙边就是站着挨打,
+            # 跟躲究极同一个坑), 偏一偏找条前方走得通的路。
+            retreating = enemy_detect.is_cautious_retreat(target, hold_px, center)
+            if retreating:
+                mouse_target = _steer_clear_of_walls(mouse_target, center, current_pos, binary_map)
+            circling = enemy_detect.tactic_for(target["species"]) == "strafe"
+            verb = "后退拉开距离" if retreating else ("绕圈打" if circling else "追击")
             _drive_and_check_stall(mouse_target, current_pos, chase_pos_history,
                                    "索敌中", f"{verb} {target['species']}({target['rarity']})",
-                                   center=center, track_stall=not circling)
+                                   center=center,
+                                   track_stall=not enemy_detect.stall_exempt_for(target["species"]))
             continue
 
         # 5) enemy_action == "wander": 没有可打/需规避的目标, 随机漫游.
@@ -1418,6 +1451,10 @@ def _apply_worker_config(cfg):
     map_name = src.get("map", d["map"])
     invert_attack = src.get("invert_attack", d["invert_attack"])
     invert_defense = src.get("invert_defense", d["invert_defense"])
+    # 索敌用户规则: 对着 map_name 规整(不属于这张图的物种丢掉并警告), 装进 enemy_detect。
+    # 跟下面的 apply_map 一样是「应用」: worker 每个进程只调这一次, 换时块 = 换 worker。
+    enemy_rules = app_config._coerce_enemy_rules(src.get("enemy_rules"), map_name)
+    enemy_detect.set_rules(enemy_rules)
     route = map_routes.route_for(map_name)
     # MAP 先设成刷怪那张图(单图路线就是它自己)。多阶段路线里 _run_entry_route()
     # 每一段会自己 apply_map() 覆盖, 这里只是给个合理的初值。
@@ -1442,6 +1479,7 @@ def _apply_worker_config(cfg):
         "reach_area_swap": src.get("reach_area_swap", d["reach_area_swap"]),
         "invert_attack": invert_attack,
         "invert_defense": invert_defense,
+        "enemy_rules": enemy_rules,
     }
 
 
@@ -2599,7 +2637,8 @@ def run_worker(cfg):
         # 蚁穴这类"标题页选不到、得先进花园再踩洞口传送"的图: 先把进场路线跑完,
         # 人真的落在刷怪那张图上再开始寻路。单图路线(花园/沙漠/海洋/丛林)这里第一圈就
         # "arrived", 整段空转。
-        entry = _run_entry_route(w["route"], stage_state, want_defense=want_defense)
+        with phase_marks.phase("travel"):       # 统计: 进场路线算「赶路」
+            entry = _run_entry_route(w["route"], stage_state, want_defense=want_defense)
         # 进场路线自己在花园里走着走着被洞口传进蚁穴, 也会被寻路当成"不在这张图"—— 那是正常
         # 进场, 不算。只有进场之后(去刷怪区 / 刷怪)再被传走才算。
         _WRONG_MAP_SEEN = None
@@ -2612,7 +2651,8 @@ def run_worker(cfg):
                 portal_switch_pending = False
                 print("⚠️ 人没进到蚁穴, 传送门换服用不上, 直接换")
                 try:
-                    switch_server(w["biome"])
+                    with phase_marks.phase("travel"):
+                        switch_server(w["biome"])
                     stage_state.reset()
                     just_switched_server = True
                     consecutive_short_rounds = 0
@@ -2626,16 +2666,18 @@ def run_worker(cfg):
                 portal_switch_pending = False
                 switched = False
                 try:
-                    switched = _switch_server_via_portal(
-                        w["biome"], _portal_switch_target(w),
-                        enemy_watch=_PathingEnemyWatch() if w["enemy_ai_enabled"] else None,
-                        want_defense=want_defense)
+                    with phase_marks.phase("travel"):
+                        switched = _switch_server_via_portal(
+                            w["biome"], _portal_switch_target(w),
+                            enemy_watch=_PathingEnemyWatch() if w["enemy_ai_enabled"] else None,
+                            want_defense=want_defense)
                 except Exception as e:
                     print(f"⚠️ 传送门换服出错: {e}")
                 if not switched:
                     print("⚠️ 没能在传送门上换服, 直接换")
                     try:
-                        switch_server(w["biome"])
+                        with phase_marks.phase("travel"):
+                            switch_server(w["biome"])
                         stage_state.reset()   # 直接换 = 新服从花园出生点重新进场
                         switched = True
                     except Exception as e:
@@ -2664,18 +2706,20 @@ def run_worker(cfg):
             overlay.update(state="启动", target=target_location,
                            message=f"第{round_count}轮: 开始自动寻路到刷怪区域")
             # 路上也躲究极(用户 2026-09-28), 只在这张图开了索敌时
-            reached_farm = lazy_theta_pathing(
-                target_location, [farming_area],
-                enemy_watch=_PathingEnemyWatch() if w["enemy_ai_enabled"] else None)
+            with phase_marks.phase("travel"):       # 统计: 去刷怪区的路上算「赶路」
+                reached_farm = lazy_theta_pathing(
+                    target_location, [farming_area],
+                    enemy_watch=_PathingEnemyWatch() if w["enemy_ai_enabled"] else None)
         if reached_farm:
             print("✅ 到达刷怪区域！")
             # 到刷怪区了: 按配置的键切到"输出" loadout. 跟 enter swap 同一道 gate ——
             # 存活续命轮 florr 没重置 loadout, 不重按.
             if swap_this_round:
                 loadout_swap.press_swap(w["reach_area_swap"])
-            auto_farming(farming_area, farming_duration,
-                         enemy_ai_enabled=w["enemy_ai_enabled"],
-                         )
+            with phase_marks.phase("farm"):         # 统计: auto_farming 里的时间(含就地复活)算「刷怪」
+                auto_farming(farming_area, farming_duration,
+                             enemy_ai_enabled=w["enemy_ai_enabled"],
+                             )
         else:
             print("❌ 本轮未能到达目标区域")
             overlay.update(message="本轮未能到达目标区域")
@@ -2760,7 +2804,8 @@ def run_worker(cfg):
                 overlay.update(state="换服务器",
                                message=f"累计{consecutive_short_rounds}次(死亡/没刷满), 切换中")
                 try:
-                    switch_server(w["biome"])
+                    with phase_marks.phase("travel"):
+                        switch_server(w["biome"])
                     stage_state.reset()   # 换到另一台花园服 = 又得重踩一次洞口
                     consecutive_short_rounds = 0
                     just_switched_server = True   # 下一次死亡画面是重连过渡态, 别点

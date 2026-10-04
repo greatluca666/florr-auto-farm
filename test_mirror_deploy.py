@@ -16,7 +16,7 @@ def _read(rel):
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="没有 bash")
-@pytest.mark.parametrize("script", ["deploy/mirror/install.sh", "deploy/ubuntu/setup.sh"])
+@pytest.mark.parametrize("script", ["deploy/mirror/install.sh", "deploy/mirror/fetch_afk.sh", "deploy/ubuntu/setup.sh"])
 def test_shell_scripts_parse(script):
     subprocess.run(["bash", "-n", str(ROOT / script)], check=True)
 
@@ -156,3 +156,81 @@ def test_install_sh_keeps_an_existing_admin_password_file(tmp_path):
     r = run()
     assert r.returncode == 0, r.stdout + r.stderr
     assert (etc / "florrfarm-admin.auth").read_text(encoding="utf-8") == real
+
+
+# ---- florr-auto-afk 固定版本的加速下载 ----
+
+AFK_SHA256 = "74488ef58966d123ace6d19ebb11c05d7ac8ee992abd949289714a8a866e7d74"
+
+
+def test_caddy_serves_afk_package_outside_the_pruned_download_dir():
+    # download/ 里不属于 florr-auto-farm 的文件会被 mirror_sync.prune 删掉, afk 包必须在别处
+    c = _read("deploy/mirror/florrfarm.caddy")
+    body = c[c.index("florrfarm.cc.cd {"):]
+    afk = body[body.index("handle /afk/*"):body.index("handle /latest.json")]
+    assert f"root * {mirror_sync.DATA_DIR}" in afk
+    assert "\t\t@found file\n" in afk
+    assert '\t\theader @found Cache-Control "public, max-age=31536000, immutable"\n' in afk
+    assert "file_server" in afk
+    assert "/var/lib/florrfarm/afk" in _read("deploy/mirror/fetch_afk.sh")
+
+
+def test_install_sh_creates_afk_dir_and_fetches_the_package():
+    s = _read("deploy/mirror/install.sh")
+    assert "/var/lib/florrfarm/afk" in s
+    assert 'bash "$HERE/fetch_afk.sh"' in s
+
+
+def test_fetch_afk_pins_the_sha256_of_the_github_asset():
+    s = _read("deploy/mirror/fetch_afk.sh")
+    assert f'SHA256="{AFK_SHA256}"' in s
+    assert 'FILE="florr-auto-afk-v1.1.1-auto.zip"' in s
+    assert 'URL="https://github.com/greatluca666/florr-auto-afk/releases/download/v1.1.1/${FILE}"' in s
+
+
+def _fetch_afk_env(tmp_path, curl_body):
+    """假 curl(把 curl_body 写进 -o 指定的文件) + 在没有 sha256sum 的机器(macOS)上用 shasum 顶替."""
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    curl = stub / "curl"
+    curl.write_text('#!/usr/bin/env bash\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\n'
+                    f'printf %s {curl_body!r} > "$out"\n', encoding="utf-8")
+    curl.chmod(0o755)
+    if shutil.which("sha256sum") is None:
+        sha = stub / "sha256sum"
+        sha.write_text('#!/usr/bin/env bash\nexec shasum -a 256 "$@"\n', encoding="utf-8")
+        sha.chmod(0o755)
+    import os
+    env = dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
+               FLORR_AFK_DIR=str(tmp_path / "afk"))
+    return env
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="没有 bash")
+def test_fetch_afk_refuses_a_download_with_the_wrong_hash(tmp_path):
+    env = _fetch_afk_env(tmp_path, "not the real zip")
+    r = subprocess.run(["bash", str(MIRROR / "fetch_afk.sh")], capture_output=True, text=True, env=env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "SHA-256" in r.stderr
+    assert list((tmp_path / "afk").iterdir()) == []      # 坏包和 .part 都不留
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="没有 bash")
+def test_fetch_afk_keeps_a_verified_package_without_downloading_again(tmp_path):
+    # 把 SHA256 换成假内容的哈希来跑通成功路径; 同时确认第二次不再调用 curl
+    import hashlib
+    body = "pretend zip"
+    script = _read("deploy/mirror/fetch_afk.sh").replace(
+        AFK_SHA256, hashlib.sha256(body.encode()).hexdigest())
+    patched = tmp_path / "fetch_afk.sh"
+    patched.write_text(script, encoding="utf-8")
+    env = _fetch_afk_env(tmp_path, body)
+    r = subprocess.run(["bash", str(patched)], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    pkg = tmp_path / "afk" / "florr-auto-afk-v1.1.1-auto.zip"
+    assert pkg.read_text(encoding="utf-8") == body
+    assert not (tmp_path / "afk" / "florr-auto-afk-v1.1.1-auto.zip.part").exists()
+    (tmp_path / "bin" / "curl").write_text("#!/usr/bin/env bash\nexit 99\n", encoding="utf-8")
+    r2 = subprocess.run(["bash", str(patched)], capture_output=True, text=True, env=env)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "不用再拉" in r2.stdout

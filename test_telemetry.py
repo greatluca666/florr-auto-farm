@@ -177,6 +177,39 @@ def test_events_pass_the_servers_validation(tmp_path):
     store.close()
 
 
+def test_heartbeat_event_without_a_window_is_still_the_v1_payload():
+    blk = {"map": "desert", "farming_area": [[9, 8], [51, 56]]}
+    e = telemetry.heartbeat_event(blk)
+    assert e["v"] == 1 and "dur" not in e and "ph" not in e
+
+
+def test_heartbeat_event_with_a_window_is_v2():
+    blk = {"map": "desert", "farming_area": [[9, 8], [51, 56]]}
+    window = {"dur": 300, "ph": {"farm": 200, "travel": 60, "other": 40}}
+    e = telemetry.heartbeat_event(blk, window)
+    assert e["v"] == 2 and e["type"] == "hb" and e["map"] == "desert" and e["area"] == [[9, 8], [51, 56]]
+    assert e["dur"] == 300 and e["ph"] == {"farm": 200, "travel": 60, "other": 40}
+    assert set(e) == {"v", "type", "id", "ver", "map", "area", "dur", "ph"}
+
+
+def test_v2_events_pass_the_servers_validation_and_credit_real_time(tmp_path):
+    stats_store = _stats_store()
+    from datetime import datetime, timedelta, timezone
+    store = stats_store.Store(str(tmp_path / "s.sqlite3"))
+    region = {"country": "中国", "province": "广东省", "city": "广州市"}
+    blk = {**gui_schedule.new_block_template({"schedule": [], "profiles": []}),
+           "farming_area": [[9, 8], [51, 56]]}
+    t0 = datetime(2026, 9, 30, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+    zero = {"dur": 0, "ph": {"farm": 0, "travel": 0, "other": 0}}
+    window = {"dur": 300, "ph": {"farm": 200, "travel": 60, "other": 40}}
+    assert store.record_event(telemetry.heartbeat_event(blk, zero), region, t0) is False   # 启动那一条
+    assert store.record_event(telemetry.heartbeat_event(blk, window), region,
+                              t0 + timedelta(seconds=300)) is True
+    ph = store.summary(30, t0 + timedelta(minutes=10))["phase"]
+    assert (ph["farm"], ph["travel"], ph["other"]) == (3.3, 1, 0.7)    # 200 / 60 / 40 秒
+    store.close()
+
+
 def test_heartbeat_interval_and_endpoint_match_the_server():
     stats_store = _stats_store()
     assert telemetry.HEARTBEAT_S == stats_store.HEARTBEAT_MINUTES * 60
@@ -209,3 +242,171 @@ SCHED = [{"id": "blk-1", "map": "desert"}, {"id": "blk-2", "map": "anthell"}]
 def test_heartbeat_block(running, proc, want):
     blk = gui_app.heartbeat_block(SCHED, running, proc)
     assert (blk["id"] if blk else None) == want
+
+
+# ---- 心跳 v2: 什么时候报、报什么 ----
+
+import types  # noqa: E402
+
+import telemetry_clock  # noqa: E402
+
+BLOCK = {"id": "blk-1", "map": "desert", "farming_area": [[9, 8], [51, 56]]}
+
+
+class _Clk:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class _FakeThread:
+    def __init__(self):
+        self.joined = []
+
+    def join(self, timeout=None):
+        self.joined.append(timeout)
+
+
+def _capture_send(monkeypatch):
+    sent = []
+
+    def send(make_payload):
+        sent.append(make_payload())
+        return _FakeThread()
+
+    monkeypatch.setattr(gui_app.telemetry, "send", send)
+    return sent
+
+
+def _app(block_id="blk-1"):
+    clk = _Clk()
+    app = types.SimpleNamespace(
+        _closing=False, _cfg={"schedule": [dict(BLOCK)], "profiles": []}, _running_block_id=block_id,
+        proc=None, _tclock=telemetry_clock.TelemetryClock(clock=clk), _hb_thread=None,
+        _telemetry_job=None, _telemetry_tick=lambda: None, after=lambda ms, fn: "job",
+        _log_line=lambda s: None,
+        _sched_running=False, _set_status=lambda *a: None, _set_start_btn=lambda *a: None,
+        _set_running_block=lambda bid: None)
+    app._send_heartbeat = lambda blk: gui_app.App._send_heartbeat(app, blk)
+    return clk, app
+
+
+def test_block_by_id():
+    assert gui_app.block_by_id(SCHED, "blk-2")["map"] == "anthell"
+    assert gui_app.block_by_id(SCHED, "gone") is None and gui_app.block_by_id(SCHED, None) is None
+
+
+def test_tick_sends_a_v2_window_and_the_next_window_starts_empty(monkeypatch):
+    sent = _capture_send(monkeypatch)
+    clk, app = _app()
+    app.proc = _Proc()
+    app._tclock.worker_started()
+    clk.t = 40
+    app._tclock.mark("farm")
+    clk.t = 300
+    gui_app.App._telemetry_tick(app)
+    assert len(sent) == 1 and sent[0]["v"] == 2
+    assert sent[0]["dur"] == 300 and sent[0]["ph"] == {"farm": 260, "travel": 0, "other": 40}
+    assert sent[0]["map"] == "desert" and sent[0]["area"] == [[9, 8], [51, 56]]
+    clk.t = 360
+    gui_app.App._telemetry_tick(app)
+    assert sent[1]["dur"] == 60 and sent[1]["ph"]["farm"] == 60
+
+
+def test_tick_sends_nothing_when_no_worker_is_running(monkeypatch):
+    sent = _capture_send(monkeypatch)
+    _, app = _app()                                       # proc 是 None
+    gui_app.App._telemetry_tick(app)
+    assert sent == []
+
+
+def test_stopping_the_worker_reports_the_last_partial_window_exactly_once(monkeypatch):
+    sent = _capture_send(monkeypatch)
+    clk, app = _app()
+
+    class _Stoppable:
+        stdin = None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    app.proc = _Stoppable()
+    app._tclock.worker_started()
+    clk.t = 70
+    gui_app.App._stop_worker_sync(app)
+    assert app.proc is None and len(sent) == 1
+    assert sent[0]["dur"] == 70 and sent[0]["v"] == 2
+    gui_app.App._stop_worker_sync(app)                    # 已经停了: 不再报
+    assert len(sent) == 1
+
+
+def test_a_worker_that_exits_on_its_own_reports_its_last_window(monkeypatch):
+    sent = _capture_send(monkeypatch)
+    clk, app = _app()
+    app.proc = proc = _Proc(code=1)
+    app._tclock.worker_started()
+    clk.t = 45
+    gui_app.App._on_worker_exit(app, proc, 1)
+    assert app.proc is None and len(sent) == 1 and sent[0]["dur"] == 45
+    gui_app.App._on_worker_exit(app, proc, 1)             # 慢半拍的重复回调: proc 已经不是当前的, 早退
+    assert len(sent) == 1
+
+
+def test_entering_a_block_reports_a_heartbeat_right_away(monkeypatch):
+    sent = _capture_send(monkeypatch)
+    clk, app = _app(block_id=None)
+    blk = {**gui_schedule.new_block_template({"schedule": [], "profiles": []}),
+           "id": "blk-1", "farming_area": [[9, 8], [51, 56]]}
+    app._stop_worker_sync = lambda: None
+    app._spawn_worker = lambda: app._tclock.worker_started()
+    app._set_running_block = lambda bid: setattr(app, "_running_block_id", bid)
+    monkeypatch.setattr(gui_app.app_config, "save_config", lambda cfg: None)
+    monkeypatch.setattr(gui_app.gui_schedule, "block_to_active", lambda b: {})   # 这里不关心 active 怎么算
+    gui_app.App._enter_block(app, blk, False)
+    assert len(sent) == 1 and sent[0]["v"] == 2 and sent[0]["dur"] == 0
+    assert sent[0]["map"] == blk["map"]
+
+
+def test_closing_the_window_waits_for_the_last_heartbeat_to_go_out():
+    order = []
+    t = _FakeThread()
+    app = types.SimpleNamespace(
+        _updates=None, _closing=False, _tick_job=None, _telemetry_job=None, after_cancel=lambda j: None,
+        _stop_worker_sync=lambda: order.append("stop"), _hb_thread=t,
+        destroy=lambda: order.append("destroy"))
+    gui_app.App.on_closing(app)
+    assert order == ["stop", "destroy"] and t.joined == [2]
+
+
+def test_spawned_workers_are_asked_to_print_phase_markers(monkeypatch):
+    seen = {}
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            seen["env"] = kw["env"]
+            self.stdout = iter(())
+            self.stdin = None
+
+    monkeypatch.setattr(gui_app.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(gui_app.worker_log, "WorkerLog",
+                        lambda *a, **k: types.SimpleNamespace(write=lambda s: None, close=lambda: None))
+    monkeypatch.setattr(gui_app.threading, "Thread",
+                        lambda **k: types.SimpleNamespace(start=lambda: None))
+    clk, app = _app()
+    app._pump_log = lambda *a: None
+    app._on_worker_traceback = lambda *a: None      # _spawn_worker 现在会给输出泵配一个 traceback 监视器
+    gui_app.App._spawn_worker(app)
+    assert seen["env"]["FLORR_PHASE_MARKERS"] == "1"
+    clk.t = 25
+    assert app._tclock.take_window()["dur"] == 25          # 起 worker 的同时开始记账

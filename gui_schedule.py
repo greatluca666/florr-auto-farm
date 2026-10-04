@@ -9,17 +9,21 @@ import tkinter as tk
 import customtkinter as ctk
 
 import app_config
+import enemy_recommend
+import enemy_species
 import gui_theme as theme
 
 WEEKDAY_LABELS = ("一", "二", "三", "四", "五", "六", "日")
 
 _ACTIVE_KEYS = app_config._ACTIVE_KEYS
 
+
 # loadout 切换和弦: 每个字段 = 开关 + 修饰键下拉 + 数字下拉.
 _SWAP_MOD_LABELS = {"none": "无", "k": "k", "l": "l"}
 _SWAP_MOD_FROM_LABEL = {v: k for k, v in _SWAP_MOD_LABELS.items()}
 _SWAP_DIGIT_VALUES = list("1234567890")
 _coerce_swap_obj = app_config._coerce_swap_obj   # 单一真源
+_coerce_enemy_rules = app_config._coerce_enemy_rules   # 单一真源
 
 
 # 目录名: 保留 \w(含汉字)和连字符, 其余替换成 _, 首尾 _ 去掉.
@@ -50,6 +54,7 @@ def block_to_active(block):
         "invert_defense": bool(block.get("invert_defense", False)),
         "enter_game_swap": _coerce_swap_obj(block.get("enter_game_swap")),
         "reach_area_swap": _coerce_swap_obj(block.get("reach_area_swap")),
+        "enemy_rules": _coerce_enemy_rules(block.get("enemy_rules"), block.get("map")),
     }
 
 
@@ -131,6 +136,215 @@ def new_block_template(cfg):
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
     }
+
+
+# ── 索敌设置子窗的纯函数(不碰 tk, 单测直接调) ──────────────────────────────────────
+# 物种 × 稀有度矩阵: 每个物种一行, 第一列「全部」管所有稀有度, 后面每个稀有度一格; 点一下往后切一格。
+RULE_CYCLE = ("", "fight", "cautious", "avoid", "ignore")        # "" = 默认(内置打法 / 稀有度起点)
+_RULE_LABELS = {"": "默认", "fight": "打", "cautious": "谨慎", "avoid": "躲", "ignore": "忽略"}
+MATRIX_COLS = ("*",) + tuple(enemy_species.RARITY_ORDER)
+_COL_HEADERS = {"*": "全部", "Common": "Com", "Unusual": "Unc", "Rare": "Rare", "Epic": "Epic",
+                "Legendary": "Leg", "Mythic": "Myth", "Ultra": "Ultra", "Super": "Super",
+                "Eternal": "Etrn", "Unique": "Uniq"}
+_CELL_TEXT = {"": "·", "fight": "打", "cautious": "谨", "avoid": "躲", "ignore": "忽"}
+_CELL_LOOK = {"": (theme.SURFACE_HI, theme.FAINT), "fight": (theme.SUCCESS, "#ffffff"),
+              "cautious": (theme.WARN, "#1b1e24"), "avoid": (theme.DANGER, "#ffffff"),
+              "ignore": (theme.FAINT, theme.TEXT)}
+_CELL_MIN = 40                   # 一格最小宽度(像素): 11 格 + 名字列要放进卡片, 太宽最右一列会被截掉
+_SWARM_LABELS = {"": "默认", "on": "开", "off": "关"}
+_SWARM_FROM_LABEL = {v: k for k, v in _SWARM_LABELS.items()}
+# 躲避起点稀有度下拉: "" = 不写键(内置 Ultra); 其余键 = app_config 认的档名。显示名用英文档名本身 ——
+# 仓库里高档稀有度的中文译名并不统一(farm_baseline / analyze_recording 的表就对不上), 不在这里再猜一份。
+_TIER_LABELS = {
+    "": f"默认 ({enemy_species.AVOID_MIN_RARITY_DEFAULT})",
+    **{t: t for t in enemy_species.AVOID_MIN_RARITY_CHOICES
+       if t != enemy_species.AVOID_MIN_RARITY_NEVER},
+    enemy_species.AVOID_MIN_RARITY_NEVER: "从不",
+}
+_TIER_FROM_LABEL = {v: k for k, v in _TIER_LABELS.items()}
+# 五个整数旋钮: (键, 子窗里显示的名字)。顺序 = 子窗里的顺序。
+_KNOB_LABELS = (
+    ("hold_active_px", "主动怪停步"),
+    ("hold_passive_px", "被动/不动怪停步"),
+    ("chase_max_px", "追击上限"),
+    ("far_chase_px", "远距追击上限"),
+    ("avoid_px", "躲避半径"),
+    ("cautious_px", "谨慎保持距离"),
+)
+# 「按装备推荐」: 下拉的显示名。"请选择" 是初始占位, 不是合法值(recommendation_for 会拒掉)。
+_STYLE_LABELS = {"melee": "近战", "ranged": "远程", "summon": "召唤"}
+_STYLE_FROM_LABEL = {v: k for k, v in _STYLE_LABELS.items()}
+_REC_PICK = "请选择"
+_REC_KNOB_NAMES = {"avoid_min_rarity": "躲避起点稀有度",
+                   **{k: label for k, label in _KNOB_LABELS if k in enemy_recommend.GOVERNED_KNOBS}}
+_KIND_LABELS = {"active": "主动", "passive": "被动", "static": "不动"}
+_DIGITS_RE = re.compile(r"[0-9]+")
+
+
+def empty_rules():
+    return {"species": {}, "knobs": {}}
+
+
+def rules_summary(rules):
+    """时块编辑器里「索敌设置…」按钮旁边那句话。"""
+    r = rules or {}
+    n, m = len(r.get("species") or {}), len(r.get("knobs") or {})
+    parts = ([f"{n} 个物种"] if n else []) + ([f"{m} 项数值"] if m else [])
+    return "自定义 " + ", ".join(parts) if parts else "全部默认"
+
+
+def next_rule(cur, step=1):
+    """矩阵格子点一下切到的下一个状态(step=-1 往回切); 不认识的状态当默认。"""
+    i = RULE_CYCLE.index(cur) if cur in RULE_CYCLE else 0
+    return RULE_CYCLE[(i + step) % len(RULE_CYCLE)]
+
+
+def species_cells(rule):
+    """一个物种的规则(字符串 / {稀有度: 打法} / None) -> {列: 状态}, 只含有打法的列。字符串 = 「全部」列。"""
+    if isinstance(rule, str):
+        return {"*": rule} if rule else {}
+    if isinstance(rule, dict):
+        return {k: v for k, v in rule.items() if v}
+    return {}
+
+
+def species_rule_from_cells(cells):
+    """{列: 状态} -> 这个物种存进配置的规则: 全空 -> None(不写); 只有「全部」-> 字符串(老写法);
+    否则 {稀有度: 打法}, 键按列顺序(「全部」、再稀有度从低到高), 空格子不写。"""
+    kept = {c: cells[c] for c in MATRIX_COLS if cells.get(c)}
+    if not kept:
+        return None
+    if set(kept) == {"*"}:
+        return kept["*"]
+    return kept
+
+
+def rules_for_map(rules, map_name):
+    """换图时: 丢掉不属于新图的物种覆盖, 旋钮原样保留。返回新 dict(入参可为 None), 逐稀有度的字典也是拷贝。
+    读纯数据模块 enemy_species(不是 enemy_detect, 后者会拉进 cv2 / cdp_bridge)。"""
+    known = enemy_species.MAP_SPECIES.get(map_name, frozenset())
+    r = rules or {}
+    return {"species": {s: (dict(v) if isinstance(v, dict) else v)
+                        for s, v in (r.get("species") or {}).items() if s in known},
+            "knobs": dict(r.get("knobs") or {})}
+
+
+def species_rows(map_name):
+    """子窗的物种行: [(slug, 中文名, 英文名, 内置打法标签)], 按 slug 排序; 地图不认识 -> []。"""
+    import enemy_detect
+    rows = []
+    for slug in sorted(enemy_detect.MAP_SPECIES.get(map_name, ())):
+        names = enemy_detect.SPECIES_NAMES[slug]
+        t = enemy_detect.SPECIES_TRAITS.get(slug, {})
+        kind = ("绕圈" if t.get("tactic") == "strafe"
+                else _KIND_LABELS[t.get("kind", "active")])
+        rows.append((slug, names["zh"], names["en"], kind))
+    return rows
+
+
+def knob_defaults(map_name):
+    """子窗输入框的 placeholder: 本图的内置值(用户留空 = 用这个)。"""
+    import enemy_detect
+    return {
+        "hold_active_px": enemy_detect.ENGAGE_HOLD_PX,
+        "hold_passive_px": enemy_detect.PASSIVE_HOLD_PX,
+        "chase_max_px": enemy_detect.CHASE_MAX_PX,
+        "far_chase_px": enemy_detect.FAR_CHASE_PX,
+        "avoid_px": enemy_detect.avoid_trigger_px_for(
+            map_name, enemy_detect.DEFAULT_AVOID_TRIGGER_PX),
+        "cautious_px": enemy_detect.CAUTIOUS_HOLD_PX,
+    }
+
+
+def knob_applies(map_name):
+    """{旋钮键: 本图上这个旋钮真会生效吗}, 键 = 六个整数旋钮 + swarm + avoid_min_rarity。
+
+    躲避半径(avoid_px)和躲避起点稀有度(avoid_min_rarity, 经 classify_action 决定谁算 AVOID)都喂给
+    逃跑判定, 两种选目标策略都走, 恒为 True; 谨慎保持距离(cautious_px)也是两种策略的分支都读(沙漠的
+    Ultra 沙尘暴 / 仙人掌就是谨慎怪), 同样恒为 True。其余(两个停步半径、追击上限、
+    远距追击上限、蚁群开关)只在 select_action 的 target_policy == "nearest" 分支里被读 ——
+    按稀有度追击("priority", 沙漠)的图上改了也没用, 子窗据此把它们置灰。
+    """
+    import enemy_detect
+    nearest = enemy_detect.target_policy_for(map_name) == "nearest"
+    out = {key: nearest for key, _label in _KNOB_LABELS}
+    out["avoid_px"] = True
+    out["cautious_px"] = True
+    out["swarm"] = nearest
+    out["avoid_min_rarity"] = True
+    return out
+
+
+def recommendation_for(style, petal, map_name):
+    """(流派键, 花瓣稀有度, 地图) -> ({旋钮键: 值或 None}, None) 或 (None, 错误串)。
+
+    None = 清回默认(近战不覆盖停步半径: 先套远程再套近战, 不该留着远程的数)。只含**本图上真会生效**的旋钮
+    (knob_applies): 沙漠按稀有度追击, 停步半径在那儿不读, 往里填一个没用的数只会骗人。"""
+    if style not in enemy_recommend.STYLES or petal not in enemy_recommend.PETAL_RARITIES:
+        return None, "先选流派和花瓣稀有度"
+    rec = enemy_recommend.recommend(style, petal)
+    applies = knob_applies(map_name)
+    return {k: rec.get(k) for k in enemy_recommend.GOVERNED_KNOBS if applies[k]}, None
+
+
+def recommendation_note(values):
+    """套用推荐之后, 子窗里那行提示: 填了什么、没填什么、有什么风险。values 是 recommendation_for 的结果。"""
+    parts = [f"{_REC_KNOB_NAMES[k]} {'默认' if values[k] is None else values[k]}"
+             for k in enemy_recommend.GOVERNED_KNOBS if k in values]
+    text = "已填: " + ", ".join(parts) + "。点「确定」才保存。"
+    if any(values.get(k) is not None for k in ("hold_active_px", "hold_passive_px")):
+        text += " 停步半径是占位值, 没有实机数据。"
+    if len(values) < len(enemy_recommend.GOVERNED_KNOBS):
+        text += " 本图停步半径不生效, 没填。"
+    tier = values.get("avoid_min_rarity")
+    order = enemy_species.RARITY_ORDER
+    if tier in order and order.index(tier) > order.index("Ultra"):
+        text += " ⚠ 起点高于 Ultra: Ultra 当普通怪打, 连内置要躲的 Ultra 蝎子 / 甲虫也一样。"
+    return text
+
+
+def rules_from_inputs(species_choices, knob_texts, swarm_choice, avoid_min_rarity=""):
+    """子窗控件内容 -> (规则, None) 或 (None, 错误串)。
+    species_choices: {slug: 打法字符串("" 默认不写 / fight / cautious / avoid / ignore, 对所有稀有度)
+                      或 {列: 打法}(列 = "*" 或稀有度档名, 即矩阵一行的各格子)}
+    knob_texts: {旋钮键: 输入框文本}(空串 = 默认, 不写)
+    swarm_choice: "" / "on" / "off"
+    avoid_min_rarity: ""(默认, 不写) / app_config 认的档名(含 "never")
+    """
+    rules = empty_rules()
+    for slug, choice in species_choices.items():
+        cells = {"*": choice} if isinstance(choice, str) else choice
+        if not isinstance(cells, dict) or any(
+                col not in MATRIX_COLS or not isinstance(a, str) or a not in RULE_CYCLE
+                for col, a in cells.items()):
+            return None, f"物种 {slug} 的打法不合法"
+        rule = species_rule_from_cells(cells)
+        if rule is not None:
+            rules["species"][slug] = rule
+    for key, label in _KNOB_LABELS:
+        text = (knob_texts.get(key) or "").strip()
+        if not text:
+            continue
+        lo, hi = app_config.ENEMY_KNOB_RANGES[key]
+        if not _DIGITS_RE.fullmatch(text):
+            return None, f"{label}要填整数(留空 = 默认)"
+        if len(text) > 6:
+            # 合法最大值(3000)只有 4 位。过长的全数字串先在这里挡掉: Python 3.11 的 int() 对 > 4300 位
+            # 的串直接抛 ValueError, 不能让它冒到界面上变成崩溃而不是红字。
+            return None, f"{label}要在 {lo}–{hi} 之间"
+        n = int(text)
+        if not (lo <= n <= hi):
+            return None, f"{label}要在 {lo}–{hi} 之间"
+        rules["knobs"][key] = n
+    if swarm_choice == "on":
+        rules["knobs"]["swarm"] = True
+    elif swarm_choice == "off":
+        rules["knobs"]["swarm"] = False
+    if avoid_min_rarity != "":
+        if avoid_min_rarity not in enemy_species.AVOID_MIN_RARITY_CHOICES:
+            return None, "躲避起点稀有度不合法"
+        rules["knobs"]["avoid_min_rarity"] = avoid_min_rarity
+    return rules, None
 
 
 def fresh_block_id(cfg):
@@ -215,6 +429,271 @@ def _fmt_pt(pt):
     return f"({int(pt[0])}, {int(pt[1])})"
 
 
+class EnemyRulesDialog(ctk.CTkToplevel):
+    """索敌设置子窗: 物种「默认/打/躲/忽略」+ 数值旋钮。「确定」把结果交给 on_ok(rules), 不落盘 ——
+    由时块编辑器的「保存」统一入库; 「取消」/ Esc 丢弃。非模态, 跟编辑器同风格。"""
+
+    _TIPS = {
+        "hold_active_px": "主动怪(会自己凑过来的)进到这个屏幕像素半径内就原地停下打。单位是屏幕像素, "
+                          "随游戏 zoom 变。不影响蚁后 / 萤火虫 / 桶 / 绕圈怪这类自带半径的物种。",
+        "hold_passive_px": "被动 / 中立 / 不动的怪不会自己过来, 要贴到这个半径内才停下打。同上, 不影响自带半径的物种。",
+        "chase_max_px": "只追这个半径内的怪, 再远的交回漫游。",
+        "far_chase_px": "超出追击上限、但在刷怪区里且小地图上直线走得到的怪, 追到这个半径。",
+        "cautious_px": "谨慎怪(你设成「谨慎」的, 以及内置的 Ultra 沙尘暴 / 仙人掌等)追到这个距离就停; "
+                       "比这个距离的 85% 还近就背离它走, 保持住。默认 500 屏幕像素, 随游戏 zoom 变。"
+                       "远程 / 召唤想离得近一点打, 就调小。",
+        "avoid_px": "躲避类怪(含你设成「躲」的)进到这个半径就跑。蚁穴内置 200, 其余图 400。只改触发半径, "
+                    "不改躲开后继续躲的那 450px 滞回, 也不改蚁穴究极冲过来时 400px 的提前躲。",
+    }
+    _TIP_SWARM = "蚁群 = 一堆挤在一起的怪, 默认先打蚁群并保持距离。关掉就把它们当单只处理。"
+    _HINT_RECOMMEND = ("躲避起点 = 花瓣稀有度高一档。近战用内置停步半径; 远程 / 召唤的停步半径是占位值, "
+                       "没有实机数据, 套用后请按手感改。只填下面的控件, 不会自动保存。")
+    _TIP_TIER = ("没设规则的怪, 稀有度达到这一档才躲, 默认 Ultra。调低 = 更谨慎(比如 Mythic: 神话怪也会触发躲避); "
+                 "调高 = 更莽(比如 Super: Ultra 也当普通怪打); 「从不」= 不按稀有度躲。"
+                 "你给物种设的「打 / 躲」优先于这个。")
+    # 物种卡片顶上那句说明。三层意思都要留(spec §2.1 / §5, test_main_worker 里有守护用例): 打 / 躲不看稀有度;
+    # 沙漠按稀有度追击, 「打」不等于一直追; 把平时要躲的 Ultra+ 设成「打」风险自担, 「忽略」的怪贴脸也不躲。
+    _HINT_SPECIES = ("每个物种一行: 「全部」那格管所有稀有度, 右边每个稀有度的格子单独管那一档, 单独的格子优先于"
+                     "「全部」; 全留空 = 内置打法。点格子往后切: · 默认 → 打 → 谨慎(打, 但保持距离, 太近就后退) → 躲 → 忽略, "
+                     "右键往回切。打 / 躲不看稀有度起点。沙漠按稀有度追击, 「打」不会让低稀有度怪被专门追; "
+                     "但「打」会去打平时要躲的怪(比如 Ultra 稀有度), 后果自负。「忽略」的怪就算贴脸也不躲。")
+    _WRAP = 760                      # 卡片里说明文字的换行宽度(子窗比以前宽, 要放得下矩阵)
+    _HINT_PRIORITY_MAP = ("本图按稀有度追击(只专门追 Mythic 及以上), 灰掉的几项只对「最近优先」的图生效, "
+                          "这里只有「躲避半径」「谨慎保持距离」和「躲避起点稀有度」管用。已存的值不会被清掉, 换到最近优先的图又会生效。")
+
+    def __init__(self, master, *, map_name, rules, on_ok):
+        super().__init__(master, fg_color=theme.BG)
+        self.title("索敌设置")
+        theme.center_on(self, master, 840, 700)
+        self.minsize(780, 400)
+        self.resizable(True, True)
+        self.transient(master)
+        self._map = map_name
+        self._on_ok = on_ok
+        self._col_headers = {}           # 列 -> 表头 tk.Label(跟格子在同一个 grid 里, 同一列)
+        self._cell_widgets = {}          # slug -> {列: tk.Label}
+        self._cell_state = {}            # slug -> {列: 状态}
+        self._knob_entries = {}
+        self._build(rules_for_map(rules, map_name))
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def _build(self, rules):
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        body.grid(row=0, column=0, sticky="nsew", pady=(12, 0))
+
+        rec_card = theme.card(body)
+        rec_card.pack(fill="x", padx=14, pady=(0, 12))
+        theme.section_title(
+            rec_card, "按装备推荐", "选流派和大部分花瓣的稀有度, 一键填好推荐值"
+        ).pack(anchor="w", fill="x", padx=14, pady=(12, 2))
+        self._rec_hint = theme.hint(rec_card, text=self._HINT_RECOMMEND, wraplength=self._WRAP)
+        self._rec_hint.pack(anchor="w", fill="x", padx=14, pady=(0, 8))
+        rec_row = ctk.CTkFrame(rec_card, fg_color="transparent")
+        rec_row.pack(fill="x", padx=14, pady=(0, 12))
+        menu_kw = dict(font=theme.font(12), dropdown_font=theme.font(12), fg_color=theme.SURFACE_HI,
+                       button_color=theme.BORDER, button_hover_color=theme.FAINT, height=28)
+        ctk.CTkLabel(rec_row, text="流派", font=theme.font(13),
+                     text_color=theme.MUTED).pack(side="left")
+        self._rec_style = ctk.CTkOptionMenu(
+            rec_row, width=90, values=[_REC_PICK] + list(_STYLE_LABELS.values()), **menu_kw)
+        self._rec_style.set(_REC_PICK)
+        self._rec_style.pack(side="left", padx=(6, 14))
+        ctk.CTkLabel(rec_row, text="大部分花瓣", font=theme.font(13),
+                     text_color=theme.MUTED).pack(side="left")
+        self._rec_petal = ctk.CTkOptionMenu(
+            rec_row, width=110, values=[_REC_PICK] + list(enemy_recommend.PETAL_RARITIES), **menu_kw)
+        self._rec_petal.set(_REC_PICK)
+        self._rec_petal.pack(side="left", padx=(6, 14))
+        theme.ghost_button(rec_row, "套用推荐", self._apply_recommendation,
+                           width=84, height=28).pack(side="left")
+
+        card = theme.card(body)
+        card.pack(fill="x", padx=14, pady=(0, 12))
+        # 说明分成两段: section_title 的副标题是不换行的单行标签, 一整句塞进去会被卡片右缘截掉。
+        theme.section_title(
+            card, "物种", "默认 = 内置打法; 忽略 = 当它不存在(不躲、不追)"
+        ).pack(anchor="w", fill="x", padx=14, pady=(12, 2))
+        self._species_hint = theme.hint(card, text=self._HINT_SPECIES, wraplength=self._WRAP)
+        self._species_hint.pack(anchor="w", fill="x", padx=14, pady=(0, 8))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=14, pady=(0, 12))
+        rows = species_rows(self._map)
+        if not rows:
+            theme.hint(inner, text="本图暂不支持索敌").pack(anchor="w")
+        else:
+            legend = ctk.CTkFrame(inner, fg_color="transparent")
+            legend.pack(fill="x", pady=(0, 6))
+            for state in RULE_CYCLE:
+                bg, fg = _CELL_LOOK[state]
+                tk.Label(legend, text=f" {_CELL_TEXT[state]} {_RULE_LABELS[state]} ", bg=bg, fg=fg,
+                         font=(theme.UI_FAMILY, 10)).pack(side="left", padx=(0, 6))
+        # 表头和各行的格子放在同一个 grid 里: 同一列天然对齐(分开 pack 的话, 字号不同宽度就不同, 表头会越排越歪)
+        grid = ctk.CTkFrame(inner, fg_color="transparent")
+        grid.pack(fill="x")
+        grid.grid_columnconfigure(0, minsize=210)
+        grid.grid_columnconfigure(1, minsize=40)
+        for ci in range(len(MATRIX_COLS)):
+            grid.grid_columnconfigure(2 + ci, uniform="cell", minsize=_CELL_MIN)
+        if rows:
+            for ci, col in enumerate(MATRIX_COLS):
+                lbl = tk.Label(grid, text=_COL_HEADERS[col], bg=theme.SURFACE, fg=theme.MUTED,
+                               font=(theme.UI_FAMILY, 9))
+                lbl.grid(row=0, column=2 + ci, padx=(1, 9) if col == "*" else 1, sticky="ew")
+                self._col_headers[col] = lbl
+                _Tooltip(lbl, "所有稀有度(没单独配的稀有度都按这一格)" if col == "*" else col)
+        for r, (slug, zh, en, kind) in enumerate(rows, start=1):
+            # 名字列要容得下最长的「白蚁主宰者  Termite Overmind」(macOS 实测 175px, Windows 字体更宽)
+            ctk.CTkLabel(grid, text=f"{zh}  {en}", anchor="w", font=theme.font(13),
+                         text_color=theme.TEXT).grid(row=r, column=0, sticky="w", pady=(0, 3))
+            ctk.CTkLabel(grid, text=kind, anchor="w", font=theme.font(11),
+                         text_color=theme.FAINT).grid(row=r, column=1, sticky="w", pady=(0, 3))
+            saved = species_cells(rules["species"].get(slug))
+            self._cell_widgets[slug], self._cell_state[slug] = {}, {}
+            for ci, col in enumerate(MATRIX_COLS):
+                w = tk.Label(grid, font=(theme.UI_FAMILY, 10), cursor="hand2", pady=2)
+                w.grid(row=r, column=2 + ci, padx=(1, 9) if col == "*" else 1, pady=(0, 3), sticky="ew")
+                w.bind("<Button-1>", lambda _e, s_=slug, c=col: self._cycle_cell(s_, c))
+                for back in ("<Button-2>", "<Button-3>"):         # 右键(macOS 的右键是 Button-2): 往回切
+                    w.bind(back, lambda _e, s_=slug, c=col: self._cycle_cell(s_, c, -1))
+                self._cell_widgets[slug][col] = w
+                self._set_cell(slug, col, saved.get(col, ""))
+
+        card2 = theme.card(body)
+        card2.pack(fill="x", padx=14, pady=(0, 12))
+        applies = knob_applies(self._map)
+        inert = any(not v for v in applies.values())
+        theme.section_title(
+            card2, "数值", "留空 = 内置值(输入框里的灰字)。单位是屏幕像素, 随游戏 zoom 变"
+        ).pack(anchor="w", fill="x", padx=14, pady=(12, 2 if inert else 8))
+        self._knob_hint = None
+        if inert:
+            self._knob_hint = theme.hint(card2, text=self._HINT_PRIORITY_MAP, wraplength=self._WRAP)
+            self._knob_hint.pack(anchor="w", fill="x", padx=14, pady=(0, 8))
+        inner2 = ctk.CTkFrame(card2, fg_color="transparent")
+        inner2.pack(fill="x", padx=14, pady=(0, 12))
+        defaults = knob_defaults(self._map)
+        for key, label in _KNOB_LABELS:
+            row = ctk.CTkFrame(inner2, fg_color="transparent")
+            row.pack(fill="x", pady=(0, 6))
+            ctk.CTkLabel(row, text=label, width=130, anchor="w", font=theme.font(13),
+                         text_color=theme.MUTED).pack(side="left")
+            e = ctk.CTkEntry(row, width=84, justify="center", font=theme.font(13),
+                             placeholder_text=str(defaults[key]))
+            if key in rules["knobs"]:
+                e.insert(0, str(rules["knobs"][key]))
+            if not applies[key]:
+                # 先填值再置灰(置灰的输入框插不进去)。值不清掉: _ok 照样 e.get() 收走, 已存的规则
+                # 在沙漠上点「确定」不会丢。
+                theme.set_entry_enabled(e, False)
+            e.pack(side="left")
+            ctk.CTkLabel(row, text=" px ", text_color=theme.MUTED,
+                         font=theme.font(12)).pack(side="left")
+            _help_mark(row, self._TIPS[key]).pack(side="left")
+            self._knob_entries[key] = e
+        row = ctk.CTkFrame(inner2, fg_color="transparent")
+        row.pack(fill="x", pady=(0, 0))
+        ctk.CTkLabel(row, text="蚁群行为", width=130, anchor="w", font=theme.font(13),
+                     text_color=theme.MUTED).pack(side="left")
+        self._swarm = ctk.CTkSegmentedButton(row, values=list(_SWARM_LABELS.values()),
+                                             font=theme.font(12), height=26)
+        cur = rules["knobs"].get("swarm")
+        self._swarm.set(_SWARM_LABELS["" if cur is None else ("on" if cur else "off")])
+        if not applies["swarm"]:
+            self._swarm.configure(state="disabled")
+        self._swarm.pack(side="left")
+        _help_mark(row, self._TIP_SWARM).pack(side="left", padx=6)
+        row = ctk.CTkFrame(inner2, fg_color="transparent")
+        row.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(row, text="躲避起点稀有度", width=130, anchor="w", font=theme.font(13),
+                     text_color=theme.MUTED).pack(side="left")
+        self._tier = ctk.CTkOptionMenu(row, width=130, values=list(_TIER_LABELS.values()),
+                                       font=theme.font(12), dropdown_font=theme.font(12),
+                                       fg_color=theme.SURFACE_HI, button_color=theme.BORDER,
+                                       button_hover_color=theme.FAINT, height=28)
+        self._tier.set(_TIER_LABELS[rules["knobs"].get("avoid_min_rarity", "")])
+        self._tier.pack(side="left")
+        _help_mark(row, self._TIP_TIER).pack(side="left", padx=6)
+
+        br = ctk.CTkFrame(self, fg_color=theme.SIDEBAR, corner_radius=0)
+        br.grid(row=1, column=0, sticky="ew")
+        br.grid_columnconfigure(0, weight=1)
+        self._err = ctk.CTkLabel(br, text="", text_color="#ff6b6f", font=theme.font(13),
+                                 anchor="w", justify="left", wraplength=260)
+        self._err.grid(row=0, column=0, sticky="w", padx=16)
+        theme.ghost_button(br, "全部恢复默认", self._reset, width=104, height=34).grid(
+            row=0, column=1, padx=(0, 8), pady=12)
+        theme.ghost_button(br, "取消", self.destroy, width=72, height=34).grid(
+            row=0, column=2, padx=(0, 8), pady=12)
+        theme.primary_button(br, "确定", self._ok, width=84, height=34).grid(
+            row=0, column=3, padx=(0, 16), pady=12)
+
+    # ---- 物种 × 稀有度矩阵 ----
+    def _cell_get(self, slug, col):
+        return self._cell_state[slug][col]
+
+    def _set_cell(self, slug, col, state):
+        bg, fg = _CELL_LOOK[state]
+        self._cell_widgets[slug][col].configure(text=_CELL_TEXT[state], bg=bg, fg=fg)
+        self._cell_state[slug][col] = state
+
+    def _cycle_cell(self, slug, col, step=1):
+        self._set_cell(slug, col, next_rule(self._cell_get(slug, col), step))
+
+    def _apply_recommendation(self):
+        """把推荐值填进下面的控件(只动推荐管的那几项, 物种选择和别的数值不碰), 不落盘 —— 「确定」才保存。
+        本图不读的旋钮(沙漠的停步半径)recommendation_for 就没给, 灰框里已存的值原样留着。"""
+        values, err = recommendation_for(
+            _STYLE_FROM_LABEL.get(self._rec_style.get()), self._rec_petal.get(), self._map)
+        if err:
+            self._err.configure(text="⚠ " + err)
+            self.bell()
+            return
+        self._err.configure(text="")
+        for key, val in values.items():
+            if key == "avoid_min_rarity":
+                self._tier.set(_TIER_LABELS[val])
+            else:
+                e = self._knob_entries[key]
+                e.delete(0, "end")
+                if val is not None:
+                    e.insert(0, str(val))
+        self._rec_hint.configure(text=recommendation_note(values))
+
+    def _reset(self):
+        self._rec_style.set(_REC_PICK)
+        self._rec_petal.set(_REC_PICK)
+        self._rec_hint.configure(text=self._HINT_RECOMMEND)
+        for slug, cols in self._cell_widgets.items():
+            for col in cols:
+                self._set_cell(slug, col, "")
+        for e in self._knob_entries.values():
+            # 置灰的输入框 delete 是空操作: 「全部恢复默认」要连灰的也清, 先放开再清再灰回去。
+            locked = e.cget("state") == "disabled"
+            if locked:
+                theme.set_entry_enabled(e, True)
+            e.delete(0, "end")
+            if locked:
+                theme.set_entry_enabled(e, False)
+        self._swarm.set(_SWARM_LABELS[""])
+        self._tier.set(_TIER_LABELS[""])
+        self._err.configure(text="")
+
+    def _ok(self):
+        rules, err = rules_from_inputs(
+            {slug: dict(cols) for slug, cols in self._cell_state.items()},
+            {key: e.get() for key, e in self._knob_entries.items()},
+            _SWARM_FROM_LABEL[self._swarm.get()],
+            _TIER_FROM_LABEL[self._tier.get()])
+        if err:
+            self._err.configure(text="⚠ " + err)
+            self.bell()
+            return
+        self._on_ok(rules)
+        self.destroy()
+
+
 class TimeBlockEditor(ctk.CTkToplevel):
     """一个时块的编辑窗. 非模态: 不 grab_set / 不 -topmost, 用户能最小化去干别的.
     保存前跑 validate_block, 失败红字不关窗. on_save(block_dict) 由调用方接。
@@ -242,6 +721,8 @@ class TimeBlockEditor(ctk.CTkToplevel):
         self._point = tuple(block["location"]) if block.get("location") else None
         self._area = ([tuple(block["farming_area"][0]), tuple(block["farming_area"][1])]
                       if block.get("farming_area") else None)
+        self._rules = rules_for_map(block.get("enemy_rules"), block.get("map", "desert"))
+        self._rules_dlg = None
         self._build()
         self.bind("<Escape>", lambda _e: self.destroy())
 
@@ -418,12 +899,19 @@ class TimeBlockEditor(ctk.CTkToplevel):
     def _build_combat(self):
         sec = self._section("战斗")
 
-        self._enemy = theme.switch(sec, "索敌 AI(追击 / 先清青怪)")
+        self._enemy = theme.switch(sec, "索敌 AI(追击 / 先清青怪)", command=self._sync_rules_button)
         if self._block.get("enemy_ai_enabled", True):
             self._enemy.select()
         self._enemy.pack(anchor="w")
         self._enemy_hint = theme.hint(sec)
         self._enemy_hint.pack(anchor="w", padx=(46, 0), pady=(0, 8))
+
+        er = ctk.CTkFrame(sec, fg_color="transparent")
+        er.pack(fill="x", padx=(46, 0), pady=(0, 8))
+        self._rules_btn = theme.ghost_button(er, "索敌设置…", self._open_rules, width=96, height=28)
+        self._rules_btn.pack(side="left")
+        self._rules_summary = theme.hint(er, text=rules_summary(self._rules))
+        self._rules_summary.pack(side="left", padx=(10, 0))
 
         inv = ctk.CTkFrame(sec, fg_color="transparent")
         inv.pack(fill="x")
@@ -552,6 +1040,8 @@ class TimeBlockEditor(ctk.CTkToplevel):
         self._picker.set_point(None)
         self._picker.set_area(None)
         self._sync_readout()
+        self._close_rules_dialog()        # 子窗是按旧地图的物种列表建的
+        self._set_rules(rules_for_map(self._rules, self._map.get()))
         self._sync_enemy_enabled()
         self._sync_map_hint()
 
@@ -563,8 +1053,9 @@ class TimeBlockEditor(ctk.CTkToplevel):
         else:
             self._map_hint.pack_forget()
 
+
     def _sync_enemy_enabled(self):
-        """索敌只在物种表非空的图上可用(现在只有沙漠)。别的图上开关置灰 ——
+        """索敌只在物种表非空的图上可用(现在七张图都有; 空表图留给以后新增的图)。空表图上开关置灰 ——
         worker 那边 main._apply_worker_config 本来就会强制关, 界面上跟它一致,
         免得用户以为开了就生效。"""
         # 延迟导入: enemy_detect 会拉进 cv2 / cdp_bridge / canvas_decode, GUI 的
@@ -573,7 +1064,33 @@ class TimeBlockEditor(ctk.CTkToplevel):
         supported = species_supported(self._map.get())
         self._enemy.configure(state="normal" if supported else "disabled")
         self._enemy_hint.configure(
-            text="本图支持索敌" if supported else "本图暂不支持索敌(目前只有沙漠)")
+            text="本图支持索敌" if supported else "本图暂不支持索敌")
+        self._sync_rules_button()
+
+    def _sync_rules_button(self):
+        """「索敌设置…」只在索敌真会生效时可点: 索敌开关开着、本图有物种表。
+        按钮置灰时顺手关掉已经开着的子窗 —— 不然灰按钮底下还有个能点「确定」的窗口。"""
+        from enemy_detect import species_supported
+        on = bool(self._enemy.get()) and species_supported(self._map.get())
+        self._rules_btn.configure(state="normal" if on else "disabled")
+        if not on:
+            self._close_rules_dialog()
+
+    def _close_rules_dialog(self):
+        if self._rules_dlg is not None and self._rules_dlg.winfo_exists():
+            self._rules_dlg.destroy()
+        self._rules_dlg = None
+
+    def _open_rules(self):
+        if self._rules_dlg is not None and self._rules_dlg.winfo_exists():
+            self._rules_dlg.lift()
+            return
+        self._rules_dlg = EnemyRulesDialog(self, map_name=self._map.get(),
+                                           rules=self._rules, on_ok=self._set_rules)
+
+    def _set_rules(self, rules):
+        self._rules = rules
+        self._rules_summary.configure(text=rules_summary(rules))
 
 
     def _on_point(self, pt):
@@ -623,6 +1140,11 @@ class TimeBlockEditor(ctk.CTkToplevel):
             enter_game_swap=self._collect_swap(self._enter_swap_w),
             reach_area_swap=self._collect_swap(self._reach_swap_w),
         )
+        if self._rules["species"] or self._rules["knobs"]:
+            blk["enemy_rules"] = {"species": dict(self._rules["species"]),
+                                  "knobs": dict(self._rules["knobs"])}
+        else:
+            blk.pop("enemy_rules", None)          # 空规则不写键, 老时块文件保持干净
         try:
             blk["farming_duration"] = int(self._dur_e.get())
         except ValueError:
