@@ -10,12 +10,16 @@
   安装 ID、程序版本、系统、Python 版本、是不是打包版、
   问题类型 + 签名 + 异常那一行、traceback、worker 输出的最后 60 行、
   当前时块的 地图 / 索敌开关 / 战斗模式 / 反转开关 / 索敌规则、用户自己写的说明。
+**附件(2026-10-07 起, 一律带, 不能取消)**: 黑匣子(blackbox.py)录的最近 5 分钟画面录像(canvas 原始帧)+
+截图(每 5 秒一张)+ 本次运行的完整 worker 日志(逐行同样脱敏), 打成一个 zip, 报告发出去之后用服务端给的
+一次性令牌接着传(submit 的第二步)。截图和画面录像**没法脱敏** —— 里面能看到账号名、别的玩家的名字和聊天,
+弹窗里写明了。
 **不发**: 账号别名和 Chrome profile 目录、用户目录路径里的系统用户名(C:\\Users\\<名字>\\...)、
-邮箱、IP、URL 的查询串、长得像密钥的长串、截图、config.json 原文。
+邮箱、IP、URL 的查询串、长得像密钥的长串(以上是文字部分和日志的脱敏)、config.json 原文。
 脱敏是尽力而为的正则, 管不到游戏里别的玩家的昵称 —— worker 输出里偶尔会有(比如「未识别怪物名」),
 所以才让用户在发之前先看一遍。
 
-点了上报之后, 发出的内容原样存一份到 logs/bug-reports/(最近 20 份)。同一个问题 6 小时内只问一次
+点了上报之后, 发出的内容原样存一份到 logs/bug-reports/(最近 20 份; 附件 zip 也在那里, 最近 5 个)。同一个问题 6 小时内只问一次
 (不管选了什么), 一天最多问 10 次。FLORR_TELEMETRY=0(和匿名使用统计共用)就一个弹窗都不弹。
 
 和 telemetry.py 一样: 上传在后台线程里做, 失败只在弹窗里提一句(可以再点一次), 绝不抛出来 ——
@@ -38,6 +42,9 @@ import version
 
 ENDPOINT = "https://florrfarm.cc.cd/api/bug"
 TIMEOUT_S = 10
+ATTACH_TIMEOUT_S = 120     # 附件几 MB, 粉丝网慢时要传一会儿
+ATTACH_TRIES = 3           # 附件传失败再试几次(文字报告已经到了, 只重传附件)
+ATTACH_RETRY_S = 2.0
 
 AUTO_KINDS = ("worker_traceback", "worker_exit", "gui_exception")    # 程序检测到的, 弹窗问用户
 MANUAL_KIND = "user_report"                                           # 用户主动点「反馈问题」
@@ -383,9 +390,35 @@ _PREVIEW_ORDER = ("kind", "msg", "tb", "log", "ctx", "ver", "os", "py", "frozen"
                   "note", "v", "type")
 
 
-def render_preview(payload):
+def _mb(n):
+    return f"{n / 1048576:.1f} MB"
+
+
+def describe_attachment(att):
+    """附件(blackbox.pack 的结果)给人看的几行: 时间范围 / 帧数 / 截图张数 / 日志 / 大小。不含完整路径。"""
+    mins = max(1, int(att.get("window_s") or 300) // 60)
+    lines = []
+    if att.get("frames") or att.get("shots"):
+        span = ""
+        if att.get("from") is not None and att.get("to") is not None:
+            span = (f": {datetime.fromtimestamp(att['from']).strftime('%m-%d %H:%M:%S')} – "
+                    f"{datetime.fromtimestamp(att['to']).strftime('%H:%M:%S')}(本机时间)")
+        lines.append(f"最近 {mins} 分钟{span}")
+        lines.append(f"画面录像 {att.get('frames', 0)} 帧, 截图 {att.get('shots', 0)} 张"
+                     "(截图里能看到你的账号名、别的玩家的名字和聊天)")
+    else:
+        lines.append("没有录到画面(黑匣子只在刷图程序运行时录)")
+    if att.get("logs"):
+        lines.append("日志: " + "、".join(att["logs"]) + "(本次运行的完整日志, 已按上面的规则脱敏)")
+    if att.get("bytes") is not None:
+        lines.append(f"大小: {_mb(att['bytes'])}")
+    return "\n".join(lines)
+
+
+def render_preview(payload, attachment=None, packing=False):
     """弹窗里给用户看的「将要发送的全部内容」: 载荷里每个字段都列出来(不在标签表里的也照列,
-    不会有字段悄悄发出去而预览里没有); 多行的(堆栈 / 输出)缩进成块, 方便读。"""
+    不会有字段悄悄发出去而预览里没有); 多行的(堆栈 / 输出)缩进成块, 方便读。
+    attachment: 一起发的附件(blackbox.pack 的结果); packing: 附件还在打包。"""
     keys = [k for k in _PREVIEW_ORDER if k in payload] + [k for k in payload if k not in _PREVIEW_ORDER]
     labels = dict(_PREVIEW_LABELS)
     if payload.get("kind") == MANUAL_KIND:
@@ -403,23 +436,73 @@ def render_preview(payload):
             parts.append(f"【{label}】\n" + "\n".join("    " + ln for ln in v.splitlines()))
         else:
             parts.append(f"【{label}】 {v}")
+    if packing:
+        parts.append("【附件(会一起发送)】 打包中…(最近 5 分钟的画面录像、截图和本次运行的日志)")
+    elif attachment:
+        parts.append("【附件(会一起发送)】\n" + "\n".join("    " + ln
+                                                          for ln in describe_attachment(attachment).splitlines()))
     return "\n".join(parts)
 
 
+def _ticket(reply):
+    """服务端回的 {"id": int, "token": str}(传附件用); 别的样子(老服务端回 204 空体)-> None。"""
+    if not isinstance(reply, dict):
+        return None
+    bid, token = reply.get("id"), reply.get("token")
+    if not isinstance(bid, int) or isinstance(bid, bool) or not isinstance(token, str) or not token:
+        return None
+    return {"id": bid, "token": token}
+
+
 def _post(payload):
+    """发文字报告。返回服务端给的附件令牌 {"id", "token"}, 老服务端(回 204)或回得不对 -> None。"""
     req = urllib.request.Request(
         ENDPOINT, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json",
                  "User-Agent": f"florr-auto-farm/{version.__version__}"})
     with urllib.request.urlopen(req, timeout=TIMEOUT_S, context=telemetry._SSL_CONTEXT) as resp:
+        body = resp.read()
+        if resp.status != 200:
+            return None
+    try:
+        return _ticket(json.loads(body.decode("utf-8")))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _put_attachment(bug_id, token, path):
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/{int(bug_id)}/attachment", data=data, method="PUT",
+        headers={"Content-Type": "application/zip", "X-Upload-Token": token,
+                 "User-Agent": f"florr-auto-farm/{version.__version__}"})
+    with urllib.request.urlopen(req, timeout=ATTACH_TIMEOUT_S, context=telemetry._SSL_CONTEXT) as resp:
         resp.read()
 
 
-def submit(payload, *, note="", aliases=(), root=None, post=None, done=None):
-    """用户点了「上报」: 后台线程里 加说明 -> 存本地副本 -> 上传 -> done(是否成功, 一句话)。
-    返回已启动的线程。done 在后台线程里被调, 调用方自己转回界面线程。上传失败只通过 done 说一声
-    (弹窗留着, 用户可以再点一次), 不抛、不自动重试。"""
+def _send_attachment(ticket, path, put, retry_s):
+    """传附件, 失败重试; 返回 None = 成功, 否则最后一次的异常。"""
+    err = None
+    for i in range(ATTACH_TRIES):
+        if i:
+            time.sleep(retry_s)
+        try:
+            put(ticket["id"], ticket["token"], path)
+            return None
+        except Exception as e:
+            err = e
+    return err
+
+
+def submit(payload, *, note="", aliases=(), root=None, post=None, done=None, attachment=None, put=None,
+           retry_s=ATTACH_RETRY_S):
+    """用户点了「上报」: 后台线程里 加说明 -> 存本地副本 -> 上传 -> (有附件且服务端给了令牌)传附件 ->
+    done(是否成功, 一句话)。返回已启动的线程。done 在后台线程里被调, 调用方自己转回界面线程。文字报告上传失败
+    只通过 done 说一声(弹窗留着, 用户可以再点一次), 不抛、不自动重试; 文字到了但附件没传上去仍算成功
+    (附件重试 ATTACH_TRIES 次), 话里说清附件留在哪。attachment: 附件 zip 的路径(blackbox.pack 打的)。"""
     post = post or _post
+    put = put or _put_attachment
 
     def run():
         try:
@@ -431,13 +514,23 @@ def submit(payload, *, note="", aliases=(), root=None, post=None, done=None):
             path = save_local(root, body) if root else None
             where = f"; 本地副本: {path}" if path else ""
             try:
-                post(body)
+                ticket = _ticket(post(body))
             except Exception as e:
                 msg = f"上传失败({type(e).__name__}), 可以稍后再点一次「上报」{where}"
                 ok = False
             else:
-                msg = f"已上报, 谢谢(问题签名 {body['sig']}){where}"
                 ok = True
+                msg = f"已上报, 谢谢(问题签名 {body['sig']}){where}"
+                if attachment and ticket is None:
+                    msg += f"; 服务器这次没收附件, 附件留在 {attachment}"
+                elif attachment:
+                    err = _send_attachment(ticket, attachment, put, retry_s)
+                    if err is None:
+                        size = os.path.getsize(attachment) if os.path.exists(attachment) else 0
+                        msg = f"已上报, 谢谢(问题签名 {body['sig']}), 附件 {_mb(size)} 也传上去了{where}"
+                    else:
+                        msg = (f"文字已送达(问题签名 {body['sig']}), 但附件没传上去({type(err).__name__}); "
+                               f"附件在 {attachment}{where}")
             if done is not None:
                 done(ok, msg)
         except Exception:

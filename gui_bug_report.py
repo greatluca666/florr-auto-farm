@@ -8,33 +8,59 @@
 
 非模态: 不 grab_set、不 -topmost —— worker 在后台继续跑(很多人挂机时不在电脑前), 窗口就在那儿等,
 用户有空再看; 不会盖住游戏或挡住别的窗口。
+
+附件(2026-10-07): 一律连同最近 5 分钟的画面录像、截图和本次运行的完整日志一起发(blackbox.py 打包, 窗口一开就在
+后台打, 打好之前「上报」是灰的), 预览里列出时间范围 / 张数 / 大小, 「打开附件所在文件夹」能看到那个 zip。
 """
+import os
+import subprocess
+import sys
+
 import customtkinter as ctk
 
 import bug_report
 import gui_theme as theme
 
 
+def _open_folder(path):
+    """用系统的文件管理器打开一个文件夹。打不开就算了。"""
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)                                    # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
+_ATTACH_NOTE = ("会连同最近 5 分钟的游戏截图和画面录像、本次运行的完整日志一起发(截图里能看到你的账号名、"
+                "别的玩家的名字和聊天; 日志按同样的规则脱敏)。")
+
+
 class BugReportDialog(ctk.CTkToplevel):
     """payload: bug_report.prepare / prepare_manual 给的载荷。on_submit(payload, note, done): 用户点了
     「上报」时调, 调用方负责真正上传, 完成后在**界面线程**里调 done(ok, 一句话)。on_close(): 窗口销毁时
-    调一次。aliases: 用户的 Chrome profile 别名, 实时预览里的说明要按它脱敏(跟上传时一致)。"""
+    调一次。aliases: 用户的 Chrome profile 别名, 实时预览里的说明要按它脱敏(跟上传时一致)。
+    attachment_job: blackbox.PackJob(done() / result()), 附件在后台打包; None = 没有附件。"""
 
     _EXPLAIN = ("程序刚才出了个错。可以把下面这份脱敏后的信息发给开发者帮忙修 —— 你点「上报」才会发, "
-                "不点什么都不会发。想先看看发什么: 下面就是全部内容。")
+                "不点什么都不会发。" + _ATTACH_NOTE + "想先看看发什么: 下面就是全部内容。")
     _EXPLAIN_MANUAL = ("遇到了问题、觉得哪里不对、想提个建议, 都可以在这里告诉开发者, 不用等程序报错。"
-                       "先写几句说明, 点「上报」才会发, 不点什么都不会发。下面是会一起发出去的全部内容, "
-                       "随你写的说明实时更新, 发之前可以先看看。")
+                       "先写几句说明, 点「上报」才会发, 不点什么都不会发。" + _ATTACH_NOTE +
+                       "下面是会一起发出去的全部内容, 随你写的说明实时更新, 发之前可以先看看。")
     _NOTE_HINT = "补充说明(可选, 比如你当时在干什么)。发出去之前会同样脱敏。"
     _NOTE_HINT_MANUAL = "你的说明(必填): 发生了什么、你原本期望怎样、怎么能重现。发出去之前会同样脱敏。"
     _SAVED_HINT = "点了「上报」之后, 发出的内容原样存一份在 logs/bug-reports/。"
 
-    def __init__(self, master, payload, *, on_submit, on_close=None, aliases=()):
+    _POLL_MS = 200
+
+    def __init__(self, master, payload, *, on_submit, on_close=None, aliases=(), attachment_job=None):
         super().__init__(master, fg_color=theme.BG)
         self._manual = payload.get("kind") == bug_report.MANUAL_KIND
         self.title("反馈问题" if self._manual else "发现问题 — 要不要上报?")
-        theme.center_on(self, master, 640, 660)
-        self.minsize(520, 420)
+        theme.center_on(self, master, 720, 660, min_size=(680, 420))     # 底栏: 状态 + 打开文件夹 + 两个按钮
         self.resizable(True, True)
         self.transient(master)
         self._payload = payload
@@ -44,7 +70,11 @@ class BugReportDialog(ctk.CTkToplevel):
         self._pending = False
         self._sent = False
         self._closed = False
+        self._job = attachment_job
+        self._att = None
+        self._att_pending = attachment_job is not None
         self._build()
+        self._poll_attachment()
         self._refresh_preview()
         self._sync()
         self.protocol("WM_DELETE_WINDOW", self._dismiss)
@@ -97,13 +127,17 @@ class BugReportDialog(ctk.CTkToplevel):
         bar.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         bar.grid_columnconfigure(0, weight=1)
         self._status = ctk.CTkLabel(bar, text="", text_color=theme.MUTED, font=theme.font(13),
-                                    anchor="w", justify="left", wraplength=360)
+                                    anchor="w", justify="left", wraplength=300)
         self._status.grid(row=0, column=0, sticky="w", padx=16)
+        self._open_btn = theme.ghost_button(bar, "打开附件所在文件夹", self._open_attachment_folder,
+                                            width=150, height=34)
+        self._open_btn.grid(row=0, column=1, padx=(0, 8), pady=12)
+        self._open_btn.grid_remove()                                   # 附件打好了才露出来
         self._no_btn = theme.ghost_button(bar, "取消" if self._manual else "不上报", self._dismiss,
                                           width=84, height=34)
-        self._no_btn.grid(row=0, column=1, padx=(0, 8), pady=12)
+        self._no_btn.grid(row=0, column=2, padx=(0, 8), pady=12)
         self._yes_btn = theme.primary_button(bar, "上报", self._submit, width=84, height=34)
-        self._yes_btn.grid(row=0, column=2, padx=(0, 16), pady=12)
+        self._yes_btn.grid(row=0, column=3, padx=(0, 16), pady=12)
 
     # ---- 说明框 / 预览 ----
     def _note_text(self):
@@ -112,8 +146,27 @@ class BugReportDialog(ctk.CTkToplevel):
     def _note_redacted(self):
         return bug_report.redact(self._note_text(), self._aliases).strip()
 
+    # ---- 附件 ----
+    def _poll_attachment(self):
+        """附件打好了没: 好了就更新预览、放开「上报」; 没好过一会儿再看。"""
+        if self._closed or not self._att_pending:
+            return
+        if self._job.done():
+            self._att_pending = False
+            self._att = self._job.result()
+            if self._att:
+                self._open_btn.grid()
+            self._refresh_preview()
+            self._sync()
+            return
+        self.after(self._POLL_MS, self._poll_attachment)
+
+    def _open_attachment_folder(self):
+        if self._att and self._att.get("path"):
+            _open_folder(os.path.dirname(self._att["path"]))
+
     def _can_send(self):
-        if self._pending or self._sent or self._closed:
+        if self._pending or self._sent or self._closed or self._att_pending:
             return False
         return bool(self._note_redacted()) if self._manual else True   # 主动反馈的正文就是说明, 必填
 
@@ -137,7 +190,8 @@ class BugReportDialog(ctk.CTkToplevel):
         at = self._preview.yview()[0]
         self._preview.configure(state="normal")
         self._preview.delete("1.0", "end")
-        self._preview.insert("1.0", bug_report.render_preview(body))
+        self._preview.insert("1.0", bug_report.render_preview(body, attachment=self._att,
+                                                             packing=self._att_pending))
         self._preview.configure(state="disabled")                      # 只读: 用户只能看
         self._preview.yview_moveto(at)                                 # 边写边看, 别每敲一个字就跳回顶部
 

@@ -18,6 +18,7 @@ import customtkinter as ctk
 
 import app_config
 import afk_watch
+import blackbox
 import bug_report
 import cdp_bridge
 import gui_accounts
@@ -199,8 +200,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         super().__init__(fg_color=theme.BG)
         self.title("florr-auto-pathing 控制面板")
-        self.geometry("980x680")
-        self.minsize(820, 560)
+        theme.place_main_window(self, 980, 680, 820, 560)
 
         self._cfg = app_config.load_config()
         self.proc = None
@@ -214,6 +214,8 @@ class App(ctk.CTk):
         self._tick_job = None
         self._telemetry_job = None
         self._bug_dialog = None                       # 正开着的「要不要上报」弹窗(同一时间最多一个)
+        self._bug_attach_job = None                   # 那个弹窗的附件打包(blackbox.PackJob)
+        self._blackbox = None                         # worker 在跑时滚动录最近几分钟(blackbox.BlackBox)
         self._tclock = telemetry_clock.TelemetryClock()   # 统计: worker 活着的秒数 + 各阶段耗时
         self._hb_thread = None                            # 最近一次心跳的发送线程(关窗口时等它一下)
 
@@ -627,6 +629,7 @@ class App(ctk.CTk):
         self._reader = threading.Thread(target=self._pump_log,
                                         args=(self.proc, wlog, self._bug_watcher), daemon=True)
         self._reader.start()
+        _start_blackbox(self)
 
     def _pump_log(self, proc, wlog=None, watcher=None):
         try:
@@ -653,7 +656,9 @@ class App(ctk.CTk):
     def _stop_worker_sync(self):
         """同步、有上限地收干净当前 worker. 关 stdin(EOF)让 worker 自己
         reset_keyboard() 再退; POSIX 上补一发 SIGTERM; 最多等 3s, 还活着就 kill.
-        收完把 self.proc 置 None —— 慢半拍的 _pump_log 回调会因 proc != self.proc 早退."""
+        收完把 self.proc 置 None —— 慢半拍的 _pump_log 回调会因 proc != self.proc 早退.
+        黑匣子也一起停(worker 崩了还没重启、这时用户点停止, proc 已经是 None, 所以放在最前面)."""
+        _stop_blackbox(self)
         proc = self.proc
         if proc is None:
             return
@@ -694,6 +699,8 @@ class App(ctk.CTk):
         blk = block_by_id(self._cfg["schedule"], self._running_block_id)
         if blk is not None:
             self._send_heartbeat(blk)             # 崩溃 / 自己退出: 补报最后一段
+        if not self._sched_running:
+            _stop_blackbox(self)                  # 调度还在跑的话马上会自动重启, 黑匣子接着录
         if self._sched_running:
             # 崩溃自愈: 清掉当前时块记号, 下次 tick 会重新进这个时块.
             self._set_running_block(None)
@@ -816,9 +823,11 @@ class App(ctk.CTk):
                 aliases=[p.get("alias") for p in cfg.get("profiles", [])])
             if payload is None:
                 return
+            aliases = [p.get("alias") for p in cfg.get("profiles", [])]
+            self._bug_attach_job = _attach_job(self, aliases)
             self._bug_dialog = gui_bug_report.BugReportDialog(
                 self, payload, on_submit=self._submit_bug, on_close=self._on_bug_dialog_closed,
-                aliases=[p.get("alias") for p in cfg.get("profiles", [])])
+                aliases=aliases, attachment_job=self._bug_attach_job)
             self._log_line("⚠️ 检测到程序出错, 弹窗里可以选择把脱敏后的错误信息上报给开发者(不点就不发)\n")
         except Exception:
             pass
@@ -856,8 +865,10 @@ class App(ctk.CTk):
             if payload is None:
                 self._log_line("没能打开反馈窗口\n")
                 return
+            self._bug_attach_job = _attach_job(self, aliases)
             self._bug_dialog = gui_bug_report.BugReportDialog(
-                self, payload, on_submit=self._submit_bug, on_close=self._on_bug_dialog_closed, aliases=aliases)
+                self, payload, on_submit=self._submit_bug, on_close=self._on_bug_dialog_closed, aliases=aliases,
+                attachment_job=self._bug_attach_job)
         except Exception:
             try:
                 self._log_line("没能打开反馈窗口\n")      # 点了没反应最让人摸不着头脑, 至少留一行
@@ -876,14 +887,18 @@ class App(ctk.CTk):
                 pass                          # 窗口已经关了
 
         try:
+            job = getattr(self, "_bug_attach_job", None)
+            att = job.result() if job is not None else None        # 弹窗在打包完之前不让点「上报」
             bug_report.submit(
                 payload, note=note, root=os.path.dirname(app_config.CONFIG_PATH), done=finish,
-                aliases=[p.get("alias") for p in self._cfg.get("profiles", [])])
+                aliases=[p.get("alias") for p in self._cfg.get("profiles", [])],
+                attachment=(att or {}).get("path"))
         except Exception:
             finish(False, "上传没能开始")
 
     def _on_bug_dialog_closed(self):
         self._bug_dialog = None
+        self._bug_attach_job = None
 
     def _clear_log(self):
         self.log_box.configure(state="normal")
@@ -917,6 +932,40 @@ class App(ctk.CTk):
         if t is not None:
             t.join(2)      # 最后那条心跳发出去: telemetry.send 是 daemon 线程, 窗口一销毁进程就退
         self.destroy()
+
+
+# ---- 黑匣子(blackbox.py): 模块级小函数, 测试里的假 app 不用带这些属性 ----
+def _start_blackbox(app):
+    """worker 起来时开黑匣子(已经开着就只是确认一下在跑)。FLORR_TELEMETRY=0 不开: 反正发不出去。不抛。"""
+    try:
+        if not bug_report.available():
+            return
+        box = getattr(app, "_blackbox", None)
+        if box is None:
+            box = app._blackbox = blackbox.BlackBox(os.path.dirname(app_config.CONFIG_PATH))
+        box.start()
+    except Exception:
+        pass
+
+
+def _stop_blackbox(app):
+    try:
+        box = getattr(app, "_blackbox", None)
+        if box is not None:
+            box.stop(timeout=1.0)
+    except Exception:
+        pass
+
+
+def _attach_job(app, aliases):
+    """弹窗一开就在后台打包附件(最近 5 分钟录像 / 截图 / 完整日志); 关着上报或出了意外 -> None(只发文字)。"""
+    try:
+        if not bug_report.available():
+            return None
+        return blackbox.PackJob(os.path.dirname(app_config.CONFIG_PATH), aliases=aliases,
+                                box=getattr(app, "_blackbox", None))
+    except Exception:
+        return None
 
 
 def main():

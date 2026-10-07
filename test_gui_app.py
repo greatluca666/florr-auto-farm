@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 
@@ -295,10 +296,47 @@ def _bug_app(**over):
 class _FakeDialog:
     made = []
 
-    def __init__(self, master, payload, *, on_submit, on_close, aliases=()):
+    def __init__(self, master, payload, *, on_submit, on_close, aliases=(), attachment_job=None):
         self.master, self.payload, self.on_submit, self.on_close = master, payload, on_submit, on_close
-        self.aliases = aliases
+        self.aliases, self.attachment_job = aliases, attachment_job
         _FakeDialog.made.append(self)
+
+
+class _FakePackJob:
+    made = []
+
+    def __init__(self, root, *, aliases=(), box=None):
+        self.root, self.aliases, self.box = root, list(aliases), box
+        self._result, self._done = None, False
+        _FakePackJob.made.append(self)
+
+    def done(self):
+        return self._done
+
+    def result(self):
+        return self._result if self._done else None
+
+
+class _FakeBlackBox:
+    made = []
+
+    def __init__(self, root):
+        self.root, self.starts, self.stops = root, 0, 0
+        _FakeBlackBox.made.append(self)
+
+    def start(self):
+        self.starts += 1
+
+    def stop(self, timeout=3.0):
+        self.stops += 1
+
+
+@pytest.fixture(autouse=True)
+def _no_real_blackbox(monkeypatch):
+    # 真的黑匣子会起线程连 CDP、真的打包会往 config 所在目录的 logs/ 里写 zip —— 这个文件里一律换成假的
+    _FakePackJob.made, _FakeBlackBox.made = [], []
+    monkeypatch.setattr(gui_app.blackbox, "PackJob", _FakePackJob)
+    monkeypatch.setattr(gui_app.blackbox, "BlackBox", _FakeBlackBox)
 
 
 @pytest.fixture
@@ -709,3 +747,82 @@ def test_worker_traceback_during_shutdown_is_dropped():
                                  _offer_bug_report=None)
     gui_app.App._on_worker_traceback(app, _TB, ["x"])
     assert scheduled == []
+
+
+
+# ── 黑匣子 / 附件(blackbox.py): worker 在跑就录, 弹窗一开就打包, 上报时带上 ─────────────────
+
+def test_spawning_the_worker_starts_the_black_box_once(monkeypatch):
+    monkeypatch.delenv("FLORR_TELEMETRY", raising=False)
+    app = _types.SimpleNamespace()
+    gui_app._start_blackbox(app)
+    gui_app._start_blackbox(app)
+    (box,) = _FakeBlackBox.made
+    assert app._blackbox is box and box.starts == 2                 # 同一个, start 本身幂等
+    assert box.root == os.path.dirname(app_config.CONFIG_PATH)
+    assert "_start_blackbox(self)" in inspect.getsource(gui_app.App._spawn_worker)
+
+
+def test_no_black_box_when_reporting_is_switched_off(monkeypatch):
+    monkeypatch.setenv("FLORR_TELEMETRY", "0")
+    app = _types.SimpleNamespace()
+    gui_app._start_blackbox(app)
+    assert _FakeBlackBox.made == [] and getattr(app, "_blackbox", None) is None
+
+
+def test_stopping_the_worker_stops_the_black_box_but_a_crash_restart_does_not(monkeypatch):
+    box = _FakeBlackBox("r")
+    app = _types.SimpleNamespace(_blackbox=box, proc=None)
+    gui_app.App._stop_worker_sync(app)
+    assert box.stops == 1
+    crashed = _exit_app(_sched_running=True, _blackbox=box)
+    gui_app.App._on_worker_exit(crashed, crashed.proc, 3221225477)  # 调度还在跑: 马上自动重启, 黑匣子接着录
+    assert box.stops == 1
+    stopped = _exit_app(_sched_running=False, _blackbox=box)
+    gui_app.App._on_worker_exit(stopped, stopped.proc, 0)
+    assert box.stops == 2
+    gui_app._stop_blackbox(_types.SimpleNamespace())                # 没开过: 不抛
+
+
+def test_a_detected_problem_also_starts_packing_the_attachment(monkeypatch, fake_dialog):
+    monkeypatch.delenv("FLORR_TELEMETRY", raising=False)
+    _prepare_returns(monkeypatch, {"sig": "abc", "kind": "worker_traceback"})
+    box = _FakeBlackBox("r")
+    app = _bug_app(_blackbox=box)
+    gui_app.App._offer_bug_report(app, "worker_traceback", _TB)
+    (job,) = _FakePackJob.made
+    assert job.box is box and job.aliases == ["默认", "小号A"] and job.root == os.path.dirname(app_config.CONFIG_PATH)
+    assert fake_dialog.made[0].attachment_job is job and app._bug_attach_job is job
+
+
+def test_the_feedback_button_also_starts_packing_the_attachment(monkeypatch, fake_dialog, manual_payload):
+    monkeypatch.delenv("FLORR_TELEMETRY", raising=False)
+    app = _feedback_app()
+    gui_app.App._on_feedback(app)
+    (job,) = _FakePackJob.made
+    assert job.box is None and fake_dialog.made[0].attachment_job is job and app._bug_attach_job is job
+
+
+@pytest.mark.parametrize("job, want", [
+    (None, None),
+    ("packing", None),
+    ("empty", None),
+    ("ready", "/r/logs/bug-reports/attach-1.zip"),
+])
+def test_submit_hands_over_the_packed_attachment(monkeypatch, job, want):
+    seen = []
+    monkeypatch.setattr(gui_app.bug_report, "submit", lambda payload, **kw: seen.append(kw))
+    j = None
+    if job is not None:
+        j = _FakePackJob("r")
+        j._done = job != "packing"
+        j._result = {"path": "/r/logs/bug-reports/attach-1.zip"} if job == "ready" else None
+    app = _bug_app(_bug_attach_job=j)
+    gui_app.App._submit_bug(app, {"sig": "abc"}, "", lambda ok, msg: None)
+    assert seen[0]["attachment"] == want
+
+
+def test_closing_the_dialog_forgets_the_attachment_job():
+    app = _bug_app(_bug_dialog=object(), _bug_attach_job=object())
+    gui_app.App._on_bug_dialog_closed(app)
+    assert app._bug_dialog is None and app._bug_attach_job is None

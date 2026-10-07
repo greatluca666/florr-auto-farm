@@ -464,8 +464,7 @@ class EnemyRulesDialog(ctk.CTkToplevel):
     def __init__(self, master, *, map_name, rules, on_ok):
         super().__init__(master, fg_color=theme.BG)
         self.title("索敌设置")
-        theme.center_on(self, master, 840, 700)
-        self.minsize(780, 400)
+        theme.center_on(self, master, 840, 700, min_size=(780, 400))
         self.resizable(True, True)
         self.transient(master)
         self._map = map_name
@@ -709,8 +708,7 @@ class TimeBlockEditor(ctk.CTkToplevel):
     def __init__(self, master, *, block, others, profiles, on_save, is_new=False):
         super().__init__(master, fg_color=theme.BG)
         self.title("新建时块" if is_new else f"编辑时块 · {block.get('id', '')}")
-        theme.center_on(self, master, 640, 780)
-        self.minsize(520, 360)
+        theme.center_on(self, master, 640, 780, min_size=(520, 360))
         self.resizable(True, True)
         self.transient(master)
         self._block = dict(block)
@@ -863,7 +861,8 @@ class TimeBlockEditor(ctk.CTkToplevel):
     def _build_location(self):
         sec = self._section(
             "刷怪位置",
-            "左键点一下 = 目标点(绿十字);左键拖动 = 刷怪区域(蓝框);滚轮缩放。二选一即可")
+            "左键点一下 = 目标点(绿十字);左键拖动 = 刷怪区域(蓝框);滚轮缩放, "
+            "放大后按住右键拖动平移。二选一即可")
         from gui_map_picker import MapPicker
         self._picker = MapPicker(sec, on_point_change=self._on_point,
                                  on_area_change=self._on_area, fg_color=theme.LOG_BG,

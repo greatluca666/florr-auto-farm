@@ -88,6 +88,22 @@ def mouse_scale():
     """
     return min(SCREEN_WIDTH / _REF_WIDTH, SCREEN_HEIGHT / _REF_HEIGHT)
 
+
+def florr_ui_scale():
+    """florr 界面(按钮 / 文字)的缩放 = max(屏宽/1920, 屏高/1080)。2026-10-07 浏览器里实测标题页: 1800x600 下
+    游客按钮宽 192、离中心 -39, 是 1080p(207 / -42)的 0.9375 = 1800/1920 倍; 1024x768 下是 768/1080 倍。
+    16:9 及更窄的屏上等于 屏高/1080(= scale_y 那个比例), 比 16:9 宽的(带鱼屏、浏览器没全屏视口被工具栏压扁)
+    上按宽缩放, 比 scale_y 大。"""
+    return max(SCREEN_WIDTH / _REF_WIDTH, SCREEN_HEIGHT / _REF_HEIGHT)
+
+
+def _ui_point(x, y):
+    """1080p 下量的、相对屏幕中心摆放的 florr 界面坐标换算到当前屏幕: 离中心的偏移乘 florr_ui_scale()。
+    scale_point 横纵各按屏宽 / 屏高缩放, 只在 16:9 及更窄的屏上跟它一样。"""
+    s = florr_ui_scale()
+    return (round(SCREEN_WIDTH / 2 + (x - _REF_WIDTH / 2) * s),
+            round(SCREEN_HEIGHT / 2 + (y - _REF_HEIGHT / 2) * s))
+
 MAP = ""
 # 这一段路线要走进去的传送门在 300x300 图上的矩形(map_routes.PORTAL_OPENINGS)。寻路图里
 # 传送门是墙(踩上去会被传走, 刷怪时必须绕开); 只有"走去踩它"的那一段才把它挖开 ——
@@ -686,7 +702,10 @@ def switch_server(biome="desert"):
 
 _BUTTON_GREEN_RGB = (27, 203, 37)  # florr.io确认类按钮统一用这个绿色底(开始/继续都是)
 _START_BUTTON_POS = scale_point(1059, 527)     # 开局菜单"开始"按钮(还没进过局/或已经回到开局菜单), 1920x1080下量出来的
-_CONTINUE_BUTTON_POS = scale_point(959, 634)   # 死亡结算画面"继续"按钮(注意: 跟开局菜单是两个完全不同的界面!), 同样是1920x1080下量出来的
+# 死亡结算画面"继续"按钮(注意: 跟开局菜单是两个完全不同的界面!), 1920x1080 下量的 (959,634), 按 florr 真实的
+# 界面缩放换算(_ui_point) —— 以前用 scale_point, 比 16:9 宽的屏上偏上, 见 find_continue_button 上面的注释。
+# 只当检测点 + 找不到按钮时的兜底; 真正点的位置是 find_continue_button 找到的。
+_CONTINUE_BUTTON_POS = _ui_point(959, 634)
 # 未登录的 Chrome profile 打开 florr.io 时, 标题页先是个登录选择页 —— 绿色
 # 「以游客身份游玩」按钮 + Discord/Apple 登录. 得先点掉游客按钮才到正常的
 # 「开始」菜单. 这个页面是否出现取决于账号(登录过的直接跳过). 坐标/颜色:
@@ -695,7 +714,7 @@ _CONTINUE_BUTTON_POS = scale_point(959, 634)   # 死亡结算画面"继续"按�
 _PLAY_AS_GUEST_POS = scale_point(960, 498)
 
 
-def _green_button_ratio(pos, half_w=15, half_h=10):
+def _green_button_ratio(pos, half_w=15, half_h=10, scale=None):
     """采样按钮周围一小块区域, 算绿色像素占比 —— 不能只采一个点.
 
     按钮上的文字/图标带黑色描边, 单点坐标很容易正好落在描边或图标上而不是纯色
@@ -704,10 +723,14 @@ def _green_button_ratio(pos, half_w=15, half_h=10):
 
     half_w/half_h默认值是1920x1080下量出来的采样半径, 换算到实际分辨率(至少
     留1px, 否则超小分辨率下可能四舍五入成0导致采样区域是空的).
+    scale: 不给 = 横纵各按 scale_x/scale_y; 给了 = 两个轴都乘它(传 florr_ui_scale(), 框跟按钮一起缩放,
+    框住按钮的比例跟 1080p 量阈值时一样).
     """
     x, y = pos
-    half_w = max(1, scale_x(half_w))
-    half_h = max(1, scale_y(half_h))
+    if scale is None:
+        half_w, half_h = max(1, scale_x(half_w)), max(1, scale_y(half_h))
+    else:
+        half_w, half_h = max(1, round(half_w * scale)), max(1, round(half_h * scale))
     region = pyautogui.screenshot(region=[x - half_w, y - half_h, half_w * 2, half_h * 2])
     arr = np.array(region)[:, :, :3]
     match = np.all(np.abs(arr.astype(int) - np.array(_BUTTON_GREEN_RGB)) <= 25, axis=-1)
@@ -727,34 +750,86 @@ _START_BTN_ASPECT = (1.3, 4.2)        # 宽/高。游客页那颗按钮是 6.5, 
 _START_BTN_MIN_FILL = 0.35
 
 
-def find_start_button():
-    """在屏幕中间那条带里找「开始」按钮, 返回它中心的屏幕坐标 (x, y); 找不到(或截屏出错)返回 None。
-    不依赖固定坐标 / 玩家名长度 / 屏幕宽高比。"""
+def _find_green_button(x0, y0, x1, y1, w_ref, h_ref, aspect, min_fill, s_lo, s_hi):
+    """在屏幕区域 [x0,x1) x [y0,y1) 里找「确认绿」按钮形连通块, 返回最大那块中心的屏幕坐标 (x, y); 找不到
+    (或截屏出错)返回 None。w_ref / h_ref 是 1080p 参照的 (下限, 上限), 下限乘 s_lo、上限乘 s_hi。"""
     try:
-        x0, x1 = int(SCREEN_WIDTH * _START_BAND_X[0]), int(SCREEN_WIDTH * _START_BAND_X[1])
-        y0, y1 = int(SCREEN_HEIGHT * _START_BAND_Y[0]), int(SCREEN_HEIGHT * _START_BAND_Y[1])
         arr = np.array(pyautogui.screenshot(region=[x0, y0, x1 - x0, y1 - y0]))[:, :, :3]
         green = np.array(_BUTTON_GREEN_RGB)
         mask = cv2.inRange(arr, np.clip(green - 25, 0, 255).astype(np.uint8),
                            np.clip(green + 25, 0, 255).astype(np.uint8))
-        s = SCREEN_HEIGHT / _REF_HEIGHT
-        k = max(3, round(5 * s)) | 1       # 字和箭头可能把绿底割成几块, 先闭运算合上
+        k = max(3, round(5 * s_lo)) | 1    # 字和箭头可能把绿底割成几块, 先闭运算合上
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
         n, _labels, stats, centers = cv2.connectedComponentsWithStats(mask, connectivity=8)
         best = None
         for i in range(1, n):
             w, h, area = (int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT]),
                           int(stats[i, cv2.CC_STAT_AREA]))
-            if not (_START_BTN_W_REF[0] * s <= w <= _START_BTN_W_REF[1] * s
-                    and _START_BTN_H_REF[0] * s <= h <= _START_BTN_H_REF[1] * s
-                    and _START_BTN_ASPECT[0] <= w / h <= _START_BTN_ASPECT[1]
-                    and area / (w * h) >= _START_BTN_MIN_FILL):
+            if not (w_ref[0] * s_lo <= w <= w_ref[1] * s_hi
+                    and h_ref[0] * s_lo <= h <= h_ref[1] * s_hi
+                    and aspect[0] <= w / h <= aspect[1]
+                    and area / (w * h) >= min_fill):
                 continue
             if best is None or area > best[0]:
                 best = (area, x0 + float(centers[i][0]), y0 + float(centers[i][1]))
         return None if best is None else (round(best[1]), round(best[2]))
     except Exception:
         return None
+
+
+def find_start_button():
+    """在屏幕中间那条带里找「开始」按钮, 返回它中心的屏幕坐标 (x, y); 找不到(或截屏出错)返回 None。
+    不依赖固定坐标 / 玩家名长度 / 屏幕宽高比。"""
+    s = SCREEN_HEIGHT / _REF_HEIGHT
+    return _find_green_button(
+        int(SCREEN_WIDTH * _START_BAND_X[0]), int(SCREEN_HEIGHT * _START_BAND_Y[0]),
+        int(SCREEN_WIDTH * _START_BAND_X[1]), int(SCREEN_HEIGHT * _START_BAND_Y[1]),
+        _START_BTN_W_REF, _START_BTN_H_REF, _START_BTN_ASPECT, _START_BTN_MIN_FILL, s, s)
+
+
+# 死亡页「继续」: 2026-10-07 粉丝反馈死亡时没点到正确位置。死亡页(你死于XX / 死掉的花 / 继续 / 关闭)是跟着死掉的
+# 花摆的, 花停在屏幕中心时「继续」在中心往下 94 x florr_ui_scale()。以前按 scale_point 算(往下 94 x 屏高/1080),
+# 比 16:9 宽的屏上(带鱼屏、浏览器没全屏)按钮实际更靠下: 60x32 的检测框还能擦到按钮上沿、判成死亡页, 点的却是
+# 框中心 = 按钮上面, 连点 10 次都点空。而且死亡页是滑进来的(录像 rec4 有一帧按钮在 y=519, 停稳后在 634)。
+# 所以点之前按颜色在屏幕中心下方一条带里找按钮, 等它停稳再点。尺寸是 2026-09-29 真录像(1080p)死亡页量的:
+# 按钮约 76x40, 宽高比 1.9, 半分辨率 JPEG 里填充率 0.34(字占了不少); 「开始」宽高比 2.5、在中心那一行, 两头都排除。
+_CONTINUE_BAND_X = (0.30, 0.70)       # 占屏宽的比例: 按钮跟着花水平居中
+_CONTINUE_BAND_DY_REF = (50, 230)     # 离屏幕中心往下(1080p 参照): 下限避开「开始」那一行, 上限在底部花瓣栏之上
+_CONTINUE_BTN_W_REF = (50, 120)
+_CONTINUE_BTN_H_REF = (26, 64)
+_CONTINUE_BTN_ASPECT = (1.4, 2.4)
+_CONTINUE_BTN_MIN_FILL = 0.2
+_CONTINUE_SETTLE_MAX_S = 1.5          # 等滑入动画停下最多等这么久
+_CONTINUE_SETTLE_POLL_S = 0.15
+
+
+def find_continue_button():
+    """在屏幕中心下方那条带里找死亡页「继续」按钮, 返回中心的屏幕坐标 (x, y); 找不到(或截屏出错)返回 None。
+    尺寸下限按 min(屏宽/1920, 屏高/1080)、上限按 florr_ui_scale() 放大 —— 浏览器没全屏时视口比屏幕小, 说不准。"""
+    s_lo, s_hi = mouse_scale(), florr_ui_scale()
+    return _find_green_button(
+        int(SCREEN_WIDTH * _CONTINUE_BAND_X[0]),
+        int(SCREEN_HEIGHT / 2 + _CONTINUE_BAND_DY_REF[0] * SCREEN_HEIGHT / _REF_HEIGHT),
+        int(SCREEN_WIDTH * _CONTINUE_BAND_X[1]),
+        min(SCREEN_HEIGHT, int(SCREEN_HEIGHT / 2 + _CONTINUE_BAND_DY_REF[1] * s_hi)),
+        _CONTINUE_BTN_W_REF, _CONTINUE_BTN_H_REF, _CONTINUE_BTN_ASPECT, _CONTINUE_BTN_MIN_FILL, s_lo, s_hi)
+
+
+def _continue_click_target():
+    """死亡页「继续」该点哪: 连续两次找到的位置差不多(滑入动画停了)就点它; 等满 _CONTINUE_SETTLE_MAX_S 还在动
+    就点最后看到的位置; 一次都没找到退回 _CONTINUE_BUTTON_POS。"""
+    tol = max(2, round(3 * mouse_scale()))
+    last = find_continue_button()
+    deadline = time.time() + _CONTINUE_SETTLE_MAX_S
+    while last is not None and time.time() < deadline:
+        time.sleep(_CONTINUE_SETTLE_POLL_S)
+        cur = find_continue_button()
+        if cur is None:
+            break
+        if abs(cur[0] - last[0]) <= tol and abs(cur[1] - last[1]) <= tol:
+            return cur
+        last = cur
+    return last or _CONTINUE_BUTTON_POS
 
 
 def on_start_screen():
@@ -794,11 +869,15 @@ def on_death_screen():
     两个按钮, 位置和文案都不一样), check_stage()原来那套in_game_dead判定
     (探测像素(316,32)是不是纯白255,255,255)在实机上从没真正触发过 —— 同样是
     没验证过的硬编码签名。这里直接测"继续"按钮那块是不是绿的.
+
+    检测点和采样框都按 florr_ui_scale() 换算(16:9 及更窄的屏上跟以前一样); 只测一个点, 不按颜色找 ——
+    游戏里每拍都要调, 多截一条带太贵。点的时候才找(click_continue_after_death)。
     """
     ratio = _green_button_ratio(
         _CONTINUE_BUTTON_POS,
         half_w=_DEATH_SCREEN_SAMPLE_HALF_W,
         half_h=_DEATH_SCREEN_SAMPLE_HALF_H,
+        scale=florr_ui_scale(),
     )
     return ratio > _DEATH_SCREEN_GREEN_THRESHOLD
 
@@ -852,9 +931,12 @@ def click_continue_after_death():
     隔离测试之所以每次都成功, 是因为脚本给了5秒倒计时, 画面早就稳定了才点 ——
     人手速也从没快到能踩中这个窗口, 所以感觉不到"冷却", 但紧循环里的脚本能.
     加一点等待, 让画面先稳定下来.
+
+    点的位置不再是固定点: 每次都按颜色找按钮、等它停稳(_continue_click_target), 见 find_continue_button
+    上面的注释。返回 True = 死亡页确认消失了, False = 试满次数还在。
     """
     time.sleep(0.5)
-    _click_button_until_gone(_CONTINUE_BUTTON_POS, on_death_screen, "继续")
+    return _click_button_until_gone(_continue_click_target, on_death_screen, "继续")
 
 
 # 点"开始"/"继续"这类确认按钮: 单发盲点经常不生效 —— 第一下click()常常只把浏览器

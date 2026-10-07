@@ -234,3 +234,95 @@ def test_advance_state_resets_timer_only_when_state_text_changes():
     new, since = overlay_module._advance_state(new, since, 60, state="卡住")
     assert since == 60
     assert new["pos"] == (1, 1)
+
+
+# ---- Windows tk 悬浮窗随 DPI 缩放 ----
+# worker 进程是 DPI-aware 的(utils.py), Tk 会按真实 DPI 放大「磅」字号, 但 place() /
+# geometry 的像素不会跟着变. 版面是 100% 下量的, 不乘倍数 125% 起字就比格子大, 全被截断.
+
+def test_dpi_factor_is_relative_to_96_dpi_and_never_shrinks():
+    assert overlay_module._dpi_factor(96 / 72) == 1.0
+    assert overlay_module._dpi_factor(144 / 72) == pytest.approx(1.5)
+    assert overlay_module._dpi_factor(192 / 72) == pytest.approx(2.0)
+    assert overlay_module._dpi_factor(1.0) == 1.0      # macOS 的 Tk 报 ~1.0, 不缩小
+    assert overlay_module._dpi_factor("bad") == 1.0
+
+
+# 布局测试要真 Tk. 放子进程里跑: macOS 上同一进程先起过 AppKit 悬浮窗(上面那些用例)
+# 再建 tk.Tk() 会直接 abort.
+_TK_LAYOUT_PROBE = r"""
+import json, tkinter as tk
+import overlay as o
+
+def boxes(widget):
+    out = []
+    for c in widget.winfo_children():
+        info = c.place_info()
+        if info:
+            out.append([int(info[k]) for k in ("x", "y", "width", "height")])
+        out.extend(boxes(c))
+    return out
+
+root = tk.Tk()
+root.withdraw()
+res = {}
+for k in (1.0, 1.25, 1.5, 2.0):
+    kw = {} if k == 1.0 else {"k": k}
+    r = res[str(k)] = {}
+    win = tk.Toplevel(root)
+    hud = o._build_tk_hud(win, **kw)
+    r["hud"] = boxes(win)
+    r["wrap"] = int(hud["message"].cget("wraplength"))
+    win = tk.Toplevel(root)
+    o._build_tk_card(win, "t", 560, 200, **kw)
+    r["card"] = boxes(win)
+root.destroy()
+print(json.dumps(res))
+"""
+
+
+@pytest.fixture(scope="module")
+def tk_layouts():
+    import json
+    import os
+    import subprocess
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    proc = subprocess.run([sys.executable, "-c", _TK_LAYOUT_PROBE], cwd=here,
+                          capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0 and "TclError" in proc.stderr:
+        pytest.skip("没有可用的显示, 建不了 tk 窗口")
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _assert_scaled(base, scaled, k):
+    assert len(base) == len(scaled) and base
+    for b, s in zip(base, scaled):
+        for bv, sv in zip(b, s):
+            assert abs(sv - bv * k) <= 1, (b, s, k)
+
+
+@pytest.mark.parametrize("k", [1.25, 1.5, 2.0])
+@pytest.mark.parametrize("part", [
+    "hud",
+    "card",
+])
+def test_tk_layout_scales_with_dpi(tk_layouts, part, k):
+    _assert_scaled(tk_layouts["1.0"][part], tk_layouts[str(k)][part], k)
+
+
+@pytest.mark.parametrize("k", [1.25, 1.5, 2.0])
+def test_tk_wraplength_scales_with_dpi(tk_layouts, k):
+    base, scaled = tk_layouts["1.0"], tk_layouts[str(k)]
+    assert scaled["wrap"] == pytest.approx(base["wrap"] * k, abs=1)
+
+
+def test_tk_window_geometries_scale_sizes_but_keep_the_hud_anchor():
+    g1 = overlay_module._tk_geometries(1.0, 1920, 1080)
+    g = overlay_module._tk_geometries(1.5, 1920, 1080)
+    assert g1["hud"] == f"300x132+{overlay_module._LEFT}+{overlay_module._TOP_OFFSET}"
+    assert g["hud"] == f"450x198+{overlay_module._LEFT}+{overlay_module._TOP_OFFSET}"
+    # 警告 / 确认弹窗放大后仍在屏幕正中
+    assert g["warning"] == "840x300+540+390"
+    assert g["confirm"] == "540x255+690+412"

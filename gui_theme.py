@@ -138,20 +138,54 @@ def fit_geometry(w, h, parent_box, screen, margin_bottom=_SCREEN_MARGIN_BOTTOM):
     return int(w), int(h), int(x), int(y)
 
 
-def center_on(win, parent, w, h):
-    """把 Toplevel 摆到 parent 正中(而不是 Tk 默认的屏幕左上角), 并保证整个窗口
-    落在屏幕可用区里. w/h 是 CTk 的逻辑像素(会被 DPI 缩放放大)."""
-    parent.update_idletasks()
-    # CTk 的 geometry() 会把整串 "WxH+X+Y" 按缩放系数放大, 所以这里全部换成逻辑单位;
-    # winfo_* 报的是物理像素.
-    scale = 1.0
+def fit_main_window(w, h, min_w, min_h, screen):
+    """主窗口: 想要的 w x h 夹进屏幕可用区并居中, 最小尺寸也跟着夹 —— 不然 1366x768 +
+    125% 缩放(逻辑 1093x614)下 minsize 820x560 本身就比可用区高, 窗口拖不小, 底部的
+    「开始调度」整条在屏幕外面. 返回 (w, h, x, y, min_w, min_h), 单位同 screen."""
+    w, h, x, y = fit_geometry(w, h, (0, 0, screen[0], screen[1]), screen)
+    return w, h, x, y, min(min_w, w), min(min_h, h)
+
+
+def geometry_string(w, h, x, y, scale):
+    """CTk 的 geometry() 只把「宽x高」乘缩放系数, "+x+y" 原样交给 Tk 当物理像素 ——
+    所以逻辑单位算出来的位置要自己乘回去. 以前没乘, 125%/150% 下弹窗都往左上偏."""
+    return f"{int(w)}x{int(h)}+{round(x * scale)}+{round(y * scale)}"
+
+
+def _window_scaling(win):
     try:
-        scale = float(win._get_window_scaling()) or 1.0
+        return float(win._get_window_scaling()) or 1.0
     except Exception:
-        pass
+        return 1.0
+
+
+def _logical_screen(win, scale):
+    # winfo_screen* 报的是物理像素(CTk 让进程 DPI-aware 了)
+    return win.winfo_screenwidth() / scale, win.winfo_screenheight() / scale
+
+
+def place_main_window(win, w, h, min_w, min_h):
+    """主窗口的初始尺寸 / 位置 / 最小尺寸. w/h/min_* 是 CTk 逻辑像素(会被 DPI 缩放放大)."""
+    scale = _window_scaling(win)
+    w, h, x, y, min_w, min_h = fit_main_window(w, h, min_w, min_h,
+                                               _logical_screen(win, scale))
+    win.minsize(min_w, min_h)
+    win.geometry(geometry_string(w, h, x, y, scale))
+    return w, h
+
+
+def center_on(win, parent, w, h, min_size=None):
+    """把 Toplevel 摆到 parent 正中(而不是 Tk 默认的屏幕左上角), 并保证整个窗口
+    落在屏幕可用区里. w/h 是 CTk 的逻辑像素(会被 DPI 缩放放大).
+    min_size=(min_w, min_h) 顺带设最小尺寸, 夹到摆好的尺寸以内 —— 单独 minsize() 的话
+    小屏上最小尺寸比可用区还大, Tk 会把窗口撑回去, 底部按钮又掉出屏幕."""
+    parent.update_idletasks()
+    # 全部换成逻辑单位来算(winfo_* 报的是物理像素), 位置最后由 geometry_string 换回物理像素.
+    scale = _window_scaling(win)
     box = (parent.winfo_rootx() / scale, parent.winfo_rooty() / scale,
            parent.winfo_width() / scale, parent.winfo_height() / scale)
-    screen = (win.winfo_screenwidth() / scale, win.winfo_screenheight() / scale)
-    w, h, x, y = fit_geometry(w, h, box, screen)
-    win.geometry(f"{w}x{h}+{x}+{y}")
+    w, h, x, y = fit_geometry(w, h, box, _logical_screen(win, scale))
+    win.geometry(geometry_string(w, h, x, y, scale))
+    if min_size is not None:
+        win.minsize(min(min_size[0], w), min(min_size[1], h))
     return w, h

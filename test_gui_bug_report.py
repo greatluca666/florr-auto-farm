@@ -307,3 +307,81 @@ def test_a_note_edited_event_arriving_after_the_window_is_gone_is_harmless(root)
     dlg.destroy()
     dlg._refresh_preview()                                           # 不抛
     dlg._on_note_edited()
+
+
+# ── 附件: 最近 5 分钟的录像 / 截图 / 日志, 一律一起发 ─────────────────────────
+
+ATT = {"path": "/x/logs/bug-reports/attach-20261007-120000-000000.zip", "bytes": 4_800_000,
+       "from": 1790000000.0, "to": 1790000300.0, "frames": 598, "shots": 60,
+       "logs": ["worker-20261007-115500.log"], "window_s": 300}
+
+
+class FakeJob:
+    def __init__(self, result=None, done=False):
+        self._result, self._done = result, done
+
+    def done(self):
+        return self._done
+
+    def result(self):
+        return self._result if self._done else None
+
+
+def test_while_the_attachment_is_packing_it_cannot_be_sent_yet(root):
+    job = FakeJob()
+    dlg, calls = _dialog(root, attachment_job=job)
+    assert "打包中" in _shown(dlg) and dlg._yes_btn.cget("state") == "disabled"
+    dlg._submit()
+    assert calls["submit"] == []
+    job._result, job._done = ATT, True
+    dlg._poll_attachment()
+    shown = _shown(dlg)
+    assert shown == bug_report.render_preview(dlg._payload, attachment=ATT)
+    assert "598" in shown and "60 张" in shown and dlg._yes_btn.cget("state") == "normal"
+    assert dlg._open_btn.winfo_manager() == "grid"                   # 能打开文件夹看看
+    dlg.destroy()
+
+
+def test_it_waits_for_the_packing_by_itself(root):
+    job = FakeJob()
+    dlg, _ = _dialog(root, attachment_job=job)
+    job._result, job._done = ATT, True
+    for _ in range(50):
+        root.update()
+        if "598" in _shown(dlg):
+            break
+        root.after(20)
+    assert "598" in _shown(dlg)
+    dlg.destroy()
+
+
+def test_nothing_to_attach_still_lets_you_send_the_text(root):
+    dlg, _ = _dialog(root, attachment_job=FakeJob(None, done=True))
+    assert _shown(dlg) == bug_report.render_preview(dlg._payload)
+    assert dlg._yes_btn.cget("state") == "normal" and dlg._open_btn.winfo_manager() == ""
+    dlg.destroy()
+
+
+def test_a_manual_report_with_an_attachment_still_needs_a_description(root):
+    calls = {"submit": [], "close": 0}
+    payload = bug_report.prepare_manual(log_lines=["l1"])
+    dlg = gui_bug_report.BugReportDialog(root, payload, attachment_job=FakeJob(ATT, done=True),
+                                         on_submit=lambda p, n, d: calls["submit"].append(n))
+    assert dlg._yes_btn.cget("state") == "disabled"
+    _type(root, dlg, "卡住了")
+    assert dlg._yes_btn.cget("state") == "normal" and "【附件(会一起发送)】" in _shown(dlg)
+    dlg.destroy()
+
+
+def test_open_folder_opens_where_the_zip_is(root, monkeypatch):
+    opened = []
+    monkeypatch.setattr(gui_bug_report, "_open_folder", opened.append)
+    dlg, _ = _dialog(root, attachment_job=FakeJob(ATT, done=True))
+    dlg._open_btn.invoke()
+    assert opened == ["/x/logs/bug-reports"]
+    dlg.destroy()
+
+
+def test_the_wording_says_screenshots_and_recordings_go_along():
+    for text in (gui_bug_report.BugReportDialog._EXPLAIN, gui_bug_report.BugReportDialog._EXPLAIN_MANUAL):
+        assert "截图" in text and "录像" in text and "日志" in text and "不点什么都不会发" in text

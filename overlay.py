@@ -559,39 +559,86 @@ def _tk_font(size, bold=False):
     return (_TK_FONT, size, "bold") if bold else (_TK_FONT, size)
 
 
-def _build_tk_hud(root):
+# ---- tk 版跟着 Windows 显示缩放放大 ----
+# worker 进程是 DPI-aware 的(utils.py, 为了 pyautogui 坐标对得上), Tk 于是按真实 DPI
+# 把「磅」字号放大(125% 缩放下 tk scaling = 120/72), 但 place() / geometry 的像素不会跟着
+# 变. 下面这些像素常量都是 100% 下量的 —— 不乘倍数, 125% 起字比格子大, 全被截断.
+# 窗口位置(_LEFT / _TOP_OFFSET)不乘: 它是按屏幕分辨率避开 utils.py 探测点的, 跟 DPI 无关.
+
+def _dpi_factor(tk_scaling):
+    """tk scaling(每磅多少像素) -> 相对 100%(96 DPI) 的倍数. 低于 1 不缩(macOS 的 Tk
+    报 ~1.0, 但那边用的是 AppKit 版, tk 版只在 Windows 上跑)."""
+    try:
+        return max(1.0, float(tk_scaling) * 72.0 / 96.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _root_dpi_factor(root):
+    try:
+        return _dpi_factor(root.tk.call("tk", "scaling"))
+    except Exception:
+        return 1.0
+
+
+def _px(v, k):
+    return int(round(v * k))
+
+
+def _place(widget, k, x, y, width, height):
+    """按 100% 下量的像素摆, 乘上 DPI 倍数 k."""
+    widget.place(x=_px(x, k), y=_px(y, k), width=_px(width, k), height=_px(height, k))
+
+
+def _tk_geometries(k, screen_w, screen_h):
+    """Windows tk 版各窗口的 geometry 串(物理像素): 尺寸乘 k, HUD 锚点不动,
+    警告 / 确认弹窗在屏幕正中."""
+    hud_h = _px(_HEIGHT, k)
+
+    def centered(w, h):
+        w, h = _px(w, k), _px(h, k)
+        return f"{w}x{h}+{(screen_w - w) // 2}+{(screen_h - h) // 2}"
+    return {
+        "hud": f"{_px(_WIDTH, k)}x{hud_h}+{_LEFT}+{_TOP_OFFSET}",
+        "warning": centered(_WARNING_WIDTH, _WARNING_HEIGHT),
+        "confirm": centered(_CONFIRM_WIDTH, _CONFIRM_HEIGHT),
+    }
+
+
+def _build_tk_hud(root, k=1.0):
     """在 root(已设好尺寸) 上摆 HUD 控件: 橙色外框/标题条 + 奶白正文. 只用
-    tkinter, 不碰 win32 —— 布局可以脱离 Windows 单独渲染检查. 返回控件表."""
+    tkinter, 不碰 win32 —— 布局可以脱离 Windows 单独渲染检查. 返回控件表.
+    k 是 DPI 倍数(见 _dpi_factor), 下面的数都是 100% 下的像素."""
     W, H, B, P = _WIDTH, _HEIGHT, _BORDER, _PAD
     root.configure(bg=_ORANGE_HEX)
-    tk.Label(root, text="florr auto-pathing", bg=_ORANGE_HEX, fg=_INK_HEX,
-             font=_tk_font(10, True), anchor="w").place(
-        x=P, y=B + 2, width=170, height=_HEADER_H - 4)
+    _place(tk.Label(root, text="florr auto-pathing", bg=_ORANGE_HEX, fg=_INK_HEX,
+                    font=_tk_font(10, True), anchor="w"),
+           k, P, B + 2, 170, _HEADER_H - 4)
     w = {}
     w["total"] = tk.Label(root, text="已运行 00:00", bg=_ORANGE_HEX, fg=_INK_HEX,
                           font=_tk_font(9), anchor="e")
-    w["total"].place(x=W - P - 110, y=B + 2, width=110, height=_HEADER_H - 4)
+    _place(w["total"], k, W - P - 110, B + 2, 110, _HEADER_H - 4)
 
     body = tk.Frame(root, bg=_BODY_HEX)
-    body.place(x=B, y=B + _HEADER_H, width=W - 2 * B, height=H - 2 * B - _HEADER_H)
+    _place(body, k, B, B + _HEADER_H, W - 2 * B, H - 2 * B - _HEADER_H)
     bw = W - 2 * B
     w["dot"] = tk.Label(body, text="●", bg=_BODY_HEX, fg=_LEVEL_HEX["idle"],
                         font=_tk_font(11), anchor="w")
-    w["dot"].place(x=P - B, y=6, width=16, height=24)
+    _place(w["dot"], k, P - B, 6, 16, 24)
     w["state"] = tk.Label(body, text="-", bg=_BODY_HEX, fg=_LEVEL_HEX["idle"],
                           font=_tk_font(13, True), anchor="w")
-    w["state"].place(x=P - B + 16, y=6, width=170, height=24)
+    _place(w["state"], k, P - B + 16, 6, 170, 24)
     w["in_state"] = tk.Label(body, text="本状态 00:00", bg=_BODY_HEX, fg=_INK_DIM_HEX,
                              font=_tk_font(9), anchor="e")
-    w["in_state"].place(x=bw - P + B - 110, y=8, width=110, height=20)
+    _place(w["in_state"], k, bw - P + B - 110, 8, 110, 20)
     w["loc"] = tk.Label(body, text="位置 -", bg=_BODY_HEX, fg=_INK_HEX,
                         font=_tk_font(10), anchor="w")
-    w["loc"].place(x=P - B, y=32, width=bw - 2 * (P - B), height=20)
+    _place(w["loc"], k, P - B, 32, bw - 2 * (P - B), 20)
     # 消息最长两行自动换行(以前单行定宽, 长消息后半截看不到).
     w["message"] = tk.Label(body, text="", bg=_BODY_HEX, fg=_INK_DIM_HEX,
                             font=_tk_font(9), anchor="nw", justify="left",
-                            wraplength=bw - 2 * (P - B))
-    w["message"].place(x=P - B, y=54, width=bw - 2 * (P - B), height=44)
+                            wraplength=_px(bw - 2 * (P - B), k))
+    _place(w["message"], k, P - B, 54, bw - 2 * (P - B), 44)
     return w
 
 
@@ -605,13 +652,15 @@ def _render_tk_hud(w, view):
     w["message"].configure(text=view["message"])
 
 
-def _build_tk_card(win, title, width, height):
-    """警告 / 确认弹窗的共同外观: 橙色外框 + 标题条 + 奶白正文区. 返回正文 Frame."""
+def _build_tk_card(win, title, width, height, k=1.0):
+    """警告 / 确认弹窗的共同外观: 橙色外框 + 标题条 + 奶白正文区. 返回正文 Frame.
+    width/height 是 100% 下的尺寸, k 是 DPI 倍数."""
     win.configure(bg=_ORANGE_HEX)
-    tk.Label(win, text=title, bg=_ORANGE_HEX, fg=_INK_HEX, font=_tk_font(11, True),
-             anchor="w").place(x=14, y=4, width=width - 28, height=26)
+    _place(tk.Label(win, text=title, bg=_ORANGE_HEX, fg=_INK_HEX, font=_tk_font(11, True),
+                    anchor="w"),
+           k, 14, 4, width - 28, 26)
     body = tk.Frame(win, bg=_BODY_HEX)
-    body.place(x=3, y=32, width=width - 6, height=height - 35)
+    _place(body, k, 3, 32, width - 6, height - 35)
     return body
 
 
@@ -646,7 +695,10 @@ class _WindowsOverlay:
 
         root = tk.Tk()
         root.overrideredirect(True)  # 无标题栏/边框, 也不进Alt+Tab切换
-        root.geometry(f"{_WIDTH}x{_HEIGHT}+{_LEFT}+{_TOP_OFFSET}")
+        self._k = _root_dpi_factor(root)   # 显示缩放倍数, 见 _dpi_factor
+        self._geo = _tk_geometries(self._k, root.winfo_screenwidth(),
+                                   root.winfo_screenheight())
+        root.geometry(self._geo["hud"])
         root.resizable(False, False)
         # 先落一次事件循环, 确保win32那边真正建出HWND, 再去取winfo_id()才有效.
         root.update_idletasks()
@@ -660,7 +712,7 @@ class _WindowsOverlay:
         self._hwnd = hwnd if hwnd else root.winfo_id()
         self._apply_window_styles()
 
-        self._widgets = _build_tk_hud(root)
+        self._widgets = _build_tk_hud(root, self._k)
 
         root.update_idletasks()
         root.update()
@@ -702,24 +754,20 @@ class _WindowsOverlay:
             if self._warning_window is None:
                 win = tk.Toplevel(self._root)
                 win.overrideredirect(True)
-
-                screen_w = self._root.winfo_screenwidth()
-                screen_h = self._root.winfo_screenheight()
-                x = (screen_w - _WARNING_WIDTH) // 2
-                y = (screen_h - _WARNING_HEIGHT) // 2
-                win.geometry(f"{_WARNING_WIDTH}x{_WARNING_HEIGHT}+{x}+{y}")
+                win.geometry(self._geo["warning"])
                 win.resizable(False, False)
                 win.update_idletasks()
 
                 hwnd = self._user32.GetParent(win.winfo_id())
                 self._warning_hwnd = hwnd if hwnd else win.winfo_id()
 
-                body = _build_tk_card(win, _WARNING_TITLE, _WARNING_WIDTH, _WARNING_HEIGHT)
+                k = self._k
+                body = _build_tk_card(win, _WARNING_TITLE, _WARNING_WIDTH, _WARNING_HEIGHT, k)
                 label = tk.Label(
                     body, bg=_BODY_HEX, fg=_LEVEL_HEX["bad"], font=_tk_font(15, True),
-                    wraplength=_WARNING_WIDTH - 60, justify="center",
+                    wraplength=_px(_WARNING_WIDTH - 60, k), justify="center",
                 )
-                label.pack(expand=True, fill="both", padx=20, pady=12)
+                label.pack(expand=True, fill="both", padx=_px(20, k), pady=_px(12, k))
 
                 self._warning_window = win
                 self._warning_label = label
@@ -768,27 +816,25 @@ class _WindowsConfirmDialog:
         root.overrideredirect(True)
         root.attributes("-topmost", True)
 
-        screen_w = root.winfo_screenwidth()
-        screen_h = root.winfo_screenheight()
-        x = (screen_w - _CONFIRM_WIDTH) // 2
-        y = (screen_h - _CONFIRM_HEIGHT) // 2
-        root.geometry(f"{_CONFIRM_WIDTH}x{_CONFIRM_HEIGHT}+{x}+{y}")
+        k = _root_dpi_factor(root)
+        root.geometry(_tk_geometries(k, root.winfo_screenwidth(),
+                                     root.winfo_screenheight())["confirm"])
         self._root = root
 
-        body = _build_tk_card(root, "florr auto-pathing", _CONFIRM_WIDTH, _CONFIRM_HEIGHT)
+        body = _build_tk_card(root, "florr auto-pathing", _CONFIRM_WIDTH, _CONFIRM_HEIGHT, k)
         tk.Label(
             body, text=_CONFIRM_MESSAGE, bg=_BODY_HEX, fg=_INK_HEX, font=_tk_font(11),
-            wraplength=_CONFIRM_WIDTH - 50, justify="center",
-        ).pack(pady=(16, 10))
+            wraplength=_px(_CONFIRM_WIDTH - 50, k), justify="center",
+        ).pack(pady=(_px(16, k), _px(10, k)))
 
         # 扁平深色按钮(系统默认灰按钮在橙/白卡片上很突兀), 回车也能确认.
         button = tk.Button(
             body, text=_CONFIRM_BUTTON_LABEL, command=self._on_confirmed,
             font=_tk_font(11, True), bg=_INK_HEX, fg="white",
             activebackground="#3a3a3a", activeforeground="white",
-            relief="flat", bd=0, padx=24, pady=6, cursor="hand2",
+            relief="flat", bd=0, padx=_px(24, k), pady=_px(6, k), cursor="hand2",
         )
-        button.pack(pady=(0, 14))
+        button.pack(pady=(0, _px(14, k)))
         root.bind("<Return>", lambda _e: self._on_confirmed())
         self._button = button
 

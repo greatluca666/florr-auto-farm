@@ -1,5 +1,5 @@
 """地图选择器: 在二值地图(maps/<name>.png, 300x300)上左键点=目标点、左键拖=刷怪
-矩形、滚轮=1~4x 缩放(视图中心跟随指针, 不做独立拖动平移). 二值图就是寻路用的
+矩形、滚轮=1~4x 缩放(指针下的点不动)、右键/中键拖=平移. 二值图就是寻路用的
 坐标系本身(utils.load_binary_map() 读的同一张图), 所以点出来的坐标可以直接进
 config.json 的 location / farming_area.
 
@@ -64,6 +64,17 @@ def anchored_pan(old_view, cursor_x, cursor_y, new_s, canvas_w, canvas_h):
             cursor_y - img_y * new_s - centered_y)
 
 
+def clamp_pan(pan, s, canvas_w, canvas_h, img_w, img_h):
+    """把平移量夹住. 放大后比控件大的那一维: 图边不离开控件边(不露空, 四个角都拖得到,
+    也不会拖飞找不回来); 没控件大的那一维: 居中, 没有可平移的余量."""
+    def one(p, c, i):
+        slack = (i * s - c) / 2
+        if slack <= 0:
+            return 0.0
+        return max(-slack, min(slack, p))
+    return (one(pan[0], canvas_w, img_w), one(pan[1], canvas_h, img_h))
+
+
 class MapPicker(ctk.CTkFrame):
     def __init__(self, master, *, on_point_change=None, on_area_change=None, **kw):
         super().__init__(master, **kw)
@@ -77,6 +88,8 @@ class MapPicker(ctk.CTkFrame):
         self._area = None           # [(ix,iy),(ix,iy)] 图像像素
         self._drag_start = None     # (wx, wy) 按下时的控件坐标
         self._area_before = None    # 按下前的矩形, "只是点了一下"时用来还原
+        self._pan_start = None      # 右键/中键平移: (按下的控件 x, y, 按下时的 _pan)
+        self._photo_key = None      # 缓存缩放后的图: 平移时尺寸不变, 不用每帧重新 resize
 
         self._canvas = tk.Canvas(self, highlightthickness=0, bg="#0f1115")
         self._canvas.pack(fill="both", expand=True)
@@ -87,6 +100,11 @@ class MapPicker(ctk.CTkFrame):
         self._canvas.bind("<MouseWheel>", self._on_wheel)          # Win/mac
         self._canvas.bind("<Button-4>", lambda e: self._on_wheel(e, +1))  # X11
         self._canvas.bind("<Button-5>", lambda e: self._on_wheel(e, -1))
+        # 右键 / 中键拖动平移. Windows 右键是 Button-3、中键 Button-2; macOS 正好反过来.
+        for b in (2, 3):
+            self._canvas.bind(f"<Button-{b}>", self._on_pan_press)
+            self._canvas.bind(f"<B{b}-Motion>", self._on_pan_drag)
+            self._canvas.bind(f"<ButtonRelease-{b}>", self._on_pan_release)
 
     # ---- 公有 API ----
     def load_map(self, name):
@@ -111,7 +129,9 @@ class MapPicker(ctk.CTkFrame):
         ch = max(self._canvas.winfo_height(), 1)
         iw, ih = self._pil.size
         s = _fit_scale(cw, ch, iw, ih) * self._zoom
-        # 缩放后若比控件大, 让图居中(zoom=1 时正好完全贴合); _pan 叠加指针锚定的平移
+        # 缩放后若比控件大, 让图居中(zoom=1 时正好完全贴合); _pan 叠加指针锚定 / 拖动的
+        # 平移. 每次都重新夹一遍 —— 控件尺寸变了(窗口拉伸)以后旧的 _pan 可能越界.
+        self._pan = clamp_pan(self._pan, s, cw, ch, iw, ih)
         offx = (cw - iw * s) / 2 + self._pan[0]
         offy = (ch - ih * s) / 2 + self._pan[1]
         return View(s=s, offset_x=offx, offset_y=offy, img_w=iw, img_h=ih)
@@ -125,8 +145,11 @@ class MapPicker(ctk.CTkFrame):
         disp_h = max(int(v.img_h * v.s), 1)
         # NEAREST: 这是张二值(墙/可走)地图, 默认的双三次会把边界糊成灰渐变 ——
         # 用户放大正是为了对准某个具体像素, 插值只会让他对不准.
-        resized = self._pil.resize((disp_w, disp_h), resample=Image.NEAREST)
-        self._tk_img = ImageTk.PhotoImage(resized)
+        key = (id(self._pil), disp_w, disp_h)
+        if key != self._photo_key:
+            resized = self._pil.resize((disp_w, disp_h), resample=Image.NEAREST)
+            self._tk_img = ImageTk.PhotoImage(resized)
+            self._photo_key = key
         self._canvas.create_image(v.offset_x, v.offset_y, anchor="nw", image=self._tk_img)
 
         if self._area:
@@ -179,7 +202,41 @@ class MapPicker(ctk.CTkFrame):
                 self._on_area_change(list(self._area))
         self._area_before = None
 
+    def _on_pan_press(self, e):
+        self._pan_start = (e.x, e.y, self._pan)
+        try:
+            self._canvas.configure(cursor="fleur")
+        except tk.TclError:
+            pass
+
+    def _on_pan_drag(self, e):
+        if self._pan_start is None or self._pil is None:
+            return
+        x0, y0, (px, py) = self._pan_start
+        self._pan = (px + e.x - x0, py + e.y - y0)
+        self._redraw()
+
+    def _on_pan_release(self, e):
+        self._pan_start = None
+        try:
+            self._canvas.configure(cursor="")
+        except tk.TclError:
+            pass
+
     def _on_wheel(self, e, direction=None):
+        """滚轮缩放. 返回 "break": 事件到此为止, 不再交给外层 CTkScrollableFrame 的
+        bind_all 去滚整个编辑窗 —— 以前两件事一起发生(Windows 一格滚 20px), 地图从
+        指针底下滑走, 在地图上沿放大两下指针就滑出地图, 上部 / 左上角根本放大不进去.
+        指针在图两侧的空白条上时不管, 照常滚编辑窗 —— 地图占满整行宽, 全吞掉的话
+        指针在这一行就滚不动编辑窗了."""
+        v = self._view()
+        if v is not None and not (v.offset_x <= e.x <= v.offset_x + v.img_w * v.s
+                                  and v.offset_y <= e.y <= v.offset_y + v.img_h * v.s):
+            return None
+        self._zoom_at(e, direction)
+        return "break"
+
+    def _zoom_at(self, e, direction=None):
         if direction is None:
             direction = 1 if getattr(e, "delta", 0) > 0 else -1
         old = self._view()

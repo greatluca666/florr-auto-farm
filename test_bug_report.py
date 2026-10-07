@@ -734,3 +734,121 @@ def test_submit_sends_a_manual_report_with_its_title_and_signature(tmp_path):
     assert body["kind"] == "user_report" and body["msg"] == "索敌老是锁错怪" and body["note"].endswith("细节")
     assert body["sig"] == br.with_note(payload, "索敌老是锁错怪\n细节")["sig"]
     assert said[0][0] is True
+
+
+# ── 附件: 报告发出去后接着传最近 5 分钟的录像 / 截图 / 日志(blackbox.pack 打的 zip) ─────────────
+
+def _zip(tmp_path, size=3 * 1024 * 1024):
+    p = tmp_path / "attach-20261007-120000-000000.zip"
+    p.write_bytes(b"z" * size)
+    return str(p)
+
+
+ATT = {"path": "/x/logs/bug-reports/attach-20261007-120000-000000.zip", "bytes": 4_800_000,
+       "from": 1790000000.0, "to": 1790000300.0, "frames": 598, "shots": 60,
+       "logs": ["worker-20261007-115500.log"], "window_s": 300}
+
+
+def test_after_the_report_goes_through_the_attachment_follows_with_the_token(tmp_path):
+    zp = _zip(tmp_path)
+    puts = []
+    _, sent, said = _submit(tmp_path, post=lambda p: {"id": 7, "token": "tok"}, attachment=zp,
+                            put=lambda *a: puts.append(a), retry_s=0)
+    assert puts == [(7, "tok", zp)]
+    (ok, msg), = said
+    assert ok is True and "附件" in msg and "3.0 MB" in msg
+
+
+def test_an_attachment_that_will_not_upload_still_counts_as_sent_and_says_where_it_is(tmp_path):
+    zp = _zip(tmp_path)
+    tries = []
+
+    def boom(*a):
+        tries.append(a)
+        raise OSError("断网")
+
+    _, _, said = _submit(tmp_path, post=lambda p: {"id": 7, "token": "tok"}, attachment=zp, put=boom, retry_s=0)
+    assert len(tries) == br.ATTACH_TRIES
+    (ok, msg), = said
+    assert ok is True and "文字已送达" in msg and "附件没传上去" in msg and "OSError" in msg and zp in msg
+
+
+def test_an_old_server_without_tokens_keeps_the_attachment_local(tmp_path):
+    zp = _zip(tmp_path)
+    puts = []
+    _, _, said = _submit(tmp_path, post=lambda p: None, attachment=zp, put=lambda *a: puts.append(a), retry_s=0)
+    (ok, msg), = said
+    assert ok is True and puts == [] and "附件" in msg and zp in msg
+
+
+def test_a_failed_report_does_not_try_the_attachment(tmp_path):
+    def boom(_p):
+        raise OSError("断网")
+
+    puts = []
+    _, _, said = _submit(tmp_path, post=boom, attachment=_zip(tmp_path), put=lambda *a: puts.append(a), retry_s=0)
+    assert puts == [] and said[0][0] is False and "上传失败" in said[0][1]
+
+
+@pytest.mark.parametrize("ticket", [{"id": "7", "token": "t"}, {"id": 7}, {"token": "t"}, {"id": True, "token": "t"},
+                                    {"id": 7, "token": 5}, [], "x"])
+def test_a_strange_reply_is_treated_like_an_old_server(tmp_path, ticket):
+    puts = []
+    _, _, said = _submit(tmp_path, post=lambda p: ticket, attachment=_zip(tmp_path), put=lambda *a: puts.append(a),
+                         retry_s=0)
+    assert puts == [] and said[0][0] is True
+
+
+def test_the_preview_lists_the_attachment_without_its_full_path():
+    p = br.build_report("worker_traceback", tb=TB, log_lines=["a"])
+    plain = br.render_preview(p)
+    text = br.render_preview(p, attachment=ATT)
+    assert text.startswith(plain) and "【附件(会一起发送)】" in text
+    assert "598" in text and "60 张" in text and "worker-20261007-115500.log" in text and "4.6 MB" in text
+    assert "截图" in text and "/x/logs" not in text
+    assert "打包中" in br.render_preview(p, packing=True)
+    assert br.render_preview(p, attachment=None, packing=False) == plain
+
+
+def test_the_attachment_description_handles_a_logs_only_attachment():
+    att = dict(ATT, frames=0, shots=0, **{"from": None, "to": None})
+    text = br.describe_attachment(att)
+    assert "worker-20261007-115500.log" in text and "没有录到画面" in text
+
+
+class _Reply:
+    def __init__(self, code, body):
+        self.status, self._body = code, body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize("code, body, want", [
+    (200, b'{"id": 3, "token": "abc"}', {"id": 3, "token": "abc"}),
+    (204, b"", None), (200, b"not json", None), (200, b'{"id": 3}', None),
+])
+def test_post_reads_the_ticket_out_of_the_reply(monkeypatch, code, body, want):
+    monkeypatch.setattr(br.urllib.request, "urlopen", lambda *a, **k: _Reply(code, body))
+    assert br._post({"type": "bug"}) == want
+
+
+def test_put_attachment_sends_the_zip_with_the_token_in_a_header(monkeypatch, tmp_path):
+    zp = _zip(tmp_path, size=10)
+    seen = []
+
+    def fake(req, timeout=None, context=None):
+        seen.append((req.get_method(), req.full_url, req.get_header("X-upload-token"), req.data, timeout))
+        return _Reply(204, b"")
+
+    monkeypatch.setattr(br.urllib.request, "urlopen", fake)
+    br._put_attachment(9, "tok", zp)
+    (method, url, token, data, timeout), = seen
+    assert method == "PUT" and url.endswith("/api/bug/9/attachment") and token == "tok"
+    assert data == b"z" * 10 and timeout == br.ATTACH_TIMEOUT_S

@@ -591,7 +591,7 @@ def _screen(monkeypatch, w, h, frame):
     monkeypatch.setattr(utils, "SCREEN_HEIGHT", h)
     # 这两个固定点是 import 时按真屏幕算的常量; 换了屏幕大小就得跟着换, 不然采样框落在屏幕外
     monkeypatch.setattr(utils, "_START_BUTTON_POS", utils.scale_point(1059, 527))
-    monkeypatch.setattr(utils, "_CONTINUE_BUTTON_POS", utils.scale_point(959, 634))
+    monkeypatch.setattr(utils, "_CONTINUE_BUTTON_POS", utils._ui_point(959, 634))
     stub = _ScreenStub(frame)
     monkeypatch.setattr(utils, "pyautogui", stub)
     return stub
@@ -774,6 +774,240 @@ def test_click_start_game_falls_back_to_the_fixed_point_and_researches_every_att
     assert utils.click_start_game() is True
     clicked = [m for m in spy.moves if m != (utils.SCREEN_WIDTH // 2, utils.SCREEN_HEIGHT // 2)]
     assert clicked == [tuple(utils._START_BUTTON_POS), (1500, 700)]
+
+
+# ── 死亡页「继续」: 检测点按 florr 真实的界面缩放算, 点的时候按颜色找按钮 ──────────────────────
+# 2026-10-07 粉丝反馈死亡时没点到正确位置。2026-10-07 在浏览器里实测 florr 标题页: 界面缩放 =
+# max(屏宽/1920, 屏高/1080)(1800x600 下游客按钮宽 192、离中心 -39, 正好是 207 / -42 的 0.9375 倍), 而
+# 老代码按 scale_point 横纵各自缩放 —— 只在 16:9 及更窄的屏上碰巧一样。比 16:9 宽的(带鱼屏 / 浏览器没全屏、
+# 视口被工具栏压扁)上「继续」实际更靠下, 检测框还能擦到按钮上沿, 点的却是框中心 = 按钮上面。
+# 另外死亡页跟着死掉的花走、有滑入动画(录像 rec4 一帧里按钮在 y=519, 停稳后在 634)。
+# 下面的死亡面板是用户 1080p 真录像(rec4, 死于工蚁)半分辨率截图里抠的, 「继续」中心在 (44,121)。
+_DEATH_PANEL = cv2.cvtColor(
+    cv2.imread(str(_Path(__file__).parent / "test_frames" / "death_panel_1080p_half.png")),
+    cv2.COLOR_BGR2RGB)            # 88x154: 「你死于 工蚁」/ 死掉的花 / 「继续」/「关闭」
+_DEATH_PANEL_BTN = (44, 121)
+# 用户 Windows 1920x1080 真标题页(带生态区选择格)的中间一块, 原图 x 560~1360 / y 440~840, 缩成半分辨率
+_TITLE_MID = cv2.cvtColor(
+    cv2.imread(str(_Path(__file__).parent / "test_frames" / "title_with_biomes_1080p_half.png")),
+    cv2.COLOR_BGR2RGB)
+
+
+def _florr_scale(w, h):
+    return max(w / 1920, h / 1080)
+
+
+def _death_frame(w, h, s, center=None):
+    """w x h 的游戏画面上贴一块真死亡面板(按界面缩放 s 放大)。「继续」中心默认放在花停在屏幕中心时它该在的地方
+    (中心 + (-1, 94)*s); 浏览器没全屏之类的情况传 center。返回 (整屏图, 按钮中心)。"""
+    frame = _gameplay_frame(w, h)
+    k = 2.0 * s
+    panel = cv2.resize(_DEATH_PANEL, None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR)
+    if center is None:
+        center = (round(w / 2 - s), round(h / 2 + 94 * s))
+    x0, y0 = center[0] - round(_DEATH_PANEL_BTN[0] * k), center[1] - round(_DEATH_PANEL_BTN[1] * k)
+    ph, pw = panel.shape[:2]
+    frame[y0:y0 + ph, x0:x0 + pw] = panel
+    return frame, center
+
+
+_DEATH_SCREENS = [   # (宽, 高): 16:9 / 16:10 / 4:3 / 5:4, 再加三种比 16:9 宽的
+    (1920, 1080), (2560, 1440), (3840, 2160), (1366, 768), (1024, 768), (1920, 1200), (1280, 1024),
+    (2560, 1080), (3440, 1440), (5120, 1440),
+]
+
+
+@pytest.mark.parametrize("w,h,want", [
+    (1920, 1080, 1.0), (2560, 1440, 4 / 3), (1024, 768, 768 / 1080), (1920, 1200, 1200 / 1080),
+    (3440, 1440, 3440 / 1920), (1800, 600, 1800 / 1920), (1920, 950, 1.0),
+])
+def test_florr_ui_scale_is_the_larger_of_the_two_axis_ratios(monkeypatch, w, h, want):
+    monkeypatch.setattr(utils, "SCREEN_WIDTH", w)
+    monkeypatch.setattr(utils, "SCREEN_HEIGHT", h)
+    assert utils.florr_ui_scale() == pytest.approx(want)
+
+
+@pytest.mark.parametrize("w,h", [(1920, 1080), (2560, 1440), (3840, 2160), (1366, 768), (1024, 768),
+                                 (1920, 1200), (1280, 1024)])
+def test_continue_check_point_is_unchanged_on_16_9_and_narrower_screens(monkeypatch, w, h):
+    # 这些屏上 florr 按高缩放, 跟老的 scale_point 一样 —— 已经能用的人行为不变
+    monkeypatch.setattr(utils, "SCREEN_WIDTH", w)
+    monkeypatch.setattr(utils, "SCREEN_HEIGHT", h)
+    new, old = utils._ui_point(959, 634), utils.scale_point(959, 634)
+    assert abs(new[0] - old[0]) <= 1 and abs(new[1] - old[1]) <= 1
+
+
+def test_continue_check_point_follows_florr_scale_on_an_ultrawide(monkeypatch):
+    monkeypatch.setattr(utils, "SCREEN_WIDTH", 3440)
+    monkeypatch.setattr(utils, "SCREEN_HEIGHT", 1440)
+    assert utils._ui_point(959, 634) == (1718, 888)          # 老的 scale_point 是 (1718, 845), 偏上 43px
+
+
+def _calibrated_death_frame(w, h, s):
+    """给 on_death_screen 的绿占比用。上面那块死亡面板是半分辨率 JPEG, 放大回来绿底边缘被糊进字里, 1080p 下
+    30x16 采样框只量到 0.15; 真全分辨率截图量的是 0.376(utils 里 _DEATH_SCREEN_* 上面的注释)。这里画一颗
+    同比例的按钮: 76x40 绿底 + 正中 50x24 白块当字 —— 1080p 下采样框里绿占 0.375, 按 s 一起放大。"""
+    frame = _gameplay_frame(w, h)
+    cx, cy = round(w / 2 - s), round(h / 2 + 94 * s)
+    bw, bh, tw, th = round(76 * s), round(40 * s), round(50 * s), round(24 * s)
+    frame[cy - bh // 2:cy - bh // 2 + bh, cx - bw // 2:cx - bw // 2 + bw] = utils._BUTTON_GREEN_RGB
+    frame[cy - th // 2:cy - th // 2 + th, cx - tw // 2:cx - tw // 2 + tw] = (255, 255, 255)
+    return frame
+
+
+def test_the_calibrated_button_measures_like_the_real_screenshot(monkeypatch):
+    _screen(monkeypatch, 1920, 1080, _calibrated_death_frame(1920, 1080, 1.0))
+    ratio = utils._green_button_ratio(utils._CONTINUE_BUTTON_POS, utils._DEATH_SCREEN_SAMPLE_HALF_W,
+                                      utils._DEATH_SCREEN_SAMPLE_HALF_H)
+    assert ratio == pytest.approx(0.376, abs=0.01)
+
+
+@pytest.mark.parametrize("w,h", _DEATH_SCREENS)
+def test_the_death_screen_is_recognised_on_every_screen_shape(monkeypatch, w, h):
+    _screen(monkeypatch, w, h, _calibrated_death_frame(w, h, _florr_scale(w, h)))
+    assert utils.on_death_screen()
+
+
+@pytest.mark.parametrize("w,h", _DEATH_SCREENS)
+def test_the_death_check_sees_the_button_like_it_did_when_the_threshold_was_set(monkeypatch, w, h):
+    # 阈值 0.15 是 1080p 下拿 30x16 框量出来的; 框要跟按钮一起按 florr 缩放, 不然宽屏上框变扁、只框到字
+    _screen(monkeypatch, w, h, _calibrated_death_frame(w, h, _florr_scale(w, h)))
+    spy = []
+    real = utils._green_button_ratio
+    monkeypatch.setattr(utils, "_green_button_ratio", lambda *a, **kw: spy.append(real(*a, **kw)) or spy[-1])
+    utils.on_death_screen()
+    assert spy[0] == pytest.approx(0.376, abs=0.05)          # 小屏上按钮 / 框取整会差一点
+
+
+@pytest.mark.parametrize("w,h", _DEATH_SCREENS)
+def test_continue_button_is_found_on_every_screen_shape(monkeypatch, w, h):
+    s = _florr_scale(w, h)
+    frame, (cx, cy) = _death_frame(w, h, s)
+    _screen(monkeypatch, w, h, frame)
+    found = utils.find_continue_button()
+    assert found is not None
+    assert abs(found[0] - cx) <= 4 * s and abs(found[1] - cy) <= 4 * s
+
+
+@pytest.mark.parametrize("w,h,top,vh", [(1920, 1080, 90, 950), (2560, 1440, 110, 1290)])
+def test_continue_button_is_found_when_the_browser_is_not_fullscreen(monkeypatch, w, h, top, vh):
+    # 浏览器最大化但没全屏: 画布从工具栏下面开始、比屏幕矮, 视口比 16:9 宽 -> florr 按视口宽缩放
+    s = max(w / 1920, vh / 1080)
+    frame, (cx, cy) = _death_frame(w, h, s, center=(round(w / 2 - s), round(top + vh / 2 + 94 * s)))
+    _screen(monkeypatch, w, h, frame)
+    found = utils.find_continue_button()
+    assert found is not None
+    assert abs(found[0] - cx) <= 4 * s and abs(found[1] - cy) <= 4 * s
+
+
+@pytest.mark.parametrize("w,h", [(1920, 1080), (2560, 1440), (3440, 1440)])
+def test_the_real_title_screen_is_not_a_death_screen(monkeypatch, w, h):
+    # 「开始」按钮 / 生态区格子(花园、丛林也是绿的)都不能被认成「继续」
+    s = _florr_scale(w, h)
+    frame = np.zeros((h, w, 3), np.uint8)
+    frame[:] = _TITLE_BG
+    mid = cv2.resize(_TITLE_MID, None, fx=2 * s, fy=2 * s, interpolation=cv2.INTER_LINEAR)
+    mh, mw = mid.shape[:2]
+    x0, y0 = round(w / 2 - 400 * s), round(h / 2 - 100 * s)       # 原图 (560,440) 离 1080p 中心 (-400,-100)
+    frame[y0:y0 + mh, x0:x0 + mw] = mid
+    _screen(monkeypatch, w, h, frame)
+    assert utils.find_continue_button() is None
+    assert not utils.on_death_screen()
+
+
+@pytest.mark.parametrize("w,h", [(1920, 1080), (2560, 1440), (3440, 1440)])
+def test_gameplay_has_no_continue_button(monkeypatch, w, h):
+    _screen(monkeypatch, w, h, _gameplay_frame(w, h))
+    assert utils.find_continue_button() is None
+
+
+@pytest.mark.parametrize("bw,bh,why", [   # 每个只踩一条线(1080p: 宽 50~120, 高 26~64, 宽高比 1.4~2.4)
+    (110, 44, "「开始」那种更扁的按钮(宽高比 2.5)"), (60, 56, "差不多是方的(圆怪 / 叶子)"),
+    (44, 30, "太窄"), (60, 22, "太矮"), (130, 60, "太宽"), (105, 70, "太高"),
+])
+def test_green_blobs_that_are_not_the_continue_button_are_ignored(monkeypatch, bw, bh, why):
+    w, h = 1920, 1080
+    frame = _gameplay_frame(w, h)
+    cx, cy = 960, 660
+    frame[cy - bh // 2:cy - bh // 2 + bh, cx - bw // 2:cx - bw // 2 + bw] = utils._BUTTON_GREEN_RGB
+    _screen(monkeypatch, w, h, frame)
+    assert utils.find_continue_button() is None, why
+    frame[cy - bh // 2:cy - bh // 2 + bh, cx - bw // 2:cx - bw // 2 + bw] = _TITLE_BG
+    frame[cy - 20:cy + 20, cx - 38:cx + 38] = utils._BUTTON_GREEN_RGB        # 同一个位置换成「继续」的尺寸就找得到
+    _screen(monkeypatch, w, h, frame)
+    assert utils.find_continue_button() is not None
+
+
+@pytest.mark.parametrize("cy,why", [(560, "在屏幕中心那一行(「开始」的位置)"), (1000, "在最底下(花瓣栏的位置)")])
+def test_a_continue_shaped_blob_outside_the_band_below_center_is_ignored(monkeypatch, cy, why):
+    frame = _gameplay_frame(1920, 1080)
+    frame[cy - 20:cy + 20, 960 - 38:960 + 38] = utils._BUTTON_GREEN_RGB
+    _screen(monkeypatch, 1920, 1080, frame)
+    assert utils.find_continue_button() is None, why
+
+
+def test_finding_the_continue_button_never_raises(monkeypatch):
+    class Boom:
+        def screenshot(self, region=None):
+            raise OSError("截屏失败")
+
+    monkeypatch.setattr(utils, "pyautogui", Boom())
+    assert utils.find_continue_button() is None
+
+
+class _ScreenClickStub(_ScreenStub):
+    """既能截屏又记点击; 点一下之后画面换成 after(按钮消失)。"""
+
+    def __init__(self, frame, after):
+        super().__init__(frame)
+        self.after = after
+        self.moves = []
+        self.clicks = 0
+
+    def moveTo(self, pos=None, *_a, **_kw):
+        self.moves.append(tuple(pos))
+
+    def click(self, *_a, **_kw):
+        self.clicks += 1
+        self.frame = self.after
+
+
+@pytest.mark.parametrize("w,h,top,vh", [
+    (1920, 1080, 0, 1080), (2560, 1080, 0, 1080), (3440, 1440, 0, 1440), (5120, 1440, 0, 1440),
+    (1920, 1080, 90, 950), (2560, 1440, 110, 1290),          # 浏览器没全屏: 按钮不在算出来的检测点上
+])
+def test_click_continue_after_death_hits_the_real_button(monkeypatch, w, h, top, vh):
+    s = max(w / 1920, vh / 1080)
+    frame, (cx, cy) = _death_frame(w, h, s, center=(round(w / 2 - s), round(top + vh / 2 + 94 * s)))
+    _screen(monkeypatch, w, h, frame)
+    stub = _ScreenClickStub(frame, _gameplay_frame(w, h))
+    monkeypatch.setattr(utils, "pyautogui", stub)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    assert utils.click_continue_after_death() is True
+    x, y = stub.moves[0]
+    assert abs(x - cx) <= 30 * s and abs(y - cy) <= 12 * s       # 按钮约 76x40(1080p), 落在按钮里面
+
+
+def test_click_continue_waits_for_the_sliding_panel_to_stop(monkeypatch):
+    # 死亡页滑进来的时候按钮还在动: 连续两次找到的位置一致了才点
+    spy = _MoveClickSpy()
+    monkeypatch.setattr(utils, "pyautogui", spy)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+    seen = iter([(960, 519), (960, 590), (960, 633), (960, 634), (960, 634)])
+    monkeypatch.setattr(utils, "find_continue_button", lambda: next(seen))
+    assert utils.click_continue_after_death() is True
+    assert spy.moves == [(960, 634)]
+
+
+def test_click_continue_falls_back_to_the_check_point_when_nothing_is_found(monkeypatch):
+    spy = _MoveClickSpy()
+    monkeypatch.setattr(utils, "pyautogui", spy)
+    monkeypatch.setattr(utils.time, "sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr(utils, "on_death_screen", lambda: False)
+    monkeypatch.setattr(utils, "find_continue_button", lambda: None)
+    assert utils.click_continue_after_death() is True
+    assert spy.moves == [tuple(utils._CONTINUE_BUTTON_POS)]
 
 
 def test_select_biome_on_title_clicks_desert_button(monkeypatch):

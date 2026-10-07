@@ -19,6 +19,15 @@ florrfarm.cc.cd {
 		reverse_proxy 127.0.0.1:8787
 	}
 
+	# 问题报告的附件(最近 5 分钟录像 / 截图 / 日志的 zip, 客户端 blackbox.py 打的): 先 POST /api/bug 拿到一次性令牌才传得进去,
+	# 上限比 florr-stats 自己的 ATTACH_LIMIT(20MB)略大
+	handle /api/bug/* {
+		request_body {
+			max_size 21MB
+		}
+		reverse_proxy 127.0.0.1:8787
+	}
+
 	# 后台面板. 密码文件由 deploy/stats/install.sh 生成; 没装统计时 deploy/mirror/install.sh
 	# 放一个一律 403 的占位 —— 宁可打不开, 也不能不设密码就对外
 	handle /admin* {
