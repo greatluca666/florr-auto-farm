@@ -70,6 +70,11 @@ _DOWNLOAD_URL = (
 # 远端随时能换内容的二进制. 重新构建/换release时这个值必须跟着更新, 否则所有人都
 # 会卡在"下载校验失败".
 _DOWNLOAD_SHA256 = "74488ef58966d123ace6d19ebb11c05d7ac8ee992abd949289714a8a866e7d74"
+# 国内镜像(我们自己服务器上的同一个文件, 文件名跟 GitHub 上那个 zip 一样, 摘要共用上面这个):
+# 国内直连 GitHub 下 347MB 经常下不完(2026-10-10 北京用户: AFK: download_failed)。下载时镜像优先,
+# 失败 / 摘要对不上再回落 GitHub。换包时两边都要传(镜像由 deploy/mirror/fetch_afk.sh 放进
+# /var/lib/florrfarm/afk/), test_afk_watch 里有一条检查文件名对得上。
+_MIRROR_URL = "https://florrfarm.cc.cd/afk/florr-auto-afk-v1.1.1-auto.zip"
 
 # 跟cdp_bridge.py的_CHROME_PROFILE_DIR同一个套路: 打包成exe后是exe自己所在
 # 目录, 脚本模式下是main.py所在目录 —— 两种场景下"跟可执行文件同级"语义一致,
@@ -124,6 +129,10 @@ _USER_AGENT = "florr-auto-pathing (github.com/greatluca666/florr-auto-farm)"
 
 _last_offset = 0
 _pause_until = 0.0
+# 这个进程自己拉起过 segment.exe 吗。区分"本次启动开的"和"上次退出 / 崩溃时遗留的(或用户另外开的)" ——
+# 后者对不上这次的 Chrome 窗口和日志偏移, 不能当成"已经在跑"(2026-10-11 粉丝: 退出应用后它还留着,
+# 再启动就认不出 AFK 弹窗了)。
+_started_here = False
 _confirmed_since = None    # 画布确认过真弹窗的时刻; 弹窗从画面上消失就提前结束暂停
 # 上一条还没确认是真是假的"Found AFK window"的时间戳; None = 没有待确认的.
 _pending_since = None
@@ -289,20 +298,130 @@ def _prompt_download_confirm():
     输入n(不分大小写, 允许前后空白)算跳过."""
     answer = input(
         f"\n🤖 没检测到florr-auto-afk(AFK弹窗自动处理用). 现在下载吗?\n"
-        f"   来源: {_DOWNLOAD_URL}\n"
+        f"   来源: {_MIRROR_URL}\n"
+        f"   (备用: {_DOWNLOAD_URL})\n"
         f"   大小: 约350MB, 解压到: {_INSTALL_DIR}\n"
         f"   (回车=下载, 输入n=跳过, 之后AFK弹窗不会自动处理): "
     )
     return answer.strip().lower() != "n"
 
 
-def _download_and_extract():
-    """流式下载到临时文件 → 核对SHA-256 → zipfile解压, 完了删掉临时zip. 网络失败/
-    校验不过/zip损坏都不抛异常出去 —— 返回False, 让调用方
-    (ensure_florr_auto_afk_running())决定怎么继续, 主程序不受影响."""
-    tmp_path = os.path.join(_INSTALL_ROOT, f"{_INSTALL_DIR_NAME}.zip.download")
+def _download_sources():
+    """下载源, 按尝试顺序: 国内镜像优先, GitHub 兜底。"""
+    return [_MIRROR_URL, _DOWNLOAD_URL]
+
+
+def _local_zip_dirs():
+    """用户手动下好的 zip 可能在的目录: 程序所在目录(说明里让放这儿)和浏览器默认的「下载」。"""
+    return [_INSTALL_ROOT, os.path.join(os.path.expanduser("~"), "Downloads")]
+
+
+def _expected_sha256():
+    # 常量侧先normalize再比: 重新构建之后来刷_DOWNLOAD_SHA256的人是在Windows上,
+    # 最可能直接粘`certutil -hashfile ... SHA256`的输出 —— 大写、还按每两字节插
+    # 空格. 不normalize的话这种粘贴会报"校验失败", 而那条提示跟"asset真被人换了"
+    # 长得一模一样, 白查半天. 只放宽大小写和空白(split()顺带吃掉换行/制表),
+    # 校验本身一点没松.
+    return "".join(_DOWNLOAD_SHA256.split()).lower()
+
+
+def _print_digest_mismatch(actual_sha256):
+    # 校验不过就当失败, 一个文件都不解出来: 这包里是我们下一步要Popen的
+    # exe, asset内容跟钉的摘要不一样时唯一安全的做法是停在这儿. 最常见的原因不是被人
+    # 换包, 而是release重新构建了而_DOWNLOAD_SHA256没跟着改 —— 所以两个摘要都印出来,
+    # 好一眼对比.
+    print(
+        "⚠️ florr-auto-afk校验失败(SHA-256不符, 已丢弃):\n"
+        f"   期望: {_expected_sha256()}\n"
+        f"   实际: {actual_sha256}"
+    )
+
+
+def _extract_verified_zip(zip_path):
+    """把已经核对过摘要的 zip 解压到 _INSTALL_DIR, 解完确认 exe 在。坏 zip / 布局不对返回 False。"""
     try:
-        req = urllib.request.Request(_DOWNLOAD_URL, headers={"User-Agent": _USER_AGENT})
+        with zipfile.ZipFile(zip_path) as zf:
+            # 解压到_INSTALL_DIR而不是_INSTALL_ROOT: 官方release zip没有顶层
+            # 目录(它的workflow用`Compress-Archive -Path ./dist/segment/*`),
+            # 解压到ROOT会把4500个文件直接铺在main.py旁边, _EXE_PATH永远不存在.
+            zf.extractall(_INSTALL_DIR)
+    except Exception as e:
+        print(f"⚠️ florr-auto-afk解压失败(zip损坏?): {e}")
+        return False
+
+    if not os.path.isfile(_EXE_PATH):
+        # 上游换了打包布局(比如哪天套了层顶层目录)时不能假装装好了 —— 这里
+        # 报出来, 比拖到Popen那步炸掉容易看懂.
+        print(
+            f"⚠️ florr-auto-afk解压完没找到{_EXE_NAME}(zip结构跟预期不符), "
+            f"之后AFK弹窗不会自动处理: {_INSTALL_DIR}"
+        )
+        return False
+
+    print(f"✅ florr-auto-afk已安装到 {_INSTALL_DIR}")
+    return True
+
+
+def _sha256_of_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def install_from_zip(zip_path):
+    """装一份用户自己下好的 zip: 先核对 SHA-256(用户手选的任意文件, 里面的 exe 下一步就要被
+    Popen, 不能不验), 再解压。不抛; 成功返回 True。GUI 的「手动安装」和下载前的本地 zip 识别都走这个。"""
+    try:
+        actual = _sha256_of_file(zip_path)
+    except OSError as e:
+        print(f"⚠️ 读不了这个文件: {zip_path} ({e})")
+        return False
+    if actual != _expected_sha256():
+        _print_digest_mismatch(actual)
+        print("   (这不是 florr-auto-afk 的安装包, 或者没下载完整 —— 请用下面的链接重新下载)")
+        return False
+    return _extract_verified_zip(zip_path)
+
+
+def _find_local_zips():
+    """手动放进来的安装包: 在 _local_zip_dirs() 里找跟官方 zip 同名的文件(浏览器重复下载会改名成
+    「xxx (1).zip」, 一并认), 新的排前面。只看名字, 摘要由 install_from_zip 核对。"""
+    name = os.path.basename(_DOWNLOAD_URL)
+    stem, ext = os.path.splitext(name)
+    found = []
+    for folder in _local_zip_dirs():
+        try:
+            entries = os.listdir(folder)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry == name or (entry.startswith(stem) and entry.endswith(ext)):
+                path = os.path.join(folder, entry)
+                if os.path.isfile(path):
+                    found.append(path)
+    return sorted(found, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
+def manual_install_instructions():
+    """自动下载全失败时给用户看的「手动装」步骤(GUI 弹窗和日志共用)。"""
+    name = os.path.basename(_DOWNLOAD_URL)
+    return (
+        "自动下载没成功。可以手动安装:\n"
+        f"1. 用浏览器 / 下载工具下载(国内链接,约 350MB):\n   {_MIRROR_URL}\n"
+        f"   (下不动再试 GitHub: {_DOWNLOAD_URL})\n"
+        f"2. 把下好的 {name} 放进程序所在文件夹,下次打开「AFK 自动处理」会自动识别:\n"
+        f"   {_INSTALL_ROOT}\n"
+        "   或者在界面里点「手动安装」直接选这个 zip 文件。\n"
+        "程序会先核对文件校验值,不是 florr-auto-afk 的安装包会拒绝安装。"
+    )
+
+
+def _fetch_verified_zip(url, tmp_path):
+    """流式下载 url 到 tmp_path, 边下边算摘要, 摘要对得上才返回 True。网络失败 / 校验不过都不抛。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         # 边下边算摘要, 不下完再回头读一遍文件: 347MB多走一趟完整磁盘IO纯属白费.
         digest = hashlib.sha256()
         with urllib.request.urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:
@@ -322,45 +441,38 @@ def _download_and_extract():
                             end="",
                         )
             print()  # 结束下载进度那行, 换行
-
-        actual_sha256 = digest.hexdigest()
-        # 常量侧先normalize再比: 重新构建之后来刷_DOWNLOAD_SHA256的人是在Windows上,
-        # 最可能直接粘`certutil -hashfile ... SHA256`的输出 —— 大写、还按每两字节插
-        # 空格. 不normalize的话这种粘贴会报"校验失败", 而那条提示跟"asset真被人换了"
-        # 长得一模一样, 白查半天. 只放宽大小写和空白(split()顺带吃掉换行/制表),
-        # 校验本身一点没松.
-        expected_sha256 = "".join(_DOWNLOAD_SHA256.split()).lower()
-        if actual_sha256 != expected_sha256:
-            # 校验不过就当下载失败, 一个文件都不解出来: 这包里是我们下一步要Popen的
-            # exe, asset内容跟钉的摘要不一样时唯一安全的做法是停在这儿(finally会把
-            # 临时zip删掉). 最常见的原因不是被人换包, 而是release重新构建了而
-            # _DOWNLOAD_SHA256没跟着改 —— 所以两个摘要都印出来, 好一眼对比.
-            print(
-                "⚠️ florr-auto-afk下载校验失败(SHA-256不符, 已丢弃, 之后AFK弹窗不会自动处理):\n"
-                f"   期望: {expected_sha256}\n"
-                f"   实际: {actual_sha256}"
-            )
-            return False
-
-        with zipfile.ZipFile(tmp_path) as zf:
-            # 解压到_INSTALL_DIR而不是_INSTALL_ROOT: 官方release zip没有顶层
-            # 目录(它的workflow用`Compress-Archive -Path ./dist/segment/*`),
-            # 解压到ROOT会把4500个文件直接铺在main.py旁边, _EXE_PATH永远不存在.
-            zf.extractall(_INSTALL_DIR)
-
-        if not os.path.isfile(_EXE_PATH):
-            # 上游换了打包布局(比如哪天套了层顶层目录)时不能假装装好了 —— 这里
-            # 报出来, 比拖到Popen那步炸掉容易看懂.
-            print(
-                f"⚠️ florr-auto-afk解压完没找到{_EXE_NAME}(zip结构跟预期不符), "
-                f"之后AFK弹窗不会自动处理: {_INSTALL_DIR}"
-            )
-            return False
-
-        print(f"✅ florr-auto-afk已下载解压到 {_INSTALL_DIR}")
-        return True
     except Exception as e:
-        print(f"⚠️ 下载/解压florr-auto-afk失败(不影响主程序, 之后AFK弹窗不会自动处理): {e}")
+        print(f"\n⚠️ 从 {url} 下载失败: {e}")
+        return False
+
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != _expected_sha256():
+        print(f"   来源: {url}")
+        _print_digest_mismatch(actual_sha256)
+        return False
+    return True
+
+
+def _download_and_extract():
+    """装 florr-auto-afk: 先看有没有手动放进来的 zip, 没有再按 _download_sources() 的顺序下载(镜像优先,
+    GitHub 兜底), 核对 SHA-256 → 解压, 完了删掉临时 zip。网络失败 / 校验不过 / zip 损坏都不抛异常出去 ——
+    返回 False, 让调用方(ensure_florr_auto_afk_running())决定怎么继续, 主程序不受影响."""
+    for path in _find_local_zips():
+        print(f"📦 找到手动下载的安装包: {path}")
+        if install_from_zip(path):
+            return True
+        print("   这个文件不能用, 继续走自动下载")
+
+    tmp_path = os.path.join(_INSTALL_ROOT, f"{_INSTALL_DIR_NAME}.zip.download")
+    try:
+        for url in _download_sources():
+            print(f"⬇️ 下载 florr-auto-afk: {url}")
+            if not _fetch_verified_zip(url, tmp_path):
+                continue
+            # 摘要对上了, 内容就是确定的那份: 解压失败(坏 zip / 布局不对)换源也是同一份, 不再试了
+            return _extract_verified_zip(tmp_path)
+        print("⚠️ 下载florr-auto-afk失败(不影响主程序, 之后AFK弹窗不会自动处理)\n"
+              + manual_install_instructions())
         return False
     finally:
         if os.path.isfile(tmp_path):
@@ -582,9 +694,16 @@ def is_florr_auto_afk_running():
     return _is_florr_auto_afk_running()
 
 
+def started_by_this_session():
+    """segment.exe 是不是本进程拉起来的(而不是之前遗留 / 别处开的)。"""
+    return _started_here
+
+
 def stop_florr_auto_afk():
-    """taskkill 掉 segment.exe(AFK 开关关掉时用). 非 win32 直接返回. 本来就没在
+    """taskkill 掉 segment.exe(AFK 开关关掉 / 应用退出时用). 非 win32 直接返回. 本来就没在
     跑不算失败 —— 吞掉非零退出码和异常, 跟 _is_florr_auto_afk_running() 一个态度."""
+    global _started_here
+    _started_here = False
     if sys.platform != "win32":
         return
     try:
@@ -605,6 +724,7 @@ def ensure_florr_auto_afk_running():
     (自动启动靠config里的runs.autoStart, 见docs/superpowers/specs/2026-08-28-afk-autostart-design.md
     第一部分那个fork补丁). 只在Windows上做, 其余平台整段跳过. 全程不阻塞主流程 ——
     这是可选增强, 任何一步失败/用户跳过都只打印一句提示, main.py照常往下走."""
+    global _started_here
     if sys.platform != "win32":
         return
 
@@ -633,6 +753,7 @@ def ensure_florr_auto_afk_running():
     except Exception as e:
         print(f"⚠️ 打开florr-auto-afk失败(不影响主程序): {e}")
         return
+    _started_here = True
 
     print(f"🪟 已在后台打开florr-auto-afk, 确认它开始检测(最多等{_START_TIMEOUT_SECONDS}秒)...")
     if _wait_for_segment_started(start_offset):

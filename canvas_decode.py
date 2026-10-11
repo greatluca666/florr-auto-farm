@@ -103,6 +103,10 @@ ZONE_LABELS = {"蚂蚁地狱": "anthell", "沙漠": "desert", "花园": "garden"
                "Sewers": "sewers", "Factory": "factory"}
 
 
+_NAMEPLATE_DX = 40.0     # 名牌字相对血条锚点的水平偏移上限(录像里 ±20 占 97%)
+_NAMEPLATE_DY = 80.0     # 名牌字在血条下方的垂直偏移上限(录像里 20~70 占 99%)
+
+
 def zone_map_from_frame(records):
     """从 HUD 上的区域名读出"人现在在哪张图". 认不出 -> None.
 
@@ -110,19 +114,34 @@ def zone_map_from_frame(records):
     花园那台服务器), 进场路线就拿花园的路线去走蚁穴的墙, 一轮白烧 180 秒。区域名是游戏
     自己画在 HUD 上的, 跟服务器号无关。
     名牌文字画在世界缩放(zoom)下, HUD 是 UI 缩放 —— 跳过跟 zoom 同缩放的文本, 玩家/怪
-    起名叫"蚂蚁地狱"也骗不了它。"""
+    起名叫"蚂蚁地狱"也骗不了它。
+    但 1024x768 上区域名按 UI 缩放 x 0.8 = 0.7111 画, 世界缩放的默认值也恰好是 0.7111(2026-10-11 录像里
+    72 帧区域名有 31 帧撞上), 光看缩放相等会把真的区域名丢掉。缩放相等时再看位置: 真名牌的字紧挨在某个
+    血条下面(录像量的: 水平 ±30 以内、下方 20~70 像素, 这里放宽到 ±_NAMEPLATE_DX / 上 25 下 _NAMEPLATE_DY),
+    区域名在小地图下面、不在任何血条的名牌位置上才算数。"""
     zoom = None
+    anchors = []
     for r in records:
         if r["op"] == "stroke" and r.get("stroke") == HEALTHBAR_BG and not _is_minimap(r):
-            zoom = r["m"][0]
-            break
+            if zoom is None:
+                zoom = r["m"][0]
+            anchors.append(_anchor(r))
+
+    def _under_a_bar(rec):
+        lx, ly = rec.get("x"), rec.get("y")
+        if lx is None or ly is None:
+            return True                    # 位置不明: 保守当名牌
+        return any(abs(lx - ax) <= _NAMEPLATE_DX and -25.0 <= ly - ay <= _NAMEPLATE_DY
+                   for ax, ay in anchors)
+
     for r in records:
         if r["op"] != "text":
             continue
         zone = ZONE_LABELS.get(str(r.get("text", "")))
         if zone is None:
             continue
-        if zoom is not None and r.get("m") is not None and abs(_scale(r) - zoom) < 1e-6:
+        if (zoom is not None and r.get("m") is not None and abs(_scale(r) - zoom) < 1e-6
+                and _under_a_bar(r)):
             continue
         return zone
     return None

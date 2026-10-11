@@ -1,6 +1,7 @@
 from utils import *
 from overlay import create_overlay
 import argparse
+import bisect
 import collections
 import os
 import signal
@@ -21,6 +22,7 @@ import os
 import map_routes
 import florr_server
 import loadout_swap
+import keep_awake
 import flee_planner
 import phase_marks
 
@@ -79,12 +81,93 @@ def line_of_sight(map, node1, node2):
             y0 += sy
 
 
-def lazy_theta_star(map, start, goal):
+# 路径离墙要有净空。2026-10-10 录像: 规划出的**每一跳**离墙最近都只有 0.95 格(贴着墙走), 工厂 (180,145)
+# 那个走廊转角在 8 份录像里卡了 9 次 —— Lazy Theta* 的任意角直线只看"没穿墙", 最短路天然贴着内侧墙角,
+# 小地图 ±1 格的误差 + 角色有体积 + 鼠标驱动的滑动 = 蹭墙卡住。给"贴墙"的格子加代价: 到最近墙的距离
+# 不到 CLEARANCE_TARGET 格的格子, 每差 1 格罚 CLEARANCE_WEIGHT 格的路程。宽走廊里路径自然走中线;
+# 窄通道(密道, 1~2 格宽)实在躲不掉, 照样能走(只是更贵; 绕大圈比密道长得多时仍走密道, 见测试)。
+CLEARANCE_TARGET = 2.0
+CLEARANCE_WEIGHT = 2.0
+CLEARANCE_PLANNING = True        # 总开关: 想退回老行为改这里
+
+_PENALTY_CACHE = {}
+
+
+def _wall_penalty(map):
+    """每格的贴墙惩罚(list of lists, 比 numpy 逐点索引快), 按地图内容缓存 —— load_binary_map() 每次返回新数组。
+    净空 = 到最近墙像素的欧氏距离, 地图外圈当墙(跟 utils 的脱困那套一致)。"""
+    import zlib
+    key = (map.shape, zlib.adler32(map.tobytes()))
+    hit = _PENALTY_CACHE.get(key)
+    if hit is None:
+        walk = (map == 255).astype(np.uint8)
+        padded = cv2.copyMakeBorder(walk, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        clearance = cv2.distanceTransform(padded, cv2.DIST_L2, 3)[1:-1, 1:-1]
+        hit = (np.maximum(0.0, CLEARANCE_TARGET - clearance) * CLEARANCE_WEIGHT).tolist()
+        if len(_PENALTY_CACHE) > 8:
+            _PENALTY_CACHE.clear()
+        _PENALTY_CACHE[key] = hit
+    return hit
+
+
+def _los_penalty(map, pen, node1, node2):
+    """跟 line_of_sight 同一条线、同一套判定; 通的话返回沿线(不含起点)的贴墙惩罚之和, 被墙挡返回 None。"""
+    x0, y0 = node1.x, node1.y
+    x1, y1 = node2.x, node2.y
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    total = 0.0
+    first = True
+    while True:
+        if map[y0][x0] == 0:
+            return None
+        if not first:
+            total += pen[y0][x0]
+        first = False
+        if x0 == x1 and y0 == y1:
+            return total
+        e2 = err * 2
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+
+
+# 规划结果缓存。工厂每次死亡都从同一个出生点规划到同一个刷怪点, Windows 上一次 9~12 秒(2026-10-10 三小时录像:
+# 56 轮里 25 轮同一条长路线, 光规划 ~4 分钟)。同一张图 + 同一起点 + 同一终点结果是确定的, 命中就直接给。
+# 键带地图内容指纹(开了传送门缺口的图是另一张图); 只缓存找到路的结果(失败不缓存, 地图可能马上就好了)。
+_PLAN_CACHE = {}
+_PLAN_CACHE_MAX = 32
+
+
+def lazy_theta_star(map, start, goal, clearance=None):
+    """clearance=None 取总开关 CLEARANCE_PLANNING; False = 老行为(纯最短路, 贴墙)。"""
     if start is None or goal is None:
         return None
     if map is None:
         return None
-    
+    use_clearance = CLEARANCE_PLANNING if clearance is None else bool(clearance)
+    import zlib
+    cache_key = (map.shape, zlib.adler32(map.tobytes()), tuple(start), tuple(goal), use_clearance)
+    hit = _PLAN_CACHE.get(cache_key)
+    if hit is not None:
+        return list(hit)
+    path = _lazy_theta_star(map, start, goal, use_clearance)
+    if path is not None:
+        if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
+            _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)))
+        _PLAN_CACHE[cache_key] = list(path)
+    return path
+
+
+def _lazy_theta_star(map, start, goal, use_clearance):
+    pen = _wall_penalty(map) if use_clearance else None
+
     class Node:
         def __init__(self, x, y, cost=math.inf, parent=None):
             self.x = x
@@ -121,7 +204,22 @@ def lazy_theta_star(map, start, goal):
             if 0 <= nx < len(map[0]) and 0 <= ny < len(map) and map[ny][nx] == 255:
                 neighbor = Node(nx, ny)
                 if (nx, ny) not in closed_list:
-                    if current.parent and line_of_sight(map, current.parent, neighbor):
+                    if pen is not None:
+                        shortcut = (_los_penalty(map, pen, current.parent, neighbor)
+                                    if current.parent else None)
+                        if shortcut is not None:
+                            new_cost = current.parent.cost + \
+                                lazy_heuristic(current.parent, neighbor) + shortcut
+                            if new_cost < neighbor.cost:
+                                neighbor.cost = new_cost
+                                neighbor.parent = current.parent
+                        else:
+                            new_cost = current.cost + \
+                                lazy_heuristic(current, neighbor) + pen[ny][nx]
+                            if new_cost < neighbor.cost:
+                                neighbor.cost = new_cost
+                                neighbor.parent = current
+                    elif current.parent and line_of_sight(map, current.parent, neighbor):
                         new_cost = current.parent.cost + \
                             lazy_heuristic(current.parent, neighbor)
                         if new_cost < neighbor.cost:
@@ -548,6 +646,314 @@ def execute_path(path, stop_when=None, binary_map=None, enemy_watch=None, deadli
     return True
 
 
+# ── 纯追踪走路径(工厂) ────────────────────────────────────────────────────────────
+# 2026-10-10 三小时工厂录像 + 官方 factory.tmj: 反复卡住的 (151,188) / (180,145) 都落在官方 shortcut(通风管)层的
+# 瓦片上 —— 密道, 实际可走宽度恰好 1 个瓦片(512 世界单位 ≈ 3.2 个小地图格; 小地图画成 4 格); 跑图装的速度 1000~3000
+# u/s(12 格/秒), 而 move_to_position 一拍要 ~0.35 秒(每拍两次抓屏查死亡), 一拍跑 4 格。它是"追节点 + 比例鼠标
+# 偏移"的闭环: 增益 x 延迟一大就振荡 —— 录像里在竖井口沿墙来回荡 ±7 格, 14 拍后判卡住, 脱困 + 重规划又十几秒。
+# 纯追踪(pure pursuit): 瞄**路径上前方 PURSUIT_LOOKAHEAD 格**的点, 永远在前面, 不存在"冲过节点再折回来";
+# 鼠标偏移满量(不做比例增益, 增益不稳定的根源), 只有临近终点才减速; 查死亡 / 开局画面降到每 0.5 秒一次
+# (一次要 ~200ms, 以前每拍两次)。只给 PURSUIT_MAPS(别的图逐点走法是实机验证过的, 不动)。
+PURSUIT_ENABLED = True
+PURSUIT_MAPS = ("factory",)
+PURSUIT_LOOKAHEAD = 6.0        # 格。一拍(~0.15 秒)跑 12 格/秒 x 0.15 = 1.8 格, 取它的 3 倍多: 修正横向偏差不过冲
+PURSUIT_SLOW_RADIUS = 8.0      # 离终点这么近(格)才按距离收鼠标偏移
+PURSUIT_SCREEN_CHECK_S = 0.5   # 抓屏查死亡 / 开局画面的最短间隔(同 FARM_SCREEN_CHECK_S)
+PURSUIT_STALL_S = 4.0          # 这么久路径进度没涨 PURSUIT_PROGRESS_EPS 格 = 卡住
+PURSUIT_PROGRESS_EPS = 1.0
+PURSUIT_MAX_S = 900.0          # 没传 deadline 时的保底(一段路走这么久还没到, 别无限走下去)
+PURSUIT_POS_LOST_S = 2.0         # 位置读不到最多等这么久(落地黑屏 / 画布这一瞬没画小地图), 再久才判卡住
+# 急转弯前收油: 满量鼠标偏移 + 控制延迟 = 速度大时冲过拐角撞墙。离路径上下一个"拐角"(前后两段夹角 >
+# PURSUIT_TURN_DEG)不到 PURSUIT_BRAKE_DIST 格就按距离收偏移(下限 PURSUIT_BRAKE_FLOOR 倍), 直路上仍然满量。
+# 三个数是在带惯性 + 控制延迟的离线仿真里扫出来的(工厂长路线, 6 个起点 x 3 种延迟/加速度): 前瞻 6 格、刹车 9 格、
+# 下限 0.5 倍 = 卡住 8 次 / 0 次失败; 前瞻 4 或 9 格、刹车 14 格都更差(卡住 17~35 次)。仿真的物理参数是猜的。
+PURSUIT_TURN_DEG = 35.0
+PURSUIT_BRAKE_DIST = 9.0
+PURSUIT_BRAKE_FLOOR = 0.5
+# 2026-10-11 录像(1024x768, 路径已经走纯追踪): (180,161) 同一个地方 4 次"路径进度 4 秒没涨" —— 横走廊拐进竖井口,
+# 前瞻点落在拐角后面的竖井里, 瞄点连线从拐角的内侧墙角擦过去: 像素级的"看得见"通过了, 人却在 c.x=180.0 贴着
+# 井口左墙往北顶(井口 4 格宽, 可走 c.x∈[180,184), 人贴边就被墙挡), 只能沿墙慢慢往东蹭。两处改动:
+#   1) 路径节点是像素下标, 像素 i 的中心在位置读数的 i+0.5(读数是 s*(world+1000), 像素 = floor(读数)), 追的点要加半格,
+#      否则瞄点整体偏左上半格, 窄道里正好往墙里偏;
+#   2) 瞄点连线要离墙边至少 PURSUIT_CLEAR 格(沿线每 0.5 格取样, 到墙边距离用墙像素中心的距离变换减半格估计),
+#      过不了就缩短前瞻 —— 拐角前瞄的是拐角本身, 过了拐角才瞄井里。
+PURSUIT_NODE_OFFSET = 0.5
+PURSUIT_CLEAR = 0.6
+PURSUIT_AIM_FRACS = (1.0, 0.7, 0.45, 0.25, 0.1)
+# 2026-10-11 录像里 (125,246)->(131,245) 两个节点反复卡: 那是一个 5 格宽、夹在两块墙垛之间的口子, 前面是沿墙垛左面往北
+# 的长直路, 满速冲过口子往北多跑了 10 格; 回头时路径进度按"离路径最近的点"投影, 直接跳到墙垛另一侧的后一段(15 格),
+# 瞄点跑到墙垛后面、视线被挡, 人在墙垛左面来回荡 4 秒判卡住。两处改动:
+#   1) 一次进度推进最多 PURSUIT_ADVANCE_MAX 格(一拍最多跑几格), 不许越过一堵墙跳到路径的后一段;
+#   2) 前面的瞄点全被挡时, 往回找路径上看得见的点(PURSUIT_BACK_STEPS 格以内)先回到路径上, 再往前。
+PURSUIT_ADVANCE_MAX = 8.0
+PURSUIT_BACK_STEPS = (0.0, 1.5, 3.0, 5.0, 8.0, 12.0, 16.0)
+
+
+def _use_pursuit():
+    return bool(PURSUIT_ENABLED and utils.MAP in PURSUIT_MAPS)
+
+
+def _path_progress(pts, cum, pos, hint):
+    """pos 在折线上的投影弧长, 只在 hint 附近的几段里找(路径可能折回来贴近自己, 不能全局找最近点)。"""
+    n = len(pts) - 1
+    i0 = max(0, bisect.bisect_right(cum, hint) - 2)
+    best = (float("inf"), hint)
+    for i in range(i0, min(n, i0 + 10)):
+        (ax, ay), (bx, by) = pts[i], pts[i + 1]
+        dx, dy = bx - ax, by - ay
+        seg = dx * dx + dy * dy
+        t = 0.0 if seg == 0 else max(0.0, min(1.0, ((pos[0] - ax) * dx + (pos[1] - ay) * dy) / seg))
+        d = math.hypot(pos[0] - (ax + t * dx), pos[1] - (ay + t * dy))
+        if d < best[0]:
+            best = (d, cum[i] + t * math.sqrt(seg))
+    return best[1]
+
+
+def _advance_progress(pts, cum, pos, s, binary_map=None):
+    """路径进度只往前、一次最多推进 PURSUIT_ADVANCE_MAX 格, 而且新进度那一点要从人这里看得见: 几何上离路径
+    后一段更近不等于走到了那里(隔着一堵墙的后一段也可能更近), 不许跳过去。看不见就少推进一点, 再不行不动。"""
+    new = min(_path_progress(pts, cum, pos, s), s + PURSUIT_ADVANCE_MAX)
+    if new <= s:
+        return s
+    if binary_map is None:
+        return new
+    total = cum[-1]
+    for frac in (1.0, 0.5, 0.25, 0.12):
+        cand = s + (new - s) * frac
+        if _visible(binary_map, pos, _path_point(pts, cum, min(total, cand))):
+            return cand
+    return s
+
+
+def _path_point(pts, cum, s):
+    """折线上弧长 s 处的点(超过终点取终点)。"""
+    if s >= cum[-1]:
+        return pts[-1]
+    i = max(0, bisect.bisect_right(cum, s) - 1)
+    seg = cum[i + 1] - cum[i]
+    t = 0.0 if seg == 0 else (s - cum[i]) / seg
+    return (pts[i][0] + t * (pts[i + 1][0] - pts[i][0]), pts[i][1] + t * (pts[i + 1][1] - pts[i][1]))
+
+
+def _visible(binary_map, a, b):
+    try:
+        return line_of_sight(binary_map, _Pt(int(math.floor(a[0])), int(math.floor(a[1]))),
+                             _Pt(int(math.floor(b[0])), int(math.floor(b[1]))))
+    except IndexError:
+        return False
+
+
+_CLEAR_CACHE = {}
+
+
+def _clearance_map(binary_map):
+    """每个像素中心到最近墙像素中心的欧氏距离(float32), 墙内 0, 地图外圈当墙; 按地图内容缓存。"""
+    import zlib
+    key = (binary_map.shape, zlib.adler32(binary_map.tobytes()))
+    hit = _CLEAR_CACHE.get(key)
+    if hit is None:
+        walk = (binary_map == 255).astype(np.uint8)
+        padded = cv2.copyMakeBorder(walk, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+        hit = cv2.distanceTransform(padded, cv2.DIST_L2, 3)[1:-1, 1:-1]
+        if len(_CLEAR_CACHE) > 8:
+            _CLEAR_CACHE.clear()
+        _CLEAR_CACHE[key] = hit
+    return hit
+
+
+def _edge_dist(clear, x, y):
+    """位置读数坐标 (x, y) 到最近墙边的距离估计(格): 像素中心在读数的 +0.5, 先双线性插值中心距离, 再减半格。"""
+    h, w = clear.shape
+    fx, fy = x - 0.5, y - 0.5
+    x0, y0 = int(math.floor(fx)), int(math.floor(fy))
+    ax, ay = fx - x0, fy - y0
+
+    def g(ix, iy):
+        return float(clear[iy, ix]) if 0 <= ix < w and 0 <= iy < h else 0.0
+
+    d = (g(x0, y0) * (1 - ax) * (1 - ay) + g(x0 + 1, y0) * ax * (1 - ay)
+         + g(x0, y0 + 1) * (1 - ax) * ay + g(x0 + 1, y0 + 1) * ax * ay)
+    return d - 0.5
+
+
+def _clear_los(clear, a, b, min_edge=None):
+    """a -> b 的连线沿途离墙边都 >= min_edge 格。起点 1 格内人可能已经贴着墙(上一拍擦过来的), 那一段只要求
+    "不比现在更贴"(>= 起点自己的净空), 不然贴墙时所有瞄点都被否掉。"""
+    min_edge = PURSUIT_CLEAR if min_edge is None else min_edge
+    near_edge = min(min_edge, max(0.0, _edge_dist(clear, a[0], a[1]))) - 0.02
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    dist = math.hypot(dx, dy)
+    n = max(1, int(math.ceil(dist / 0.5)))
+    for i in range(1, n + 1):
+        t = i / n
+        px, py = a[0] + dx * t, a[1] + dy * t
+        need = near_edge if t * dist <= 1.0 else min_edge
+        if _edge_dist(clear, px, py) < need:
+            return False
+    return True
+
+
+PURSUIT_CENTER_BELOW = 1.2     # 路径点离墙边不到这么远才往走廊中线挪
+PURSUIT_CENTER_RADIUS = 2.0    # 最多挪这么远(格)
+
+
+def _centered(binary_map, clear, pt):
+    """把贴墙的路径点挪到附近净空最大的位置(走廊中线)。路径是像素下标的折线, 4 格宽的竖井里它可能走在
+    最左一列(c.x∈[180,181), 离墙边只有 0.5 格), 人瞄着它走, 稍有横向误差就蹭墙。挪动只在原点到新点之间
+    像素视线通的范围内(别挪到隔着墙的另一条走廊里去)。"""
+    e0 = _edge_dist(clear, pt[0], pt[1])
+    if e0 >= PURSUIT_CENTER_BELOW:
+        return pt
+    best, best_score = pt, e0
+    steps = int(PURSUIT_CENTER_RADIUS / 0.5)
+    for i in range(-steps, steps + 1):
+        for j in range(-steps, steps + 1):
+            q = (pt[0] + i * 0.5, pt[1] + j * 0.5)
+            e = _edge_dist(clear, q[0], q[1])
+            if e <= 0.0:
+                continue
+            score = e - 0.1 * math.hypot(i * 0.5, j * 0.5)
+            if score > best_score and _visible(binary_map, pt, q):
+                best, best_score = q, score
+    return best
+
+
+def _pursuit_aim(pts, cum, s, pos, binary_map, clear):
+    """瞄路径上前方的哪一点: 最远的、连线不穿墙(像素视线)而且离墙边够远(_clear_los)的前瞻点;
+    都不行就退到只看像素视线的那个; 再不行返回 None(调用方绕可走格子)。"""
+    total = cum[-1]
+    plain = None
+    for frac in PURSUIT_AIM_FRACS:
+        want = s + PURSUIT_LOOKAHEAD * frac
+        cand = _path_point(pts, cum, min(total, want))
+        if binary_map is None:
+            return cand
+        if clear is not None and want < total - 1e-9:      # 终点本身不挪(到没到按它算)
+            cand = _centered(binary_map, clear, cand)
+        if not _visible(binary_map, pos, cand):
+            continue
+        if clear is None or _clear_los(clear, pos, cand):
+            return cand
+        if plain is None:
+            plain = cand
+    if plain is not None:
+        return plain
+    # 前面的点全被挡(冲过了拐角 / 口子, 人在墙的另一侧): 沿路径往回找第一个看得见的点, 先回到路径上
+    for back in PURSUIT_BACK_STEPS:
+        cand = _path_point(pts, cum, max(0.0, s - back))
+        if _visible(binary_map, pos, cand):
+            return cand
+    return None
+
+
+def follow_path(path, stop_when=None, binary_map=None, enemy_watch=None, deadline=None):
+    """纯追踪走路径, 接口和返回值跟 execute_path 一样: True(走完 / stop_when 说够了) / "stuck" /
+    "enemy" / "timeout" / "in_game_dead" / "in_menu"。原理和为什么见上面那段说明。"""
+    if path is None or len(path) == 0:
+        return "stuck"
+    off = PURSUIT_NODE_OFFSET
+    pts = [(float(path[0][0]) + off, float(path[0][1]) + off)]
+    for p in path[1:]:
+        q = (float(p[0]) + off, float(p[1]) + off)
+        if q != pts[-1]:
+            pts.append(q)
+    clear = _clearance_map(binary_map) if binary_map is not None else None
+    print(f"🗺️  跟随路径(纯追踪), 共 {len(path)} 个节点...")
+    if len(pts) == 1:
+        return True
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    total, end = cum[-1], pts[-1]
+    turns = []                                  # 急转弯节点的弧长位置
+    for k in range(1, len(pts) - 1):
+        a1 = math.atan2(pts[k][1] - pts[k - 1][1], pts[k][0] - pts[k - 1][0])
+        a2 = math.atan2(pts[k + 1][1] - pts[k][1], pts[k + 1][0] - pts[k][0])
+        da = abs((a2 - a1 + math.pi) % (2 * math.pi) - math.pi)
+        if math.degrees(da) > PURSUIT_TURN_DEG:
+            turns.append(cum[k])
+    cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+    started = time.time()
+    s = 0.0
+    best_s, best_t = 0.0, time.time()
+    next_screen_check = 0.0
+    lost_since = None
+    while True:
+        if afk_watch.poll_afk_pause():
+            overlay.update(state="AFK弹窗处理中", message="等待florr-auto-afk解题")
+            time.sleep(0.2)
+            best_t = time.time()           # 暂停期间没进展不算卡住
+            continue
+        pos = get_player_position(precise=True)
+        if pos is None:
+            # 传送刚落地 / 画布这一瞬没画小地图时读不到: 停下等一等再判(2026-10-11 录像里落地后第一次读就
+            # 返回 stuck, 紧跟着的脱困在出生点旁边乱走进了回花园的门)。真读不回来才交回上层。
+            now = time.time()
+            if lost_since is None:
+                lost_since = now
+                reset_keyboard()
+            if now - lost_since > PURSUIT_POS_LOST_S:
+                print("   ⚠️ 移动中丢失玩家位置")
+                overlay.update(state="无法检测位置", message="移动中丢失玩家位置")
+                reset_keyboard()
+                return "stuck"
+            time.sleep(0.1)
+            continue
+        if lost_since is not None:
+            lost_since = None
+            best_t = time.time()           # 读不到的那几秒不算"没进展"
+        now = time.time()
+        s = _advance_progress(pts, cum, pos, s, binary_map)
+        if s > best_s + PURSUIT_PROGRESS_EPS:
+            best_s, best_t = s, now
+        d_end = math.hypot(end[0] - pos[0], end[1] - pos[1])
+        overlay.update(state="移动中", pos=(round(pos[0]), round(pos[1])), target=(round(end[0]), round(end[1])))
+        if d_end < ARRIVE_RADIUS:
+            reset_keyboard()
+            print("✅ 路径执行完成")
+            return True
+        if stop_when is not None and stop_when((round(pos[0]), round(pos[1]))):
+            release_keys()
+            print("   ✅ 已进入目标区域, 剩下的路不走了")
+            return True
+        if deadline is not None and now >= deadline:
+            release_keys()
+            return "timeout"
+        if enemy_watch is not None and enemy_watch.should_flee():
+            release_keys()
+            return "enemy"
+        if now - best_t > PURSUIT_STALL_S or now - started > PURSUIT_MAX_S:
+            reset_keyboard()
+            print(f"   ⚠️ 路径进度 {now - best_t:.0f} 秒没涨, 判定卡住(离终点 {d_end:.1f} 格)")
+            overlay.update(state="卡住", message="路径进度没涨")
+            return "stuck"
+
+        # 瞄路径前方 PURSUIT_LOOKAHEAD 格的点; 从这里直线看不到就缩短, 再不行绕可走格子(_steer_point)
+        aim = _pursuit_aim(pts, cum, s, pos, binary_map, clear)
+        if aim is None:
+            far = _path_point(pts, cum, min(total, s + PURSUIT_LOOKAHEAD))
+            aim = _steer_point(binary_map, (round(pos[0]), round(pos[1])), (round(far[0]), round(far[1])))
+        adx, ady = aim[0] - pos[0], aim[1] - pos[1]
+        ad = math.hypot(adx, ady)
+        extend = (max(min(d_end * 45, 500), 50) if d_end < PURSUIT_SLOW_RADIUS else 500) * mouse_scale()
+        ahead = [t - s for t in turns if t - s > 0]
+        if ahead and min(ahead) < PURSUIT_BRAKE_DIST:
+            extend *= max(PURSUIT_BRAKE_FLOOR, min(ahead) / PURSUIT_BRAKE_DIST)
+        if ad > 0:
+            _move_mouse_safely(clamp_to_screen(cx + extend * adx / ad, cy + extend * ady / ad))
+        if now >= next_screen_check:
+            next_screen_check = now + PURSUIT_SCREEN_CHECK_S
+            if on_death_screen():
+                reset_keyboard()
+                overlay.update(state="已死亡")
+                return "in_game_dead"
+            if on_start_screen():
+                reset_keyboard()
+                overlay.update(state="菜单中")
+                return "in_menu"
+        time.sleep(0.05)
+
+
 PATH_FLEE_MAX_S = 10.0   # 寻路途中躲一次究极最多躲这么久, 之后照样回去重新规划
 
 
@@ -624,6 +1030,30 @@ def _on_wrong_map():
     return zone
 
 
+_UNREADABLE_DIAG_FIRST = 10     # 位置连续读不出来第几次起记屏幕体检
+_UNREADABLE_DIAG_EVERY = 60     # 之后每隔多少次再记一次
+
+
+def _report_unreadable_position(retry_count):
+    """位置连续读不出来时, 在第 10 次、之后每 60 次记一行: 屏幕截图是不是黑的 + 页面有没有焦点/是否可见。
+
+    2026-10-08 第一份录像: 死后回到标题页, 开始按钮明明在, 位置读不出来连续 5 分钟, 日志里只有同一句
+    "无法检测玩家位置", 看不出是截图黑了(锁屏/远程桌面断开)还是画面认不出来。一次整屏截图 + 一次 CDP
+    往返, 所以不能每次重试都做。诊断本身绝不抛, 不能把寻路循环带崩。"""
+    if retry_count < _UNREADABLE_DIAG_FIRST:
+        return
+    if retry_count != _UNREADABLE_DIAG_FIRST and retry_count % _UNREADABLE_DIAG_EVERY:
+        return
+    summary, _black = utils.screen_health()
+    try:
+        # eval_js 返回的是 CDP 的原始应答字典(2026-10-10 日志里整个字典被打了出来), 取值要用 _eval_value
+        page = str(cdp_bridge._eval_value(
+            "[document.hasFocus(), document.visibilityState].join(',')"))
+    except Exception:
+        page = "页面状态读不到(CDP 连不上)"
+    print(f"🩺 位置已经连续 {retry_count} 次读不出来: {summary}; 页面 焦点,可见性 = {page}")
+
+
 def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
     """寻路到目标区域. 检测不到位置、或者移动卡住, 都不放弃, 一直重试
     (脱困后重新规划路径)直到真的到达/玩家死亡/进了菜单为止。
@@ -642,6 +1072,13 @@ def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
     """
     retry_count = 0
     no_progress = 0
+    # 先装 canvas hook 再读第一次位置: 刚进游戏时钩子还没装(装钩子只在刷怪索敌扫描里), 位置只能退回截图
+    # 认小地图金点 —— 小地图大小跟 300x300 的假设对不上时读出个假坐标(录像里每次都是 (250,45)), 路径从假起点
+    # 规划, 人往错的方向走了 10 秒才卡住。装不上(页面在重载 / CDP 抖)就照旧退回截图, 不能拦住寻路。
+    try:
+        cdp_bridge.inject_canvas_hook()
+    except Exception:
+        pass
 
     while True:
         if deadline is not None and time.time() >= deadline:
@@ -684,6 +1121,7 @@ def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
             # 认出玩家标记(截图抖动之类), 单纯重试.
             retry_count += 1
             print(f"⚠️ 无法检测玩家位置，持续重试中 (第{retry_count}次)...")
+            _report_unreadable_position(retry_count)
             # 只在小状态框 + 控制台/GUI 日志里提示 —— 以前 retry_count>7 会弹一个
             # 屏幕正中央的大号黄色警告窗, 结果那个窗盖住了小地图, get_player_position()
             # 截图截到的是警告窗本身, 位置永远认不回来, 警告窗也就再也不消失. 死循环.
@@ -720,11 +1158,16 @@ def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
 
         print(f"✅ 找到路径，共 {len(path)} 个点")
         overlay.update(message=f"找到路径, 共{len(path)}个点")
-        def _inside(here):
-            return bool(area) and here is not None and if_in_area(area, here)
+        entry_area = _inset_areas(area, AREA_ENTRY_MARGIN) if area else area
 
-        stat = execute_path(path, stop_when=_inside, binary_map=binary_map,
-                            enemy_watch=enemy_watch, deadline=deadline)
+        def _inside(here):
+            # 进区就收手要往里再走 AREA_ENTRY_MARGIN 格: 贴着边界收手, 惯性(工厂区外跑图装 12 格/秒)
+            # 一滑就出区, 「离开刷怪区域 -> 重新寻路回去」每 25 秒一轮(2026-10-11 录像 8 轮/200 秒)。
+            return bool(entry_area) and here is not None and if_in_area(entry_area, here)
+
+        stat = (follow_path if _use_pursuit() else execute_path)(
+            path, stop_when=_inside, binary_map=binary_map,
+            enemy_watch=enemy_watch, deadline=deadline)
         if stat == "enemy":
             _flee_while_pathing(enemy_watch)
             continue
@@ -778,6 +1221,23 @@ def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
             print("📋 玩家在菜单中")
             overlay.update(state="菜单中")
             return False
+
+
+AREA_ENTRY_MARGIN = 4
+AREA_INSET_MIN_SIZE = 30     # 只缩真正的刷怪区(任一边 >= 这么大); 传送点的到达框只有 10x10, 缩了就改了进场行为
+
+
+def _inset_areas(areas, margin):
+    """每个矩形四边各往里缩 margin 格; 小矩形(传送点到达框这种)原样保留。"""
+    out = []
+    for (x1, y1), (x2, y2) in areas:
+        lo_x, hi_x = min(x1, x2), max(x1, x2)
+        lo_y, hi_y = min(y1, y2), max(y1, y2)
+        if hi_x - lo_x >= AREA_INSET_MIN_SIZE and hi_y - lo_y >= AREA_INSET_MIN_SIZE:
+            out.append(((lo_x + margin, lo_y + margin), (hi_x - margin, hi_y - margin)))
+        else:
+            out.append(((lo_x, lo_y), (hi_x, hi_y)))
+    return out
 
 
 def random_walkable_point(area, binary_map, max_tries=20):
@@ -1142,6 +1602,236 @@ def _nearest_inside(farming_area, pos, binary_map, inset=ARRIVE_RADIUS + 3):
     return None
 
 
+# ── 迷宫图(工厂)寻怪 ─────────────────────────────────────────────────────────────
+# 2026-10-09 三份工厂录像: 刷怪区里 98% 的拍子屏幕上都有怪, 决策却有一半时间是漫游 —— 其中 2/3 是最近的
+# 可打怪在 300~600px、小地图上直线隔着墙(can_reach 说走不到, select_action 就不追, 老逻辑这么设计是怕
+# 追过去顶墙)。漫游目标又是整个 161x71 区域里的随机可走点(三间房, 里面还有 U 形墙), 一条直线走过去顶
+# 墙, 一局 15 次"移动受阻 / 地图脱困", 人被一次次推回入口那条走廊。
+#   - 看得见却隔墙的怪: 在可走图上 BFS 一条路, 鼠标朝路上"从这里直线看得到的最远点"推(绕过去), 够近的才去。
+#   - 漫游: 目标挑"路径 10~35 格内够得着"的点, 一腿一腿朝路径上的看得见的点走, 到了才换下一个。
+# 只给迷宫图开(开阔图的直线漫游没这个毛病, 不动它)。
+MAZE_SEEK_MAPS = ("factory",)
+# 2026-10-10 苏州用户的沙漠日志: 沙漠这张图本身不都是开阔的 —— 他的刷怪区是一条贴着墙拐来拐去的南北向走廊,
+# 4.2 万秒刷怪里「原地打转判定卡住」2289 次(77% 的漫游腿以卡住收场)、「20次尝试后仍未到达」264 次, 人几乎
+# 全程待在区域最上头的路口。所以沙漠**按刷怪区的形状**决定: 区里随机两个可走点直线看得见的比例低于
+# CORRIDOR_LOS_MAX 就是走廊形、走上面那套; 开阔的沙漠区照旧。别的图(花园 / 海洋 / 丛林 / 下水道 / 蚁穴)
+# 没有日志证据, 先不动 —— 有了同样的症状再加进 CORRIDOR_AREA_MAPS。
+CORRIDOR_AREA_MAPS = ("desert",)
+CORRIDOR_LOS_MAX = 0.9          # 实测: 他的走廊区 0.67~0.70, 沙漠两块大空地 0.96~1.0, 地图上方长走廊带 0.4
+CORRIDOR_SAMPLE_PAIRS = 600
+PATH_APPROACH_MAX_CELLS = 22     # 绕路去追的路径上限(格, 工厂一格 ~160 世界单位, 22 格 ~ 10 秒的路)
+PATH_APPROACH_MAX_PX = 1100      # 只考虑屏幕上这个半径内的怪
+APPROACH_BLOCK_S = 15.0          # 绕路途中卡住了, 这么久之内不再绕路(免得对着一面墙反复撞)
+WANDER_GOAL_MIN_CELLS = 10       # 漫游目标离这里至少这么多格的路(太近等于原地踏步)
+WANDER_GOAL_MAX_CELLS = 35
+WANDER_GOAL_TIMEOUT_S = 30.0     # 一个漫游目标走了这么久还没到就换(路上被怪拖住 / 路径被挤偏)
+_BFS_STEPS = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1))
+
+
+def _walkable_near(binary_map, cell, radius=2):
+    """cell 本身可走就是它, 否则取 radius 格内离它最近的可走格; 没有返回 None。"""
+    x, y = int(cell[0]), int(cell[1])
+    h, w = binary_map.shape[:2]
+    best = None
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < w and 0 <= ny < h and binary_map[ny][nx] == 255:
+                d = dx * dx + dy * dy
+                if best is None or d < best[0]:
+                    best = (d, (nx, ny))
+    return None if best is None else best[1]
+
+
+def _area_bounds(area):
+    """[(x1,y1),(x2,y2)](不要求谁大谁小)-> (xmin, ymin, xmax, ymax), 给 _bfs_reach 当边界。"""
+    (ax, ay), (bx, by) = area
+    return (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+
+
+def _bfs_reach(binary_map, start, max_cells, bounds=None):
+    """从 start 在可走图(255)上 8 连通 BFS, 最远走 max_cells 步。返回 (dist, parent):
+    dist[cell] = 步数, parent[cell] = 上一格(起点是 None)。_steer_point 同一套邻接。
+    bounds=(xmin, ymin, xmax, ymax): 只在这个矩形里扩展(起点在外面也行, 只是不往外走)。
+    绕路 / 漫游传刷怪区 —— 区外一格常常是另一条走廊, 路径穿出去就触发「离开刷怪区域」。"""
+    h, w = binary_map.shape[:2]
+    dist, parent = {start: 0}, {start: None}
+    queue = collections.deque([start])
+    while queue:
+        cx, cy = queue.popleft()
+        d = dist[(cx, cy)]
+        if d >= max_cells:
+            continue
+        for dx, dy in _BFS_STEPS:
+            nxt = (cx + dx, cy + dy)
+            if bounds is not None and not (bounds[0] <= nxt[0] <= bounds[2]
+                                           and bounds[1] <= nxt[1] <= bounds[3]):
+                continue
+            if nxt not in dist and 0 <= nxt[0] < w and 0 <= nxt[1] < h \
+                    and binary_map[nxt[1]][nxt[0]] == 255:
+                dist[nxt] = d + 1
+                parent[nxt] = (cx, cy)
+                queue.append(nxt)
+    return dist, parent
+
+
+def _route_waypoint(binary_map, here, parent, goal):
+    """路径(start..goal)上, 从 here 直线看得到的**最远**那个点 —— 朝它推不会顶墙(跟 _steer_point
+    同一个挑法, 那个自己做 BFS 且不限路长)。"""
+    route = []
+    node = goal
+    while node is not None:
+        route.append(node)
+        node = parent[node]
+    for node in route:                       # goal -> start, 第一个看得到的就是最远的
+        if node != here and line_of_sight(binary_map, _Pt(*here), _Pt(*node)):
+            return node
+    return route[-2] if len(route) > 1 else goal
+
+
+def _plan_path_approach(detections, here, binary_map, area, *, max_cells=None, max_px=None, center=None):
+    """屏幕上有可打的怪、但小地图上直线隔着墙(select_action 因此交回漫游)时, 沿可走路径绕过去。
+    返回 {"target": 那只怪, "goal": 它所在的可走格, "waypoint": 现在该朝哪推, "cells": 路径格数} 或 None。
+
+    候选: 非 AVOID、置信度够、在刷怪区里、在屏幕 max_px 内。挑 路径格数 × 物种代价 最小的(桶这种
+    "最后才打"的代价高); 路径超过 max_cells 的不去 —— 那是隔着一整面墙, 走过去的功夫够打别的怪。"""
+    max_cells = PATH_APPROACH_MAX_CELLS if max_cells is None else max_cells
+    max_px = PATH_APPROACH_MAX_PX if max_px is None else max_px
+    s = utils.MINIMAP_WORLD_SCALE.get(utils.MAP)
+    if s is None or binary_map is None or here is None or not detections:
+        return None
+    center = center or enemy_detect.current_center()
+    inside = _in_farm_area(area)
+    cands = []
+    for d in detections:
+        if enemy_detect.classify_action(d["species"], d["rarity"]) == "AVOID":
+            continue
+        if d.get("confidence", 1.0) < CHASE_MIN_CONF:
+            continue
+        w = d.get("world")
+        if w is None:
+            continue
+        sx, sy = d["screen_pos"]
+        if math.hypot(sx - center[0], sy - center[1]) > max_px:
+            continue
+        if inside is not None and not inside(d):
+            continue
+        cands.append((d, (round(s * (w[0] + 1000.0)), round(s * (w[1] + 1000.0)))))
+    if not cands:
+        return None
+    start = _walkable_near(binary_map, (round(here[0]), round(here[1])))
+    if start is None:
+        return None
+    dist, parent = _bfs_reach(binary_map, start, max_cells, bounds=_area_bounds(area))
+    best = None
+    for d, cell in cands:
+        goal = _walkable_near(binary_map, cell)
+        if goal is None or goal not in dist or dist[goal] == 0:
+            continue
+        score = dist[goal] * enemy_detect.cost_for(d["species"])
+        if best is None or score < best[0]:
+            best = (score, d, goal)
+    if best is None:
+        return None
+    _, target, goal = best
+    return {"target": target, "goal": goal, "cells": dist[goal],
+            "waypoint": _route_waypoint(binary_map, start, parent, goal)}
+
+
+def _aim_mouse(center, here, waypoint):
+    """鼠标朝 waypoint 推: 从玩家在屏幕上的位置出发, 方向 = 小地图上 here -> waypoint, 推多远跟
+    move_to_position 一个公式(离得越远推得越远, 限在 50~500 像素)。"""
+    dx, dy = waypoint[0] - here[0], waypoint[1] - here[1]
+    d = math.hypot(dx, dy)
+    if d == 0:
+        return center
+    extend = max(min(d * 45, 500), 50) * mouse_scale()
+    return clamp_to_screen(center[0] + extend * dx / d, center[1] + extend * dy / d)
+
+
+def _area_is_corridor(binary_map, area, pairs=CORRIDOR_SAMPLE_PAIRS):
+    """刷怪区是不是走廊形: 区里随机取 pairs 对可走点, 直线看得见的比例低于 CORRIDOR_LOS_MAX。
+    固定随机种子(同一张图同一个区每次算出同一个结论, 不会一局里忽开忽关)。输入不全 -> False。"""
+    try:
+        x1, y1, x2, y2 = _area_bounds(area)
+        h, w = binary_map.shape[:2]
+    except (AttributeError, TypeError, ValueError):
+        return False            # 地图不是 ndarray / 区域不是两个角: 判断不了就当不是走廊(老行为), 别抛
+    cells = [(x, y) for y in range(max(0, y1), min(h - 1, y2) + 1)
+             for x in range(max(0, x1), min(w - 1, x2) + 1) if binary_map[y][x] == 255]
+    if len(cells) < 2:
+        return False
+    rng = random.Random(0)
+    seen = sum(1 for _ in range(pairs)
+               if line_of_sight(binary_map, _Pt(*rng.choice(cells)), _Pt(*rng.choice(cells))))
+    return seen / pairs < CORRIDOR_LOS_MAX
+
+
+def _use_maze_seek(binary_map, area, enemy_ai_enabled):
+    """这一轮刷怪要不要走迷宫寻怪(路径绕墙追怪 + 路径漫游): 索敌开着、有地图图, 并且是迷宫图(工厂),
+    或者沙漠里走廊形的刷怪区。"""
+    if not (enemy_ai_enabled and binary_map is not None):
+        return False
+    if utils.MAP in MAZE_SEEK_MAPS:
+        return True
+    return utils.MAP in CORRIDOR_AREA_MAPS and _area_is_corridor(binary_map, area)
+
+
+def _pick_wander_goal(binary_map, here, area, rng=random):
+    """迷宫图漫游目标: 刷怪区里、路径 WANDER_GOAL_MIN_CELLS~MAX_CELLS 格内**走得到**的随机一格。没有 -> None。"""
+    start = _walkable_near(binary_map, (round(here[0]), round(here[1])))
+    if start is None:
+        return None
+    dist, _ = _bfs_reach(binary_map, start, WANDER_GOAL_MAX_CELLS, bounds=_area_bounds(area))
+    cells = [c for c, d in dist.items() if d >= WANDER_GOAL_MIN_CELLS]
+    return rng.choice(cells) if cells else None
+
+
+def _wander_waypoint(binary_map, here, goal, area):
+    """漫游目标 goal 在**刷怪区内**的路径上, 现在该朝哪推。走不到(区内没路 / 超出搜索范围)返回 None, 调用方换目标。"""
+    start = _walkable_near(binary_map, (round(here[0]), round(here[1])))
+    if start is None:
+        return None
+    dist, parent = _bfs_reach(binary_map, start, WANDER_GOAL_MAX_CELLS + 15, bounds=_area_bounds(area))
+    if goal not in dist:
+        return None
+    if dist[goal] == 0:
+        return goal
+    return _route_waypoint(binary_map, start, parent, goal)
+
+
+def _nearest_reachable_inside(farming_area, pos, binary_map, margin=2, limit=4000):
+    """离开刷怪区域后回哪儿: 从 pos 在可走图上按路径远近 BFS, 取第一个落在区域内(离边界至少 margin 格)且
+    离 pos 够远(不在 ARRIVE_RADIUS 内 —— 否则一个 moveTo 都不发就"到了")的可走格。_nearest_inside 夹出来的
+    点是墙时用它, 不能再退回区域**中心**: 迷宫图里中心也可能是墙、或者从这儿走不到
+    (2026-10-10 工厂: 人在 (143,99), 中心 (119,61) 是墙, 寻路 18 秒后「路径规划失败」整轮报废)。
+    没有可走到的区内格 -> None。"""
+    if binary_map is None or pos is None:
+        return None
+    start = _walkable_near(binary_map, (round(pos[0]), round(pos[1])))
+    if start is None:
+        return None
+    x1, y1, x2, y2 = _area_bounds(farming_area)
+    mx, my = min(margin, (x2 - x1) // 2), min(margin, (y2 - y1) // 2)
+    h, w = binary_map.shape[:2]
+    dist = {start: 0}
+    queue = collections.deque([start])
+    first_inside = None
+    while queue and len(dist) < limit:
+        c = queue.popleft()
+        if x1 + mx <= c[0] <= x2 - mx and y1 + my <= c[1] <= y2 - my:
+            if math.hypot(c[0] - pos[0], c[1] - pos[1]) > ARRIVE_RADIUS:
+                return c
+            if first_inside is None:
+                first_inside = c
+        for dx, dy in _BFS_STEPS:
+            nxt = (c[0] + dx, c[1] + dy)
+            if nxt not in dist and 0 <= nxt[0] < w and 0 <= nxt[1] < h and binary_map[nxt[1]][nxt[0]] == 255:
+                dist[nxt] = dist[c] + 1
+                queue.append(nxt)
+    return first_inside
+
+
 FARM_SCREEN_CHECK_S = 0.5     # 刷怪时截图查死亡/开局画面的间隔(以前每拍两张截图)
 FARM_TIMING_LOG_S = 30.0      # 刷怪主循环耗时分解, 隔这么久打一行
 
@@ -1219,6 +1909,12 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
     mythic_latch = False
     mythic_misses = 0
     mythic_target_pos = None   # 上一 tick 锁定 Mythic 的屏幕坐标, 给 pick_mythic_target 做连续性
+    # 迷宫图(工厂)寻怪: 见 MAZE_SEEK_MAPS 上面那段说明
+    maze_seek = _use_maze_seek(binary_map, farming_area, enemy_ai_enabled)
+    wander_goal = None
+    wander_goal_since = 0.0
+    approach_block_until = 0.0
+    approach_logged = None
 
     def _wander_enemy_watch(_pos):
         """move_to_position 的 on_tick 钩子: wander 腿途中做一次(节流的)索敌, 需要
@@ -1238,6 +1934,9 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
                     engage_px=MYTHIC_ENGAGE_PX, release_px=MYTHIC_RELEASE_PX,
                     chase_min_conf=CHASE_MIN_CONF, prev_pos=mythic_target_pos) is not None):
             return "enemy"
+        if (maze_seek and enemy_decision[0] == "wander" and time.time() >= approach_block_until
+                and _plan_path_approach(detections, _pos, binary_map, farming_area) is not None):
+            return "enemy"          # 漫游途中看到隔墙的怪: 停下这一腿, 外层去绕路
         return None
 
     clock = _LoopClock()
@@ -1289,9 +1988,10 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
             overlay.update(state="离开刷怪区域", pos=current_pos, message="重新寻路回去")
             # 回**最近的边内点**, 不是区域中心 —— 飘出一格也要横穿半张区域(用户
             # 2026-09-25)。落在墙上时退回中心。
-            target = _nearest_inside(farming_area, current_pos, binary_map) or (
-                (farming_area[0][0] + farming_area[1][0]) // 2,
-                (farming_area[0][1] + farming_area[1][1]) // 2)
+            target = (_nearest_inside(farming_area, current_pos, binary_map)
+                      or _nearest_reachable_inside(farming_area, current_pos, binary_map)
+                      or ((farming_area[0][0] + farming_area[1][0]) // 2,
+                          (farming_area[0][1] + farming_area[1][1]) // 2))
             if not lazy_theta_pathing(target, [farming_area],
                                       enemy_watch=_PathingEnemyWatch() if enemy_ai_enabled else None):
                 print("❌ 无法回到刷怪区域")
@@ -1379,10 +2079,61 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
                                    track_stall=not enemy_detect.stall_exempt_for(target["species"]))
             continue
 
+        # 4.5) 迷宫图: 屏幕上有可打的怪但直线隔着墙(上面 select_action 因此交回漫游) —— 沿可走路径绕过去.
+        if maze_seek and time.time() >= approach_block_until:
+            plan = _plan_path_approach(detections, current_pos, binary_map, farming_area)
+            if plan is not None:
+                wander_goal = None
+                center = enemy_detect.current_center()
+                tgt = plan["target"]
+                if approach_logged != (tgt["species"], tgt["rarity"]):
+                    approach_logged = (tgt["species"], tgt["rarity"])
+                    print(f"🧱 {tgt['species']}({tgt['rarity']}) 隔着墙, 沿路径绕过去(约 {plan['cells']} 格)")
+                outcome = _drive_and_check_stall(
+                    _aim_mouse(center, current_pos, plan["waypoint"]), current_pos, chase_pos_history,
+                    "索敌中", f"绕过墙去 {tgt['species']}({tgt['rarity']}), 约 {plan['cells']} 格",
+                    center=center)
+                if outcome == "stuck":
+                    approach_block_until = time.time() + APPROACH_BLOCK_S
+                continue
+            approach_logged = None
+
         # 5) enemy_action == "wander": 没有可打/需规避的目标, 随机漫游.
         tick_wander = True
+        if maze_seek:
+            # 迷宫图: 目标挑刷怪区内"路径够得着"的点, 每拍朝路径上看得到的最远点推鼠标(跟绕路同一套),
+            # 到了(或太久没到 / 走不到 / 卡住)才换。不用 move_to_position 逐段 hop: 走廊一拐弯路点就落在
+            # ARRIVE_RADIUS 以内, 它认为到了、一个 moveTo 都不发, 人站着不动(2026-10-10 实机, 每轮白站 30~100 秒)。
+            if wander_goal is not None and (
+                    math.hypot(wander_goal[0] - current_pos[0], wander_goal[1] - current_pos[1]) <= ARRIVE_RADIUS
+                    or time.time() - wander_goal_since > WANDER_GOAL_TIMEOUT_S):
+                wander_goal = None
+            wander_wp = None
+            if wander_goal is not None:
+                wander_wp = _wander_waypoint(binary_map, current_pos, wander_goal, farming_area)
+                if wander_wp is None:
+                    wander_goal = None          # 区内走不到了(被挤出路径 / 区域边缘), 换个
+            if wander_goal is None:
+                wander_goal = _pick_wander_goal(binary_map, current_pos, farming_area)
+                wander_goal_since = time.time()
+                chase_pos_history.clear()
+                if wander_goal is not None:
+                    print(f"🚶 移动到 ({wander_goal[0]}, {wander_goal[1]})")
+                    wander_wp = _wander_waypoint(binary_map, current_pos, wander_goal, farming_area)
+            if wander_goal is not None and wander_wp is not None:
+                center = enemy_detect.current_center()
+                overlay.update(state="刷怪中", pos=current_pos, target=wander_goal,
+                               message=f"持续走动中 (第{move_count + 1}次)")
+                outcome = _drive_and_check_stall(
+                    _aim_mouse(center, current_pos, wander_wp), current_pos, chase_pos_history,
+                    "刷怪中", f"走向 {wander_goal}", center=center)
+                if outcome == "stuck":
+                    wander_goal = None          # 这条路走不通, 脱困完换个目标
+                continue
+            wander_goal = None                  # 区内没有够得着的目标: 退回老的随机漫游
         chase_pos_history.clear()
         random_x, random_y = random_walkable_point(farming_area, binary_map)
+        leg_target = (random_x, random_y)
 
         # 移动到目标点 —— 到了立刻挑下一个点接着走, 不暂停.
         print(f"🚶 移动到 ({random_x}, {random_y})")
@@ -1390,7 +2141,7 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
         # max_attempts=20 (≈1s worst case at time.sleep(0.05)每tick) 而不是默认的
         # 200(≈10s) —— 让外层循环更频繁拿回控制权重新索敌扫描, 见下面ENEMY_SCAN_INTERVAL
         # 的注释.
-        move_result = move_to_position(current_pos, (random_x, random_y),
+        move_result = move_to_position(current_pos, leg_target,
                                        max_attempts=20, on_tick=_wander_enemy_watch)
 
         if move_result == "enemy":
@@ -1400,6 +2151,7 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
         if move_result == "stuck":
             print("⚠️ 移动受阻, 脱困一下...")
             overlay.update(state="卡住", message="脱困中")
+            wander_goal = None          # 这条路走不通, 脱困完换个目标
             execute_anti_stuck()
         elif move_result in ["in_game_dead", "in_menu"]:
             print(f"⚠️ 游戏状态变化: {move_result}")
@@ -1761,29 +2513,50 @@ class _StageState:
     读得到服务器号时这个猜测每圈都会被 florr_server.current_map_name() 覆盖;
     读不到(探针没装 / CDP 抖 / 反查接口挂了)时它就是唯一依据。
     转移规则来自实机确认过的事实: 从标题页进场 = 回到第一段; 踩过传送点 = 推进
-    一段; 换服务器 = 回到第一段; **死亡重生不变**(蚁穴里死了还在蚁穴)。
+    一段; 换服务器 = 回到第一段; **死亡重生不变**(蚁穴/工厂里死了还在原图的检查点) ——
+    主循环在「点继续 -> 点开始」那一路上不 reset(见 respawn_in_place)。
     """
 
     def __init__(self, route):
         self._route = route
         self._index = 0
+        self._carried = False
 
     @property
     def map_name(self):
         return self._route.stages[self._index].map_name
 
+    @property
+    def carried(self):
+        """这个阶段是从上一命带过来的(死亡重生留在原图, 见 carry())吗。"""
+        return self._carried
+
+    def carry(self):
+        """死亡 -> 点继续 -> 点开始: 重生在原图的检查点, 阶段不变, 并且记下"这是带过来的, 不是乐观推进猜的"。"""
+        self._carried = True
+
     def advance(self):
+        self._carried = False
         self._index = min(self._index + 1, len(self._route.stages) - 1)
+
+    def past(self, map_name):
+        """猜测已经走到了 map_name 那一段**之后**吗(map_name 不在路线上 -> False)。"""
+        for i, stage in enumerate(self._route.stages):
+            if stage.map_name == map_name:
+                return i < self._index
+        return False
 
     def sync_to(self, map_name):
         """人实际在 map_name 上(画布区域名读出来的) —— 把猜测对齐过去. 不在路线上就不动."""
         for i, stage in enumerate(self._route.stages):
             if stage.map_name == map_name:
                 self._index = i
+                self._carried = False
                 return
 
     def reset(self):
         self._index = 0
+        self._carried = False
 
 
 # 跟仓库一起发的寻路图(git ls-files maps/): 不是 capture_map.py 采出来的, 缺了要
@@ -1829,7 +2602,7 @@ def _route_blocker(route):
     return None
 
 
-PORTAL_SWITCH_TIMEOUT = 90.0   # 从蚁穴出生点走到回花园那个门的预算(出生点离它只有 ~6 格)
+PORTAL_SWITCH_TIMEOUT = 90.0   # 默认预算: 从蚁穴出生点走到回花园那个门(出生点离它只有 ~6 格); 各图的预算见 map_routes.SWITCH_DOORS
 PORTAL_STAGING_MIN_PX = 3      # 先走到离门这么多格的可走点, 再按光效贴上去 —— 寻路走得太近
                                # 会在 lazy_theta_pathing 里就蹭上门传送走, 错过换服的时机
 
@@ -1838,10 +2611,10 @@ PORTAL_DIRECT_PX = 12          # 离门这么近(小地图格)就不寻路到集
 
 
 def _portal_switch_target(w):
-    """这个时块换服时要不要走"传送门换服": 只有蚁穴(回花园的门)。其余图 -> None。"""
-    if w.get("map_name") == "anthell":
-        return map_routes.ANTHELL_TO_GARDEN_PORTAL
-    return None
+    """这个时块换服时要不要走"传送门换服": 蚁穴(回花园的门)和工厂(回花园的门, 在出生点旁边)。其余图 -> None。
+    返回门的小地图格; 世界坐标 / 预算见 map_routes.SWITCH_DOORS。"""
+    door = map_routes.SWITCH_DOORS.get(w.get("map_name"))
+    return door.cell if door is not None else None
 
 
 # 走进门: "点一下 -> 松手滑停 -> 量 -> 再点一下"。
@@ -2061,7 +2834,7 @@ def _portal_staging_point(binary_map, portal, min_px=PORTAL_STAGING_MIN_PX, sear
     return best[1] if best else calibrate_player(binary_map, portal)
 
 
-def _switch_server_via_portal(biome, portal, enemy_watch=None, timeout=PORTAL_SWITCH_TIMEOUT,
+def _switch_server_via_portal(biome, portal, enemy_watch=None, timeout=None,
                               want_defense=None):
     """走进蚁穴回花园的传送门, 传送(黑屏)那一下换服 —— 用户 2026-09-28 给的技巧: 这样
     新服务器里出生点还在蚁穴, 不用从花园重新走进来(录像里直接换服每次多走 2 分多钟)。
@@ -2072,12 +2845,15 @@ def _switch_server_via_portal(biome, portal, enemy_watch=None, timeout=PORTAL_SW
 
     返回 True = 已经在传送途中换了服; False = 没走到 / 没传送上 / 死了, 调用方退回直接换服。
     最坏情况(时机没卡上)就是落回花园, 跟直接换服一样, 进场路线会接着走。"""
+    door = map_routes.door_for_cell(portal)
+    if timeout is None:
+        timeout = door.timeout if door is not None else PORTAL_SWITCH_TIMEOUT
     deadline = time.time() + timeout
     binary_map = load_binary_map()
     if binary_map is None:
         return False
     staging = _portal_staging_point(binary_map, portal)
-    print(f"🚪 蚁穴换服: 走进回花园的传送门 {portal}, 传送时换服(出生点不重置)")
+    print(f"🚪 {utils.MAP or '这张图'}换服: 走进回花园的传送门 {portal}, 传送时换服(出生点不重置)")
     overlay.update(state="换服务器", target=portal, message="走到回花园的传送门, 传送时换服")
     defense_off = False
     switched = False
@@ -2094,10 +2870,10 @@ def _switch_server_via_portal(biome, portal, enemy_watch=None, timeout=PORTAL_SW
                 return False
         if on_death_screen() or on_start_screen():
             return False
-        portal_world = (map_routes.ANTHELL_TO_GARDEN_PORTAL_WORLD
-                        if portal == map_routes.ANTHELL_TO_GARDEN_PORTAL else None)
-        if portal_world is None:
+        door = map_routes.door_for_cell(portal)
+        if door is None:
             return False
+        portal_world = door.world
         switched = _walk_into_portal(portal_world, biome, deadline)
         return switched
     finally:
@@ -2199,6 +2975,13 @@ def _run_entry_route(route, stage_state, timeout=ENTRY_ROUTE_TIMEOUT, want_defen
                     # 缩放比又都读不出 —— 刚确认过传送走了, 信阶段状态, 别拿花园的路线去走新图的墙。
                     current = stage_state.map_name
                     hopped = False
+                elif stage_state.carried and stage_state.past(current):
+                    # 同一个道理, 但只对"死亡重生带过来的阶段"(主循环 carry()): 蚁穴/下水道/工厂都跑在花园
+                    # 那台服务器上, 服务器号永远只会说"花园", 分不出人是在花园还是在后面的图里。
+                    # 2026-10-11 实机(1024x768): 工厂里死了重生(还在工厂检查点), 区域名读不到,
+                    # 服务器号说花园 -> 拿花园的图在工厂里走 180 秒, 一次死亡白丢 2-3 分钟。
+                    # 乐观推进猜的阶段(没带过来的)不走这条: 那种猜测可能是假的, 服务器号说了算。
+                    current = stage_state.map_name
             if current == route.final_map:
                 apply_map(current)
                 return "arrived"
@@ -2502,6 +3285,7 @@ def run_worker(cfg):
     #     又给它拉回去.
     global overlay
     overlay = create_overlay()
+    keep_awake.start()   # 无人值守别让显示器休眠 / 进屏保(见 keep_awake 的说明)
 
     # bot 自己不按攻击键, 靠 florr 的「反转攻击键」持续输出;「反转防御键」是对称的
     # 可选项. florr 每次从菜单进局都会从账号数据重载设置、把这两个字节盖回原值 ——
@@ -2563,6 +3347,16 @@ def run_worker(cfg):
     # worker 启动后第一次进开局菜单时点一次, 后续每次重生(回到开局菜单)都不再点
     # (florr 死亡/重生会留在同一台服务器 = 同生态区, 不点也不会跑去别的生态区).
     biome_selected = False
+    # 死了 -> 点继续 -> 点开始 重生在**原图的检查点**(蚁穴/工厂里死了还在蚁穴/工厂), 不是花园出生点;
+    # 只有从标题页冷启动 / 换服务器才是从路线第一段(花园)重新走。这个旗标管"点开始时要不要把
+    # 阶段状态 reset": 原来一律 reset, 重生后全靠画布区域名把状态纠回来, 区域名读不到的分辨率下
+    # (见 canvas_hook.js 的 ZONE_TEXTS)就拿花园的图在工厂里走满 180 秒。
+    respawn_in_place = False
+    # 跑路装(进游戏时换上的 loadout)是不是还穿着、没换回输出装。到刷怪区才换回, 所以只要某一轮
+    # 换上了却没走到区(路径规划失败 / 被传去别的图 / 进场被打断 —— 人都没死), 这个标记就一直留到
+    # 真的到区那一轮。原来的门只看"这一轮是不是刚进游戏"(swap_this_round), 人没死的下一轮它是
+    # 假的 —— 到了区也不换回, 花朵穿着跑路装刷到下次死(2026-10-11 粉丝反馈)。
+    run_gear_on = False
     while True:
         round_count += 1
         round_start_time = time.time()
@@ -2592,6 +3386,7 @@ def run_worker(cfg):
                 overlay.update(state="重新开始", message="死亡, 点击继续...")
                 click_continue_after_death()
                 entered_game = True
+                respawn_in_place = True
                 time.sleep(2)
         if on_start_screen():
             print("🔁 检测到开局菜单, 点击开始按钮进入游戏...")
@@ -2618,7 +3413,11 @@ def run_worker(cfg):
             # 第五份录像复活后朝那边走了 6 秒, 从传送门旁边走出去 1000 多单位。归中 = 原地等。
             keyup("w")
             entered_game = True
-            stage_state.reset()   # 从标题页重新进场 = 回到路线第一段(蚁穴 -> 花园)
+            if respawn_in_place:
+                stage_state.carry()   # 死亡重生留在原图(检查点): 阶段不动(见上面的说明)
+            else:
+                stage_state.reset()   # 从标题页重新进场 = 回到路线第一段(蚁穴 -> 花园)
+            respawn_in_place = False
             time.sleep(3)
 
         # 进游戏了(或本来就在局内): florr 刚才可能从账号数据把「反转攻击键 /
@@ -2633,6 +3432,7 @@ def run_worker(cfg):
         swap_this_round = entered_game or round_count == 1
         if swap_this_round:
             loadout_swap.press_swap(w["enter_game_swap"])
+            run_gear_on = True
 
         # 蚁穴这类"标题页选不到、得先进花园再踩洞口传送"的图: 先把进场路线跑完,
         # 人真的落在刷怪那张图上再开始寻路。单图路线(花园/沙漠/海洋/丛林)这里第一圈就
@@ -2712,10 +3512,14 @@ def run_worker(cfg):
                     enemy_watch=_PathingEnemyWatch() if w["enemy_ai_enabled"] else None)
         if reached_farm:
             print("✅ 到达刷怪区域！")
-            # 到刷怪区了: 按配置的键切到"输出" loadout. 跟 enter swap 同一道 gate ——
-            # 存活续命轮 florr 没重置 loadout, 不重按.
-            if swap_this_round:
+            # 用最终那张图的墙规划出了路并走进了刷怪区 = 人确实在这张图上。下一轮(没死接着刷 / 死了重生
+            # 都留在原图)区域名读不出时服务器号只会说"花园", 靠这个标记告诉进场路线别信它。
+            stage_state.carry()
+            # 到刷怪区了: 按配置的键切到"输出" loadout. 跟 enter swap 配对 —— 只有跑路装还穿着
+            # (run_gear_on)才按; 存活续命轮 florr 没重置 loadout、也没换过装, 不重按.
+            if run_gear_on:
                 loadout_swap.press_swap(w["reach_area_swap"])
+                run_gear_on = False
             with phase_marks.phase("farm"):         # 统计: auto_farming 里的时间(含就地复活)算「刷怪」
                 auto_farming(farming_area, farming_duration,
                              enemy_ai_enabled=w["enemy_ai_enabled"],
@@ -2791,11 +3595,11 @@ def run_worker(cfg):
                       f"(连续{consecutive_short_rounds}次)")
             if (w["auto_switch_server"]
                     and consecutive_short_rounds >= CONSECUTIVE_SHORT_ROUND_LIMIT):
-                # 只有这一轮人确实进了蚁穴(entry 到了)才走传送门; 卡在花园进不去(进场超时)
-                # 的用不上蚁穴的门, 照旧当场换 —— 不然那条"洞口进不去就换服"的自愈链路就断了。
+                # 只有这一轮人确实进了蚁穴 / 工厂(entry 到了)才走传送门; 卡在花园进不去(进场超时)
+                # 的用不上它们的门, 照旧当场换 —— 不然那条"洞口进不去就换服"的自愈链路就断了。
                 if _portal_switch_target(w) is not None and entry == "arrived":
                     print(f"🌐 累计{consecutive_short_rounds}次(死亡/没刷满), 换个服务器 —— "
-                          f"蚁穴: 先复活, 再走进回花园的传送门, 传送时换(出生点不重置)")
+                          f"{w.get('map_name')}: 先复活, 再走进回花园的传送门, 传送时换(出生点不重置)")
                     overlay.update(state="换服务器", message="复活后走传送门换服")
                     portal_switch_pending = True
                     consecutive_short_rounds = 0

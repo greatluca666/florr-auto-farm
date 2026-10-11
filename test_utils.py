@@ -1377,6 +1377,15 @@ def test_execute_anti_stuck_falls_back_to_random_when_the_map_is_unavailable(mon
     assert len(randoms) == 1      # 读不到地图 -> 退回原来的随机方向
 
 
+def test_execute_anti_stuck_does_not_walk_blind_when_the_position_is_unreadable(monkeypatch):
+    """工厂出生点离回花园的门只有几格, 位置读不到(传送刚落地的黑屏)时随机朝南 = 走进门被传回花园
+    (2026-10-11 录像, 白丢 1 分多钟)。没标定墙壁色的图上位置读不到就站着等, 不蒙着头乱走。"""
+    moves, randoms = _stub_escape_env(monkeypatch, map_name="factory",
+                                      binary_map=_room_and_corridor(), pos=None)
+    utils.execute_anti_stuck(duration=0.5)
+    assert randoms == [] and moves == []
+
+
 def test_execute_anti_stuck_leaves_calibrated_maps_on_the_old_path(monkeypatch):
     # 沙漠有标定墙壁色: 行为不变, 就算力度弱落进随机分支也不去碰地图脱困.
     moves, randoms = _stub_escape_env(monkeypatch, map_name="desert",
@@ -1618,3 +1627,107 @@ def test_canvas_minimap_scale_gives_up_quietly(monkeypatch, value):
         return value
     monkeypatch.setattr(utils.cdp_bridge, "_eval_value", ev)
     assert utils.canvas_minimap_scale() is None
+
+
+# ── 屏幕体检: "位置读不出来"时一行话说清屏幕截图是不是黑的 ────────────────────────────
+
+def _flat_screen(rgb, size=(64, 36)):
+    from PIL import Image
+    return Image.new("RGB", size, rgb)
+
+
+def test_screen_health_flags_an_all_black_capture(monkeypatch):
+    # 2026-10-08 第一份录像: 死后回到标题页, 开始按钮明明在, 屏幕检测连续 5 分钟啥也认不出来,
+    # 用户一动鼠标就好了 —— 当时没任何线索能分清"截图是黑的"还是"画面认不出来"。
+    monkeypatch.setattr(utils.pyautogui, "screenshot", lambda *a, **k: _flat_screen((0, 0, 0)))
+    summary, black = utils.screen_health()
+    assert black is True
+    assert "全黑" in summary
+
+
+def test_screen_health_passes_a_normal_screen(monkeypatch):
+    import numpy as np
+    from PIL import Image
+    noise = np.random.RandomState(0).randint(30, 220, (36, 64, 3), dtype=np.uint8)
+    monkeypatch.setattr(utils.pyautogui, "screenshot", lambda *a, **k: Image.fromarray(noise))
+    summary, black = utils.screen_health()
+    assert black is False
+    assert "全黑" not in summary and "亮度" in summary
+
+
+def test_screen_health_never_raises(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("screen grab failed")
+    monkeypatch.setattr(utils.pyautogui, "screenshot", boom)
+    summary, black = utils.screen_health()
+    assert black is True and "截图失败" in summary and "screen grab failed" in summary
+
+
+# ── 抓屏失败(锁屏 / 显示器休眠 / 远程桌面断开)不能把 worker 带崩 ────────────────────────
+# 2026-10-10 用户上报: 连挂 16 小时后 16:50 起读不到位置、Chrome 失联, 16:55 抓屏抛
+# OSError("screen grab failed"), 整个 worker 退出, 之后三个小时没人发现。
+
+class _FakeDesktop:
+    """抓屏替身: 前 fail_times 次抛 OSError(桌面不可用), 之后正常出图; 同时给 time.sleep /
+    time.monotonic 配一个假钟 —— sleep 不真睡, 只把假钟拨快。"""
+
+    def __init__(self, monkeypatch, fail_times, size=(300, 300)):
+        self.fail_times = fail_times
+        self.calls = 0
+        self.sleeps = []
+        self.now = 1000.0
+        self.size = size
+        monkeypatch.setattr(utils.pyautogui, "screenshot", self.screenshot)
+        monkeypatch.setattr(utils.time, "sleep", self.sleep)
+        monkeypatch.setattr(utils.time, "monotonic", lambda: self.now)
+
+    def screenshot(self, region=None):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise OSError("screen grab failed")
+        w, h = (region[2], region[3]) if region else self.size
+        return Image.new("RGB", (w, h), (10, 20, 30))
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_grab_screen_waits_out_an_unavailable_desktop_instead_of_raising(monkeypatch):
+    desktop = _FakeDesktop(monkeypatch, fail_times=3)
+    img = utils.grab_screen(region=[0, 0, 40, 30])
+    assert img.size == (40, 30)
+    assert desktop.calls == 4
+    assert len(desktop.sleeps) == 3 and all(s > 0 for s in desktop.sleeps)
+
+
+def test_grab_screen_without_a_region_grabs_the_whole_screen(monkeypatch):
+    _FakeDesktop(monkeypatch, fail_times=1, size=(64, 36))
+    assert utils.grab_screen().size == (64, 36)
+
+
+def test_grab_screen_does_not_swallow_other_errors(monkeypatch):
+    # 只有 OSError(抓屏本身失败)才等; 别的异常是真 bug, 要照常抛出来让人看见
+    def boom(region=None):
+        raise ValueError("bad region")
+    monkeypatch.setattr(utils.pyautogui, "screenshot", boom)
+    monkeypatch.setattr(utils.time, "sleep", lambda s: pytest.fail("不该等"))
+    with pytest.raises(ValueError):
+        utils.grab_screen(region=[0, 0, 1, 1])
+
+
+def test_grab_screen_logs_the_wait_once_then_sparsely_then_the_recovery(monkeypatch, capsys):
+    desktop = _FakeDesktop(monkeypatch, fail_times=100)      # 每次等 2 秒 ≈ 200 秒
+    utils.grab_screen(region=[0, 0, 4, 4])
+    out = capsys.readouterr().out
+    assert out.count("抓屏失败") == 1                         # 开头只说一次, 不刷屏
+    assert out.count("仍在等待") == 3                         # 之后约每 60 秒报一次: 60/120/180 秒
+    assert "抓屏恢复" in out and "screen grab failed" in out
+    assert desktop.calls == 101
+
+
+def test_get_map_survives_the_desktop_going_away(monkeypatch):
+    # 崩溃现场: get_player_position -> get_map -> pyautogui.screenshot 抛 OSError
+    _FakeDesktop(monkeypatch, fail_times=2)
+    image = utils.get_map()
+    assert image.shape[:2] == (300, 300)

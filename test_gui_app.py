@@ -264,6 +264,154 @@ def test_finish_ensure_afk_does_not_destroy_the_modal_on_the_spot():
     assert logged == ["AFK: started\n"]
 
 
+# ── AFK 手动安装: 自动下载失败(国内直连 GitHub 下不动)时的退路, 2026-10-10 北京用户要的 ──
+
+def test_manual_afk_install_does_nothing_when_no_file_was_chosen():
+    for chosen in ("", None):
+        assert gui_app.manual_afk_install(
+            chosen, install=lambda p: pytest.fail("没选文件不该安装"),
+            start=lambda: pytest.fail("没选文件不该启动")) == "cancelled"
+
+
+def test_manual_afk_install_does_not_start_anything_when_the_zip_is_rejected():
+    started = []
+    assert gui_app.manual_afk_install(
+        "x.zip", install=lambda p: False, start=lambda: started.append(1)) == "install_failed"
+    assert started == []
+
+
+def test_manual_afk_install_installs_the_chosen_zip_then_starts_it():
+    calls = []
+    outcome = gui_app.manual_afk_install(
+        "x.zip", install=lambda p: calls.append(("install", p)) or True,
+        start=lambda: calls.append(("start",)))
+    assert outcome == "installed" and calls == [("install", "x.zip"), ("start",)]
+
+
+def _afk_finish_app():
+    scheduled, offered, persisted = [], [], []
+    fake = type("App", (), {})()
+    fake._afk_busy = True
+    fake.afk_switch = type("Sw", (), {"configure": lambda _s, **k: None,
+                                      "select": lambda _s: persisted.append("select")})()
+    fake.after = lambda ms, fn: scheduled.append(fn)
+    fake._log_line = lambda t: None
+    fake._offer_manual_afk_install = lambda: offered.append(1)
+    fake._persist_afk = lambda enabled: persisted.append(("persist", enabled))
+    fake._explain_afk_install_failed = lambda: gui_app.App._explain_afk_install_failed(fake)
+    fake.persisted = persisted
+    return fake, scheduled, offered
+
+
+def test_a_failed_download_then_offers_the_manual_route():
+    fake, scheduled, offered = _afk_finish_app()
+    gui_app.App._finish_ensure_afk(fake, _FakeModal(), "download_failed")
+    for fn in scheduled:
+        fn()
+    assert offered == [1]
+
+
+def test_a_manual_install_that_worked_turns_the_afk_switch_on_and_remembers_it():
+    fake, _scheduled, _offered = _afk_finish_app()
+    gui_app.App._finish_ensure_afk(fake, _FakeModal(), "installed")
+    assert fake.persisted == ["select", ("persist", True)]
+
+
+@pytest.mark.parametrize("outcome", ["started", "downloaded", "download_failed", "install_failed",
+                                     "cancelled", "declined"])
+def test_only_a_successful_manual_install_flips_the_afk_setting(outcome):
+    fake, _scheduled, _offered = _afk_finish_app()
+    gui_app.App._finish_ensure_afk(fake, _FakeModal(), outcome)
+    assert fake.persisted == []
+
+
+def test_a_rejected_manual_zip_explains_why_instead_of_failing_silently(monkeypatch):
+    # 安装过程的细节只打在控制台(打包版没有控制台), 用户在界面上得看到原因和下一步
+    shown = []
+    fake, scheduled, offered = _afk_finish_app()
+    monkeypatch.setattr(gui_app.messagebox, "showerror",
+                        lambda title, text, **k: shown.append(text))
+    gui_app.App._finish_ensure_afk(fake, _FakeModal(), "install_failed")
+    for fn in scheduled:
+        fn()
+    assert offered == [] and len(shown) == 1
+    assert "校验" in shown[0] and gui_app.afk_watch._MIRROR_URL in shown[0]
+
+
+@pytest.mark.parametrize("outcome", ["started", "downloaded", "declined", "installed", "cancelled"])
+def test_other_outcomes_do_not_open_the_manual_route(outcome):
+    fake, scheduled, offered = _afk_finish_app()
+    gui_app.App._finish_ensure_afk(fake, _FakeModal(), outcome)
+    for fn in scheduled:
+        fn()
+    assert offered == []
+
+
+def test_the_offer_shows_the_steps_and_goes_to_the_file_picker_only_on_yes(monkeypatch):
+    shown, picked = [], []
+    fake = type("App", (), {})()
+    fake._manual_afk_install = lambda: picked.append(1)
+    monkeypatch.setattr(gui_app.messagebox, "askyesno",
+                        lambda title, text, **k: shown.append(text) or False)
+    gui_app.App._offer_manual_afk_install(fake)
+    assert picked == [] and gui_app.afk_watch._MIRROR_URL in shown[0]
+    monkeypatch.setattr(gui_app.messagebox, "askyesno", lambda title, text, **k: True)
+    gui_app.App._offer_manual_afk_install(fake)
+    assert picked == [1]
+
+
+def test_the_sidebar_manual_install_button_opens_the_file_picker_in_a_real_app(tmp_path, monkeypatch):
+    # 真造一个 App(需要显示, 跟别的真 Tk 测试一样): 侧栏「手动安装」按钮必须真的接到文件选择上
+    monkeypatch.delenv("FLORR_TELEMETRY", raising=False)
+    monkeypatch.setattr(gui_app, "_IS_WINDOWS", True)            # 按钮只在 Windows 上可用
+    monkeypatch.setattr(app_config, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(gui_app.telemetry, "send", lambda *a, **k: None)
+    monkeypatch.setattr(gui_app.telemetry, "install_id", lambda: "0123456789abcdef0123456789abcdef")
+    monkeypatch.setattr(gui_app.gui_update.UpdateController, "check", lambda self, *a, **k: None)
+    asked = []
+    monkeypatch.setattr(gui_app.filedialog, "askopenfilename",
+                        lambda **k: asked.append(k) or "")        # 用户点了取消
+    app = gui_app.App()
+    try:
+        _find_button(app, "手动安装").invoke()
+        assert len(asked) == 1
+        assert any(ext == "*.zip" for _name, ext in asked[0]["filetypes"])
+        assert not getattr(app, "_afk_busy", False) and app.afk_switch.cget("state") == "normal"
+    finally:
+        app.destroy()
+
+
+# ── 没装 Chrome: 点「登录」弹窗说清楚, 不是未捕获异常(用户 2026-10-09 南京, v1.0.6) ──
+
+def test_a_chrome_launch_failure_pops_up_the_reason_and_is_logged(monkeypatch):
+    shown, logged = [], []
+    fake = type("App", (), {})()
+    fake._log_line = logged.append
+    monkeypatch.setattr(gui_app.messagebox, "showerror", lambda t, m, **k: shown.append((t, m)))
+    gui_app.App._on_chrome_launch_error(fake, RuntimeError("没找到 Chrome, 请先安装: https://x.test/"))
+    assert len(shown) == 1 and "https://x.test/" in shown[0][1] and "登录" in shown[0][1]
+    assert any("起 Chrome 失败" in line for line in logged)
+
+
+def test_the_login_guide_in_a_real_app_reports_a_missing_chrome_through_that_popup(tmp_path, monkeypatch):
+    monkeypatch.delenv("FLORR_TELEMETRY", raising=False)
+    monkeypatch.setattr(app_config, "CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(gui_app.telemetry, "send", lambda *a, **k: None)
+    monkeypatch.setattr(gui_app.telemetry, "install_id", lambda: "0123456789abcdef0123456789abcdef")
+    monkeypatch.setattr(gui_app.gui_update.UpdateController, "check", lambda self, *a, **k: None)
+    shown = []
+    monkeypatch.setattr(gui_app.messagebox, "showerror", lambda t, m, **k: shown.append(m))
+    def no_chrome(*a, **k):
+        raise RuntimeError("没找到 Chrome, 请先安装: https://www.google.com/chrome/")
+    app = gui_app.App()
+    try:
+        app._login_guide._launch = no_chrome
+        app._login_guide.start("d", on_done=lambda: pytest.fail("不该算登录完成"), on_cancel=lambda: None)
+        assert len(shown) == 1 and "没找到 Chrome" in shown[0]
+    finally:
+        app.destroy()
+
+
 # ── bug 上报接线: 检测到问题 -> 弹窗让用户选 ─────────────────────────────────
 
 import types as _types
@@ -826,3 +974,105 @@ def test_closing_the_dialog_forgets_the_attachment_job():
     app = _bug_app(_bug_dialog=object(), _bug_attach_job=object())
     gui_app.App._on_bug_dialog_closed(app)
     assert app._bug_dialog is None and app._bug_attach_job is None
+
+
+# ── 退出时收掉 AFK 助手 / 启动时认出上次遗留的陈旧实例(2026-10-11 粉丝反馈) ──
+
+@pytest.mark.parametrize("running, ours, exe_exists, want", [
+    (False, False, True, "start"),
+    (False, False, False, "start"),      # 没装的情况交给 start_afk 去走下载流程
+    (True, True, True, "already"),       # 本次启动自己拉起的: 别动
+    (True, False, True, "restart"),      # 上次退出 / 崩溃遗留的: 收掉重开
+    (True, False, False, "already"),     # 没有我们的 exe: 没法重开, 保持老行为(多半是用户自己另装的)
+])
+def test_afk_launch_plan(running, ours, exe_exists, want):
+    assert gui_app.afk_launch_plan(running=running, ours=ours, exe_exists=exe_exists) == want
+
+
+def _afk_cfg_app(afk_enabled):
+    return _types.SimpleNamespace(_cfg={"afk_enabled": afk_enabled})
+
+
+@pytest.mark.parametrize("afk_enabled, ours, stopped", [
+    (True, False, True),      # 开关开着: 生命周期归本程序管, 退出就收(包括上次遗留的)
+    (False, True, True),      # 开关后来关了但这次拉起过: 照收
+    (False, False, False),    # 跟本程序无关(用户自己开的一份): 不碰
+])
+def test_exit_stops_the_afk_helper_only_when_it_is_ours_to_manage(monkeypatch, afk_enabled, ours, stopped):
+    calls = []
+    monkeypatch.setattr(gui_app.afk_watch, "started_by_this_session", lambda: ours)
+    monkeypatch.setattr(gui_app.afk_watch, "stop_florr_auto_afk", lambda: calls.append(1))
+    gui_app.App._stop_afk_on_exit(_afk_cfg_app(afk_enabled))
+    assert bool(calls) is stopped
+
+
+def test_exit_never_fails_because_the_afk_helper_would_not_stop(monkeypatch):
+    monkeypatch.setattr(gui_app.afk_watch, "stop_florr_auto_afk",
+                        lambda: (_ for _ in ()).throw(OSError("taskkill 不在了")))
+    gui_app.App._stop_afk_on_exit(_afk_cfg_app(True))        # 不抛, 退出流程要接着走完
+
+
+def test_closing_the_window_stops_the_afk_helper_before_it_destroys_itself(monkeypatch):
+    order = []
+    app = _types.SimpleNamespace(
+        _updates=None, _closing=False, _tick_job=None, _telemetry_job=None, _hb_thread=None,
+        after_cancel=lambda j: None,
+        _stop_worker_sync=lambda: order.append("worker"),
+        _stop_afk_on_exit=lambda: order.append("afk"),
+        destroy=lambda: order.append("destroy"))
+    gui_app.App.on_closing(app)
+    assert order == ["worker", "afk", "destroy"]
+
+
+# ── 进时块前要确认 Chrome 真的还在(2026-10-11 粉丝: 刷怪中强关 Chrome, 停止再启动就一直提示
+#    "专用 Chrome 未就绪") ──
+# 根因: _chrome_profile 只是"上次开过哪个账号"的记忆, 没人核对 Chrome 现在还活着没有。强关 Chrome 后
+# 记忆没变, plan_transition 就判"同一个账号, 不用重开", worker 一起来自检不过就退出, 下个 tick
+# 又是同样的判断 —— 永远循环。
+
+def _block(**kw):
+    b = {"id": "b1", "profile": "默认", "map": "desert", "start": "09:00", "end": "12:00"}
+    b.update(kw)
+    return b
+
+
+def _enter_env(monkeypatch, tmp_path, *, chrome_ready, wait_result="tab", chrome_profile="默认"):
+    """_enter_block 的假 App + 桩掉所有真副作用; 返回 (app, events)。"""
+    events = []
+    monkeypatch.setattr(gui_app.gui_accounts, "profile_dir", lambda cfg, alias: "chrome-profiles/默认")
+    monkeypatch.setattr(gui_app.gui_accounts, "abs_profile_path", lambda rel: str(tmp_path))
+    monkeypatch.setattr(gui_app.cdp_bridge, "is_dedicated_chrome_ready", lambda: chrome_ready)
+    monkeypatch.setattr(gui_app.cdp_bridge, "launch_chrome_for_profile",
+                        lambda pdir, **kw: events.append("launch"))
+    monkeypatch.setattr(gui_app.cdp_bridge, "wait_for_florr_tab", lambda t: wait_result)
+    monkeypatch.setattr(gui_app.gui_schedule, "block_to_active", lambda blk: {"map": blk["map"]})
+    monkeypatch.setattr(gui_app.app_config, "save_config", lambda cfg: None)
+    monkeypatch.setattr(gui_app.theme, "map_label", lambda m: m)
+    app = _types.SimpleNamespace(
+        _cfg={"active": None}, _chrome_profile=chrome_profile,
+        _stop_worker_sync=lambda: None, _log_line=lambda m: None,
+        _set_running_block=lambda b: events.append(("running", b)),
+        _spawn_worker=lambda: events.append("spawn"),
+        _send_heartbeat=lambda blk: None)
+    return app, events
+
+
+def test_chrome_that_was_killed_is_relaunched_even_though_the_profile_did_not_change(monkeypatch, tmp_path):
+    app, events = _enter_env(monkeypatch, tmp_path, chrome_ready=False)
+    gui_app.App._enter_block(app, _block(), False)       # plan_transition: 同一账号, 不用重开
+    assert events[:2] == ["launch", "spawn"]
+
+
+def test_a_living_chrome_is_left_alone(monkeypatch, tmp_path):
+    app, events = _enter_env(monkeypatch, tmp_path, chrome_ready=True)
+    gui_app.App._enter_block(app, _block(), False)
+    assert "launch" not in events and "spawn" in events
+
+
+def test_a_chrome_that_will_not_come_back_skips_the_block_and_forgets_the_account(monkeypatch, tmp_path):
+    # 重开前已经把所有 Chrome 杀了 —— 重开没成, "当前开着哪个账号"的记忆就必须作废,
+    # 不然下个 tick 还是拿它当"同一个账号"
+    app, events = _enter_env(monkeypatch, tmp_path, chrome_ready=False, wait_result=None)
+    gui_app.App._enter_block(app, _block(), False)
+    assert "spawn" not in events
+    assert app._chrome_profile is None

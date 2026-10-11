@@ -493,18 +493,23 @@ def test_routes_through_the_shortcut_tunnels_get_walked(monkeypatch, map_name, s
     import cv2
     walk = cv2.imread(f"./maps/{map_name}.png", cv2.IMREAD_GRAYSCALE)
     _stub_move_env(monkeypatch)
-    path = main.lazy_theta_star(walk, start, goal)
+    # 这条测的是 execute_path 的 binary_map 判据(老判据卡密道、新判据走得通), 用纯最短路(贴墙)的路径才能
+    # 把"老判据卡住"这个前提立住; 带净空的规划(默认)另有断言: 同样走得通。
+    path = main.lazy_theta_star(walk, start, goal, clearance=False)
     assert path is not None
+    path_clear = main.lazy_theta_star(walk, start, goal)
+    assert path_clear is not None
 
-    def walk_it(binary_map):
+    def walk_it(binary_map, nodes=path):
         flower = _SlidingFlower(walk, start, vmax)
         monkeypatch.setattr(main, "get_player_position", flower.position)
         monkeypatch.setattr(main, "_move_mouse_safely", lambda p: setattr(flower, "mouse", p))
         monkeypatch.setattr(main, "reset_keyboard", lambda: setattr(flower, "mouse", None))
-        return main.execute_path(path, binary_map=binary_map)
+        return main.execute_path(nodes, binary_map=binary_map)
 
     assert walk_it(None) == "stuck"      # 老判据: 卡在密道里
     assert walk_it(walk) is True
+    assert walk_it(walk, path_clear) is True          # 带净空的路径照样穿得过密道
 
 
 # ── _move_mouse_safely: pyautogui FailSafe 恢复(2026-09-20实机复盘) ─────────
@@ -587,6 +592,89 @@ def test_lazy_theta_pathing_names_which_screen_it_landed_on(monkeypatch, capsys)
     monkeypatch.setattr(main, "on_start_screen", lambda: False)
     assert main.lazy_theta_pathing((1, 2)) is False
     assert "死亡结算画面" in capsys.readouterr().out
+
+
+def test_unreadable_position_diagnostics_fire_on_a_schedule(monkeypatch, capsys):
+    """2026-10-08 第一份录像: 死后回到标题页, 位置读不出来连续 5 分钟(57 次重试 + 之后一轮轮脱困),
+    日志里只有同一句"无法检测玩家位置", 看不出是截图黑了还是画面认不出。第 10 次起记一行屏幕体检 +
+    页面焦点, 之后每 60 次再记一行(不能每次都记: 一次整屏截图 + 一次 CDP 往返)。"""
+    monkeypatch.setattr(main.utils, "screen_health", lambda: ("屏幕截图亮度 3 起伏 1 —— 几乎全黑!", True))
+    monkeypatch.setattr(main.cdp_bridge, "_eval_value", lambda js, **k: "true,visible")
+    fired = []
+    for n in range(1, 200):
+        main._report_unreadable_position(n)
+        if capsys.readouterr().out:
+            fired.append(n)
+    assert fired == [10, 60, 120, 180]
+    main._report_unreadable_position(10)
+    out = capsys.readouterr().out
+    assert "几乎全黑" in out and "true,visible" in out
+
+
+def test_unreadable_position_diagnostics_print_the_value_not_the_cdp_envelope(monkeypatch, capsys):
+    monkeypatch.setattr(main.utils, "screen_health", lambda: ("屏幕截图亮度 90 起伏 40", False))
+    # 真的 eval_js 返回整个 CDP 应答; 诊断行里不该出现 {'id': ..., 'result': ...}
+    monkeypatch.setattr(main.cdp_bridge, "eval_js", lambda js, **k: {"id": 1, "result": {"result": {"value": "x"}}})
+    monkeypatch.setattr(main.cdp_bridge, "_eval_value", lambda js, **k: "true,visible")
+    main._report_unreadable_position(10)
+    out = capsys.readouterr().out
+    assert "true,visible" in out and "'result'" not in out and "'id'" not in out
+
+
+def test_unreadable_position_diagnostics_survive_a_dead_cdp(monkeypatch, capsys):
+    monkeypatch.setattr(main.utils, "screen_health", lambda: ("屏幕截图亮度 90 起伏 40", False))
+
+    def boom(*a, **k):
+        raise ConnectionError("cdp down")
+    monkeypatch.setattr(main.cdp_bridge, "_eval_value", boom)
+    main._report_unreadable_position(10)           # 不能抛: 这是诊断, 不能把寻路循环带崩
+    out = capsys.readouterr().out
+    assert "屏幕截图亮度 90" in out and "页面状态读不到" in out
+
+
+def test_lazy_theta_pathing_runs_the_diagnostics_while_position_is_unreadable(monkeypatch, capsys):
+    monkeypatch.setattr(main, "overlay", _StubOverlay(), raising=False)
+    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "_on_wrong_map", lambda: None)
+    monkeypatch.setattr(main, "get_player_position", lambda: None)
+    monkeypatch.setattr(main.utils, "screen_health", lambda: ("屏幕截图亮度 0 起伏 0 —— 几乎全黑!", True))
+    monkeypatch.setattr(main.cdp_bridge, "_eval_value", lambda js, **k: "false,hidden")
+    sleeps = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 12:
+            raise KeyboardInterrupt        # 永不放弃的循环, 测试里靠这个跳出来
+
+    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        main.lazy_theta_pathing((1, 2))
+    out = capsys.readouterr().out
+    assert out.count("几乎全黑") == 1 and "false,hidden" in out    # 第 10 次那一拍, 只一次
+
+
+def test_lazy_theta_pathing_installs_the_canvas_hook_before_reading_the_start_position(monkeypatch):
+    """2026-10-10 录像: 每次进游戏后第一次读位置都读成同一个假点 (250,45) —— 那时 canvas hook 还没装(装钩子
+    只在刷怪索敌扫描里), 退回截图认小地图金点, 小地图大小跟 300x300 的假设对不上, 读出个假坐标; 路径从假起点
+    规划, 人往错的方向走了 10 秒才"原地打转"卡住、脱困后位置读对才重新规划。寻路开头先装钩子, 位置就读画布。"""
+    _pathing_env(monkeypatch)
+    order = []
+    monkeypatch.setattr(main.cdp_bridge, "inject_canvas_hook", lambda *a, **k: order.append("hook"))
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: order.append("pos") or (20, 40))
+    assert main.lazy_theta_pathing((13, 68), [AREA]) is True      # 已经在区域里, 读一次位置就返回
+    assert order[0] == "hook" and "pos" in order
+
+
+def test_lazy_theta_pathing_survives_a_failing_hook_install(monkeypatch):
+    _pathing_env(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("canvas hook 注入没生效")
+    monkeypatch.setattr(main.cdp_bridge, "inject_canvas_hook", boom)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (20, 40))
+    assert main.lazy_theta_pathing((13, 68), [AREA]) is True      # 装不上就照旧(退回截图), 不能拦住寻路
 
 
 def test_lazy_theta_pathing_stops_replanning_when_nothing_moves(monkeypatch, capsys):
@@ -730,7 +818,9 @@ def test_walking_back_stops_the_moment_the_flower_is_inside(monkeypatch):
     monkeypatch.setattr(main, "lazy_theta_star",
                         lambda m, a, b: [a, (20, 72), (20, 60), (13, 40)])
     assert main.lazy_theta_pathing((13, 40), [AREA]) is True
-    assert moves == [(20, 72)]
+    # (20,72) 刚踩进边界(离上沿 1 格)还不够: 再往里 AREA_ENTRY_MARGIN 格才收手, 免得惯性一滑又出区;
+    # 但也不走完整条路(没走到 (13,40))
+    assert moves == [(20, 72), (20, 60)]
 
 
 def test_rules_farming_walks_back_to_the_nearest_edge_not_the_centre(monkeypatch):
@@ -823,6 +913,18 @@ def test_run_worker_reasserts_florr_toggles_at_startup_and_each_round(monkeypatc
     A, D = main.florr_settings.INVERT_ATTACK_ADDR, main.florr_settings.INVERT_DEFENSE_ADDR
     # _stub 的 _apply_worker_config 返回 invert_attack True → want 1; invert_defense False → want 0
     assert calls == [(A, 1), (D, 0), (A, 1), (D, 0)]
+
+
+def test_run_worker_asks_windows_to_stay_awake(monkeypatch):
+    # 无人值守挂机时显示器休眠 / 屏保会让输入和画面都到不了游戏(2026-10-08 第一份录像 5 分钟卡死)
+    _stub_run_worker_env(monkeypatch)
+    started = []
+    monkeypatch.setattr(main.keep_awake, "start", lambda *a, **k: started.append(1))
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert started == [1]
 
 
 def test_run_worker_toggle_wants_come_from_active_slice(monkeypatch):
@@ -1331,6 +1433,43 @@ def test_run_worker_skips_reach_swap_when_pathing_fails(monkeypatch):
                                          # (_stub 里 on_start/on_death 恒 False) → 不切
 
 
+def test_run_worker_puts_the_damage_loadout_on_when_a_later_round_finally_arrives(monkeypatch):
+    # 第 1 轮进游戏穿上跑路装, 但寻路没到刷怪区(路径规划失败 / 被传去别的图 / 进场被打断,
+    # 人都没死); 第 2 轮人还活着, entered_game 是假的 —— 原来的门只看"这一轮是不是刚进游戏",
+    # 到区了也不按输出装, 花朵穿着跑路装刷到下次死。门要看"跑路装还穿着没换回来"。
+    seen = _swap_env(monkeypatch, enter="k", reach="l")
+    calls = {"n": 0}
+
+    def fake_path(*a, **k):
+        calls["n"] += 1
+        return calls["n"] >= 2          # 第 1 轮没到, 第 2 轮到了
+
+    monkeypatch.setattr(main, "lazy_theta_pathing", fake_path)
+    monkeypatch.setattr(main, "auto_farming",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == ["k", "l"]           # 第 1 轮穿跑路装; 第 2 轮到区 -> 换回输出装
+
+
+def test_run_worker_does_not_press_the_damage_loadout_twice_for_one_run_loadout(monkeypatch):
+    # 配对: 一次跑路装只换回一次。到区换过之后, 续命轮(没死没重进)再到区不能重复按 ——
+    # 非对称配置每轮漂移(见 test_run_worker_skips_swaps_on_survived_continuation_round)
+    seen = _swap_env(monkeypatch, enter="k", reach="l")
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda *a, **k: True)
+    calls = {"n": 0}
+
+    def fake_farm(*a, **k):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "auto_farming", fake_farm)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == ["k", "l"]           # 三轮, 只有第 1 轮一对
+
+
 def test_run_worker_skips_swaps_on_survived_continuation_round(monkeypatch):
     # 一命跑满 farming_duration 没死: 下一轮不过 on_death/on_start 分支, florr 没
     # 重置 loadout, 不该再切. auto_farming 第 1 次正常返回, 第 2 次掐断.
@@ -1794,6 +1933,183 @@ def test_stage_state_advances_and_resets(monkeypatch):
     assert st.map_name == "anthell"
     st.reset()
     assert st.map_name == "garden"
+
+
+def test_stage_state_past(monkeypatch):
+    route = _anthell_route(monkeypatch)
+    st = main._StageState(route)
+    assert not st.past("garden")          # 还在第一段: 谁都不在"之后"
+    st.advance()
+    assert st.past("garden")              # 已经推进到蚁穴: 花园在身后
+    assert not st.past("anthell")         # 当前段不算
+    assert not st.past("desert")          # 不在路线上 -> False
+
+
+def test_entry_route_trusts_stage_state_when_zone_unreadable_and_server_says_garden(monkeypatch):
+    """工厂/蚁穴/下水道都跑在花园那台服务器上, 服务器号永远说"花园"。区域名读不出时(1024x768 下
+    hook 把它丢了 90% 的帧), 人明明重生在工厂的检查点, 原来拿服务器号当依据 -> 在工厂里走花园的路线
+    180 秒(2026-10-11 实机一次死亡丢 2-3 分钟)。阶段状态已经推进到工厂时, 该信它。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("factory")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    walked = []
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc))
+    st = main._StageState(route)
+    st.advance()                           # 上一命就在工厂里
+    st.carry()                             # 死亡重生带过来的阶段
+    assert main._run_entry_route(route, st, timeout=5) == "arrived"
+    assert walked == []                    # 一步花园的路都不该走
+
+
+def test_stage_state_carried_flag_lives_only_until_the_next_transition(monkeypatch):
+    route = map_routes.route_for("factory")
+    st = main._StageState(route)
+    assert not st.carried
+    st.advance()
+    st.carry()
+    assert st.carried
+    st.sync_to("factory")                  # 区域名读到了 -> 以画面为准, 不再是"带过来的"
+    assert not st.carried
+    st.carry()
+    st.reset()
+    assert not st.carried
+    st.advance()
+    st.carry()
+    st.advance()                           # 已经在最后一段, advance 也清掉带过来的标记
+    assert not st.carried
+
+
+def test_entry_route_does_not_trust_an_optimistic_stage_even_when_ahead_of_the_server_id(monkeypatch):
+    """没带过来的阶段(乐观推进猜的)比服务器号靠前时, 服务器号说了算: 猜的可能是假的。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("factory")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    walked = []
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    st.advance()                           # 没 carry
+    main._run_entry_route(route, st, timeout=0.05)
+    assert walked and walked[0] == route.stage_for("garden").walk_to
+
+
+def test_entry_route_still_walks_the_garden_when_state_is_at_the_first_stage(monkeypatch):
+    """反过来: 阶段状态在第一段(冷启动/换服后 reset), 服务器号说花园, 区域名读不出 -> 照旧走花园
+    那段到传送点。信阶段状态只在它比服务器号靠前时。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("factory")
+    reported = iter(["garden", "garden", "garden"])
+    monkeypatch.setattr(main.florr_server, "current_map_name",
+                        lambda ev: next(reported, "garden"))
+    walked = []
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    # 走到传送点 -> 复查"已离开" -> 推进到工厂 -> arrived (走的是花园那段路)
+    assert main._run_entry_route(route, main._StageState(route), timeout=5) == "arrived"
+    assert walked and walked[0] == route.stage_for("garden").walk_to
+
+
+def test_entry_route_zone_label_beats_stage_state(monkeypatch):
+    """区域名读得到就以它为准: 阶段状态说工厂, 画面却说花园(被门传走了) -> 按花园走。"""
+    _quiet_entry_env(monkeypatch)
+    route = map_routes.route_for("factory")
+    monkeypatch.setattr(main, "_canvas_zone_map", lambda: "garden")
+    monkeypatch.setattr(main.florr_server, "current_map_name", lambda ev: "garden")
+    walked = []
+    monkeypatch.setattr(main, "apply_map", lambda n: None)
+    monkeypatch.setattr(main, "lazy_theta_pathing",
+                        lambda loc, area, **kw: walked.append(loc) or False)
+    st = main._StageState(route)
+    st.advance()
+    assert main._run_entry_route(route, st, timeout=0.05) == "timeout"
+    assert walked and walked[0] == route.stage_for("garden").walk_to
+
+
+def _respawn_env(monkeypatch):
+    """跑 run_worker 的工厂路线, 进场路线换成探针: 第 1 轮把阶段状态推进到工厂(= 上一命在工厂里),
+    之后每轮记下进场路线开始时阶段状态在哪一段。"""
+    _stub_run_worker_env(monkeypatch)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+        "location": (1, 2), "farming_area": [(0, 0), (9, 9)], "farming_duration": 9999,
+        "short_round_limit": 99, "enemy_ai_enabled": False, "auto_switch_server": False,
+        "biome": "garden", "map_name": "factory",
+        "route": map_routes.route_for("factory"),
+        "enter_game_swap": "none", "reach_area_swap": "none",
+        "invert_attack": True, "invert_defense": False,
+    })
+    monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_wait_for_start_menu", lambda *a, **k: True)
+    monkeypatch.setattr(main, "click_start_game", lambda: True)
+    monkeypatch.setattr(main, "click_continue_after_death", lambda: True)
+    monkeypatch.setattr(main, "_reassert_florr_toggles",
+                        lambda *a, **k: {"attack": "unchanged", "defense": "unchanged"})
+    seen = []
+
+    def probe(route, stage_state, **kw):
+        seen.append((stage_state.map_name, stage_state.carried))
+        if len(seen) == 1:
+            stage_state.advance()          # 第 1 轮: 走到工厂了
+            return "interrupted"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "_run_entry_route", probe)
+    return seen
+
+
+def test_run_worker_keeps_stage_when_respawning_after_a_real_death(monkeypatch):
+    """死了 -> 点继续 -> 点开始: 重生在工厂的检查点, 进场路线要从"工厂"这一段起步,
+    不是 reset 回花园(区域名读不出时 reset 回去就拿花园的图在工厂里走满 180 秒)。"""
+    seen = _respawn_env(monkeypatch)
+    rounds = {"n": -1}
+    monkeypatch.setattr(main, "on_guest_screen",
+                        lambda: rounds.__setitem__("n", rounds["n"] + 1) or False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: rounds["n"] >= 1)
+    monkeypatch.setattr(main, "on_death_screen", lambda: rounds["n"] >= 2)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == [("garden", False), ("factory", True)]    # 带过来的, 不是乐观推进猜的
+
+
+def test_run_worker_carries_the_stage_into_the_next_round_after_reaching_the_farm(monkeypatch):
+    """没死、一轮刷满接着下一轮: 人还在工厂里。到过刷怪区的那一轮要把阶段标成"带过来的",
+    区域名读不出时下一轮的进场路线才不会拿服务器号(永远说花园)去走花园的路。"""
+    seen = _respawn_env(monkeypatch)
+    rounds = {"n": -1}
+    monkeypatch.setattr(main, "on_guest_screen",
+                        lambda: rounds.__setitem__("n", rounds["n"] + 1) or False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+
+    def probe(route, stage_state, **kw):
+        seen.append((stage_state.map_name, stage_state.carried))
+        if len(seen) == 1:
+            stage_state.advance()            # 第 1 轮走到工厂, 到达刷怪区
+            return "arrived"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "_run_entry_route", probe)
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda *a, **k: True)
+    monkeypatch.setattr(main, "auto_farming", lambda *a, **k: None)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == [("garden", False), ("factory", True)]
+
+
+def test_run_worker_resets_stage_on_a_cold_start_without_death(monkeypatch):
+    """没死(掉线 / 冷启动 / 换服)直接落到标题页: 新进场 = 从花园出生点走, 阶段状态回第一段。"""
+    seen = _respawn_env(monkeypatch)
+    rounds = {"n": -1}
+    monkeypatch.setattr(main, "on_guest_screen",
+                        lambda: rounds.__setitem__("n", rounds["n"] + 1) or False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: rounds["n"] >= 1)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == [("garden", False), ("garden", False)]
 
 
 def test_entry_route_is_a_noop_on_single_stage_maps(monkeypatch):
@@ -4204,16 +4520,67 @@ def test_portal_switch_steps_out_and_back_in_then_gives_up(monkeypatch):
     assert spent < main.PORTAL_SWITCH_TIMEOUT
 
 
-def test_portal_switch_is_only_for_anthell():
+def test_portal_switch_is_for_anthell_and_factory_only():
+    # 用户 2026-10-10: "工厂换服没有走传送门, 改掉, 蚁穴也是要走传送门的"
     assert main._portal_switch_target({"map_name": "anthell"}) == map_routes.ANTHELL_TO_GARDEN_PORTAL
-    assert main._portal_switch_target({"map_name": "desert"}) is None
+    assert main._portal_switch_target({"map_name": "factory"}) == map_routes.FACTORY_TO_GARDEN_PORTAL
+    for other in ("desert", "garden", "ocean", "jungle", "sewers"):
+        assert main._portal_switch_target({"map_name": other}) is None
 
 
-def _anthell_switch_worker(monkeypatch, portal_result):
+def test_every_switch_door_has_a_world_coordinate_and_a_budget():
+    assert set(map_routes.SWITCH_DOORS) == {"anthell", "factory"}
+    for name, door in map_routes.SWITCH_DOORS.items():
+        assert map_routes.door_for_cell(door.cell) is door
+        assert len(door.world) == 2 and door.timeout >= 60
+    assert map_routes.door_for_cell((1, 1)) is None
+    # 工厂复活点可能离门很远, 预算比蚁穴宽
+    assert map_routes.SWITCH_DOORS["factory"].timeout > map_routes.SWITCH_DOORS["anthell"].timeout
+
+
+def test_factory_door_world_coordinate_matches_its_minimap_cell():
+    # 世界坐标是 2026-10-10 工厂录像里小地图绿点反解的; 小地图格是按同一条换算(跟 maps/factory.png 一个坐标系)
+    import utils
+    door = map_routes.SWITCH_DOORS["factory"]
+    s = utils.MINIMAP_WORLD_SCALE["factory"]
+    cx, cy = s * (door.world[0] + 1000.0), s * (door.world[1] + 1000.0)
+    assert abs(cx - door.cell[0]) <= 1.0 and abs(cy - door.cell[1]) <= 1.0
+
+
+def test_factory_door_is_a_wall_with_a_walkable_staging_point_beside_it():
+    # 门那一格在 maps/factory.png 上要是墙(寻路不踩进去被传走), 旁边要有主连通区里的可走点当集结点
+    import cv2
+    m = cv2.imread("./maps/factory.png", cv2.IMREAD_GRAYSCALE)
+    x, y = map_routes.FACTORY_TO_GARDEN_PORTAL
+    assert m[y, x] == 0
+    staging = main._portal_staging_point(m, map_routes.FACTORY_TO_GARDEN_PORTAL)
+    assert m[staging[1], staging[0]] == 255
+    assert math.hypot(staging[0] - x, staging[1] - y) <= 10
+
+
+def test_factory_portal_switch_uses_the_factory_door_and_its_budget(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(main, "load_binary_map", lambda: np.full((300, 300), 255, dtype=np.uint8))
+    monkeypatch.setattr(main, "get_player_position", lambda: (54, 285))      # 离门 5 格: 直接走
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "overlay", _StubOverlay(), raising=False)
+
+    def walk(world, biome, deadline):
+        seen["world"], seen["biome"] = world, biome
+        seen["budget"] = deadline - main.time.time()
+        return True
+    monkeypatch.setattr(main, "_walk_into_portal", walk)
+    assert main._switch_server_via_portal("garden", map_routes.FACTORY_TO_GARDEN_PORTAL) is True
+    assert seen["world"] == map_routes.FACTORY_TO_GARDEN_PORTAL_WORLD and seen["biome"] == "garden"
+    assert 170 < seen["budget"] <= 180
+
+
+def _anthell_switch_worker(monkeypatch, portal_result, map_name="anthell"):
     _stub_run_worker_env(monkeypatch)
     cfg = main._apply_worker_config({})
     monkeypatch.setattr(main, "_apply_worker_config", lambda c: dict(
-        cfg, map_name="anthell", biome="garden", auto_switch_server=True, short_round_limit=1))
+        cfg, map_name=map_name, biome="garden", auto_switch_server=True, short_round_limit=1))
     monkeypatch.setattr(main, "on_start_screen", lambda: True)
     monkeypatch.setattr(main, "click_start_game", lambda: True)
     monkeypatch.setattr(main, "_reassert_florr_toggles", lambda *a, **k: {})
@@ -4262,6 +4629,36 @@ def test_anthell_switch_falls_back_to_a_direct_switch(monkeypatch):
         main.run_worker({})
     assert log[:2] == [("portal", "garden", map_routes.ANTHELL_TO_GARDEN_PORTAL),
                        ("direct", "garden")]
+
+
+def test_factory_switches_servers_through_the_portal_too(monkeypatch):
+    log = _anthell_switch_worker(monkeypatch, portal_result=True, map_name="factory")
+    rounds = {"n": 0}
+
+    def entry(*a, **k):
+        rounds["n"] += 1
+        if rounds["n"] > 2:
+            raise KeyboardInterrupt
+        return "arrived"
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert log[0] == ("portal", "garden", map_routes.FACTORY_TO_GARDEN_PORTAL)
+
+
+def test_factory_falls_back_to_a_direct_switch_when_the_portal_walk_fails(monkeypatch):
+    log = _anthell_switch_worker(monkeypatch, portal_result=False, map_name="factory")
+    rounds = {"n": 0}
+
+    def entry(*a, **k):
+        rounds["n"] += 1
+        if rounds["n"] > 2:
+            raise KeyboardInterrupt
+        return "arrived"
+    monkeypatch.setattr(main, "_run_entry_route", entry)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert log[:2] == [("portal", "garden", map_routes.FACTORY_TO_GARDEN_PORTAL), ("direct", "garden")]
 
 
 def test_anthell_portal_switch_pending_but_stuck_outside_switches_directly(monkeypatch):
@@ -5016,3 +5413,940 @@ def test_auto_farming_a_fight_target_close_by_is_still_not_steered(monkeypatch):
     seen = _drive_one_chase_tick(monkeypatch, target, 120)
     assert seen["steer"] == [] and seen["drive"][0] == (960.0, 540.0)
     assert "后退" not in seen["drive"][2] and "追击" in seen["drive"][2]
+
+
+# ── 迷宫图(工厂)寻怪: 直线隔墙看得见的怪沿可走路径绕过去; 漫游目标选路径够得着的并走到为止 ────────
+# 2026-10-09 三份工厂录像: 刷怪区里 98% 的拍子屏幕上都有怪, 却有一半时间在随机漫游 —— 其中 2/3 是最近
+# 的可打怪在 300~600px、小地图上直线隔着墙(can_reach 说走不到, select_action 就不追)。漫游目标又是整个
+# 161x71 区域里的随机可走点(三间房, 里面还有 U 形墙), 直线走过去顶墙, 一局 15 次"移动受阻/地图脱困"。
+
+import numpy as _np
+
+
+def _wall_map():
+    """60x60 全可走, 中间一道竖墙 x=30(y=10..49), 上下各留一个口: 绕路得走到 y<10 或 y>49。"""
+    m = _np.full((60, 60), 255, dtype=_np.uint8)
+    m[10:50, 30] = 0
+    return m
+
+
+def _world_of(cell, scale):
+    return (cell[0] / scale - 1000.0, cell[1] / scale - 1000.0)
+
+
+def _det(species, rarity, cell, scale, center=(960, 540), px=(300.0, 0.0), conf=1.0):
+    return {"species": species, "rarity": rarity, "confidence": conf, "world": _world_of(cell, scale),
+            "screen_pos": (center[0] + px[0], center[1] + px[1]), "bbox": (0, 0, 0, 0)}
+
+
+@pytest.fixture
+def factory_scale(monkeypatch):
+    monkeypatch.setattr(main.utils, "MAP", "factory")
+    return main.utils.MINIMAP_WORLD_SCALE["factory"]
+
+
+def test_bfs_reach_goes_around_a_wall_and_respects_the_limit():
+    m = _wall_map()
+    dist, parent = main._bfs_reach(m, (25, 30), max_cells=60)
+    assert dist[(25, 30)] == 0
+    assert dist[(35, 30)] > 10 + 5      # 直线 10 格, 隔墙绕要走到口子再回来
+    dist_small, _ = main._bfs_reach(m, (25, 30), max_cells=8)
+    assert (35, 30) not in dist_small and max(dist_small.values()) <= 8
+
+
+AREA_WALL = [(5, 5), (55, 55)]
+
+
+def test_path_approach_walks_around_the_wall_not_into_it(factory_scale):
+    m = _wall_map()
+    here = (28, 45)                                 # 离下面的口子(y=50)近, 目标在墙另一侧
+    det = _det("spider", "Legendary", (33, 45), factory_scale)
+    plan = main._plan_path_approach([det], here, m, AREA_WALL, max_cells=40, max_px=2000)
+    assert plan is not None and plan["target"] is det
+    wx, wy = plan["waypoint"]
+    assert main.line_of_sight(m, main._Pt(*here), main._Pt(wx, wy))   # 朝它推不会顶墙
+    assert wy > here[1]                              # 先往下绕, 不是直直朝 +x 顶墙
+    assert plan["cells"] >= 8                        # 直线才 5 格, 绕口子要 10 格
+
+
+def test_path_approach_gives_up_when_the_detour_is_too_long(factory_scale):
+    m = _wall_map()
+    det = _det("spider", "Legendary", (33, 30), factory_scale)   # 离口子 20 格, 绕一圈 ~40
+    assert main._plan_path_approach([det], (28, 30), m, AREA_WALL, max_cells=20, max_px=2000) is None
+
+
+def test_path_approach_ignores_what_it_should_not_chase(factory_scale):
+    m = _wall_map()
+    here = (28, 45)
+    kw = dict(max_cells=40, max_px=2000)
+    cell = (33, 45)
+    assert main._plan_path_approach([_det("spider", "Ultra", cell, factory_scale)], here, m, AREA_WALL, **kw) is None
+    assert main._plan_path_approach([_det("spider", "Legendary", cell, factory_scale, conf=0.3)],
+                                    here, m, AREA_WALL, **kw) is None
+    assert main._plan_path_approach([_det("spider", "Legendary", (33, 58), factory_scale)],
+                                    here, m, AREA_WALL, **kw) is None          # 区外
+    assert main._plan_path_approach([_det("spider", "Legendary", cell, factory_scale, px=(3000.0, 0.0))],
+                                    here, m, AREA_WALL, **kw) is None          # 屏幕上太远
+    assert main._plan_path_approach([], here, m, AREA_WALL, **kw) is None
+    assert main._plan_path_approach([_det("spider", "Legendary", cell, factory_scale)], None, m, AREA_WALL, **kw) is None
+
+
+def test_path_approach_prefers_the_cheaper_species_at_similar_distance(factory_scale):
+    m = _wall_map()
+    here = (28, 45)
+    barrel = _det("barrel", "Legendary", (33, 44), factory_scale)      # cost 3.0, 最后才打
+    spider = _det("spider", "Legendary", (33, 46), factory_scale)
+    plan = main._plan_path_approach([barrel, spider], here, m, AREA_WALL, max_cells=40, max_px=2000)
+    assert plan["target"] is spider
+
+
+def test_path_approach_on_a_line_of_sight_target_aims_straight_at_it(factory_scale):
+    m = _wall_map()
+    det = _det("crab", "Legendary", (20, 20), factory_scale)
+    plan = main._plan_path_approach([det], (10, 20), m, AREA_WALL, max_cells=40, max_px=2000)
+    assert plan["waypoint"] == (20, 20)
+
+
+def test_aim_mouse_points_from_the_player_toward_the_waypoint(monkeypatch):
+    monkeypatch.setattr(main.utils, "SCREEN_WIDTH", 1920)
+    monkeypatch.setattr(main.utils, "SCREEN_HEIGHT", 1080)
+    x, y = main._aim_mouse((960, 540), (10, 10), (20, 10))
+    assert y == 540 and x > 960
+    x, y = main._aim_mouse((960, 540), (10, 10), (10, 0))
+    assert x == 960 and y < 540
+    assert main._aim_mouse((960, 540), (10, 10), (10, 10)) == (960, 540)
+
+
+def test_wander_goal_is_reachable_inside_the_area_and_not_too_close():
+    m = _wall_map()
+    import random
+    for seed in range(30):
+        goal = main._pick_wander_goal(m, (20, 20), AREA_WALL, rng=random.Random(seed))
+        assert goal is not None
+        dist, _ = main._bfs_reach(m, (20, 20), main.WANDER_GOAL_MAX_CELLS)
+        assert main.WANDER_GOAL_MIN_CELLS <= dist[goal] <= main.WANDER_GOAL_MAX_CELLS
+        assert 5 <= goal[0] <= 55 and 5 <= goal[1] <= 55
+        assert m[goal[1], goal[0]] == 255
+
+
+def test_wander_goal_is_none_when_nothing_qualifies():
+    tiny = _np.full((60, 60), 0, dtype=_np.uint8)
+    tiny[20:23, 20:23] = 255                         # 一个 3x3 的小窝, 走不出 MIN 格
+    assert main._pick_wander_goal(tiny, (21, 21), AREA_WALL) is None
+
+
+def _farming_env(monkeypatch, m=None):
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main.utils, "MAP", "factory")
+    monkeypatch.setattr(main, "load_binary_map", lambda: m if m is not None else _wall_map())
+    monkeypatch.setattr(main, "MYTHIC_LATCH_ENABLED", False)
+
+
+class _Done(Exception):
+    pass
+
+
+def test_auto_farming_in_a_maze_approaches_a_walled_off_mob_instead_of_wandering(monkeypatch, factory_scale):
+    _farming_env(monkeypatch)
+    monkeypatch.setattr(main, "get_player_position", lambda: (28, 45))
+    det = _det("spider", "Legendary", (33, 45), factory_scale)
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [det], 0.0, True))
+    moved = {}
+
+    def drive(mouse_target, current_pos, hist, state, message, **kw):
+        moved.update(target=mouse_target, state=state, message=message)
+        raise _Done
+
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda *a, **k: pytest.fail("隔墙有怪却去随机漫游了"))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    with pytest.raises(_Done):
+        main.auto_farming(AREA_WALL, 30, enemy_ai_enabled=True)
+    assert moved["state"] == "索敌中" and "spider" in moved["message"]
+    assert moved["target"][1] > 540                  # 先往下绕
+
+
+def test_auto_farming_wanders_the_old_way_on_open_maps(monkeypatch, factory_scale):
+    # 只有迷宫图(工厂)和沙漠里的走廊形刷怪区走新逻辑; 开阔的沙漠区 / 蚁穴等照旧
+    _farming_env(monkeypatch, _np.full((60, 60), 255, dtype=_np.uint8))
+    monkeypatch.setattr(main.utils, "MAP", "desert")
+    monkeypatch.setattr(main, "get_player_position", lambda: (28, 45))
+    det = _det("spider", "Legendary", (33, 45), factory_scale)
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [det], 0.0, True))
+    monkeypatch.setattr(main, "_plan_path_approach",
+                        lambda *a, **k: pytest.fail("非迷宫图不该绕路追"))
+    monkeypatch.setattr(main, "random_walkable_point", lambda *a, **k: (40, 40))
+
+    def move(*a, **k):
+        raise _Done
+    monkeypatch.setattr(main, "move_to_position", move)
+    with pytest.raises(_Done):
+        main.auto_farming(AREA_WALL, 30, enemy_ai_enabled=True)
+
+
+# ── 沙漠里的走廊形刷怪区也要走迷宫寻怪(2026-10-10 苏州用户日志) ───────────────────────────────
+# 那份日志: 沙漠, 刷怪区是一条贴着墙拐来拐去的南北向走廊(184,138)-(218,292), 刷怪时长 4.2 万秒里「原地打转
+# 判定卡住」2289 次、「20次尝试后仍未到达」264 次, 77% 的漫游腿以卡住收场; 人几乎全程待在区域最上头的路口
+# (进区位置 175 次是 (184,144), 出区 128 次都在 x=219 / y 在 137~151)。老漫游在整块矩形里随机挑可走点、
+# 直线走过去(move_to_position 不带地图, 不会绕墙), 走廊一拐弯就顶墙。
+
+_USER_DESERT_AREA = [(184, 138), (218, 292)]
+
+
+def _real_map(name):
+    import cv2
+    return cv2.imread(f"maps/{name}.png", cv2.IMREAD_GRAYSCALE)
+
+
+def test_the_real_desert_corridor_from_the_user_log_counts_as_corridor_shaped():
+    assert main._area_is_corridor(_real_map("desert"), _USER_DESERT_AREA) is True
+
+
+@pytest.mark.parametrize("area", [[(20, 120), (100, 190)], [(225, 185), (290, 285)]])
+def test_open_blobs_of_the_real_desert_do_not_count_as_corridors(area):
+    assert main._area_is_corridor(_real_map("desert"), area) is False
+
+
+def test_corridor_check_is_deterministic():
+    m = _real_map("desert")
+    assert len({main._area_is_corridor(m, _USER_DESERT_AREA) for _ in range(5)}) == 1
+
+
+def test_corridor_check_copes_with_degenerate_input():
+    assert main._area_is_corridor(None, _USER_DESERT_AREA) is False
+    assert main._area_is_corridor(_real_map("desert"), None) is False
+    solid = _np.zeros((60, 60), dtype=_np.uint8)                   # 区里一个可走点都没有
+    assert main._area_is_corridor(solid, AREA_WALL) is False
+    assert main._area_is_corridor(_np.full((60, 60), 255, dtype=_np.uint8), [(500, 500), (600, 600)]) is False
+    # 不是 ndarray 的地图(测试替身 / 别处塞了个 list)也不能抛 —— 这个检查绝不能把刷怪循环带崩
+    assert main._area_is_corridor([[255]], [(0, 0), (9, 9)]) is False
+    assert main._area_is_corridor(_np.full((60, 60), 255, dtype=_np.uint8), "垃圾") is False
+
+
+@pytest.mark.parametrize("map_name,m,area,ai,expected", [
+    ("factory", _wall_map(), AREA_WALL, True, True),                       # 迷宫图: 一直开
+    ("factory", _np.full((60, 60), 255, dtype=_np.uint8), AREA_WALL, True, True),
+    ("desert", _wall_map(), AREA_WALL, True, True),                        # 沙漠 + 走廊形区域
+    ("desert", _np.full((60, 60), 255, dtype=_np.uint8), AREA_WALL, True, False),   # 沙漠 + 开阔区域
+    ("ocean", _wall_map(), AREA_WALL, True, False),                        # 别的图没证据, 不动
+    ("garden", _wall_map(), AREA_WALL, True, False),
+    ("desert", _wall_map(), AREA_WALL, False, False),                      # 索敌关着不走
+    ("factory", None, AREA_WALL, True, False),                             # 没有地图图
+])
+def test_which_farming_runs_use_the_maze_style_seek(monkeypatch, map_name, m, area, ai, expected):
+    monkeypatch.setattr(main.utils, "MAP", map_name)
+    assert main._use_maze_seek(m, area, ai) is expected
+
+
+def test_auto_farming_wanders_through_the_corridor_by_path_on_a_desert_corridor_area(monkeypatch):
+    _farming_env(monkeypatch, _wall_map())
+    monkeypatch.setattr(main.utils, "MAP", "desert")
+    monkeypatch.setattr(main, "get_player_position", lambda: (28, 45))
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [], 0.0, True))
+    monkeypatch.setattr(main, "_pick_wander_goal", lambda *a, **k: (35, 45))       # 墙对面
+    monkeypatch.setattr(main, "random_walkable_point",
+                        lambda *a, **k: pytest.fail("走廊形区域不该再瞎挑直线目标"))
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda *a, **k: pytest.fail("走廊形区域不该再用 move_to_position 直线走"))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    seen = {}
+
+    def drive(mouse_target, current_pos, hist, state, message, **kw):
+        seen.update(target=mouse_target, state=state)
+        raise _Done
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(_Done):
+        main.auto_farming(AREA_WALL, 30, enemy_ai_enabled=True)
+    assert seen["target"][1] > 540                   # 目标在墙另一侧: 先往下绕口子
+
+
+def test_auto_farming_in_a_maze_wanders_by_steering_the_mouse_not_by_hopping(monkeypatch, factory_scale):
+    """2026-10-10 实机: 漫游这一腿的目标取"路径上直线看得见的最远点", 走廊一拐弯它就落在 ARRIVE_RADIUS(5 格)
+    以内, move_to_position 认为到了、一个 moveTo 都不发 —— 日志连续几十行 `移动到 (112, 85), 先到 (114, 95)`,
+    人站在原地没动, 每轮开头白站 30~100 秒。迷宫漫游改成每拍朝路径点推鼠标(跟绕路同一套), 不再逐段 hop。"""
+    m = _wall_map()
+    _farming_env(monkeypatch, m)
+    monkeypatch.setattr(main, "get_player_position", lambda: (28, 45))
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [], 0.0, True))
+    monkeypatch.setattr(main, "_pick_wander_goal", lambda *a, **k: (35, 45))   # 墙对面
+    monkeypatch.setattr(main, "random_walkable_point",
+                        lambda *a, **k: pytest.fail("迷宫图漫游不该再瞎挑目标"))
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda *a, **k: pytest.fail("迷宫图漫游不该再用 move_to_position 逐段 hop"))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    seen = {}
+
+    def drive(mouse_target, current_pos, hist, state, message, **kw):
+        seen.update(target=mouse_target, state=state)
+        raise _Done
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(_Done):
+        main.auto_farming(AREA_WALL, 30, enemy_ai_enabled=True)
+    assert seen["target"] != (960, 540)              # 真的在推鼠标, 不是原地不动
+    assert seen["target"][1] > 540                   # 目标在墙另一侧: 先往下绕口子
+
+
+def test_auto_farming_in_a_maze_keeps_the_same_wander_goal_until_reached(monkeypatch, factory_scale):
+    m = _wall_map()
+    _farming_env(monkeypatch, m)
+    pos = {"p": (10, 10)}
+    monkeypatch.setattr(main, "get_player_position", lambda: pos["p"])
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [], 0.0, True))
+    picks = []
+    monkeypatch.setattr(main, "_pick_wander_goal", lambda *a, **k: picks.append(1) or (20, 10))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    ticks = []
+
+    def drive(mouse_target, current_pos, *a, **kw):
+        ticks.append(current_pos)
+        if len(ticks) == 1:
+            pos["p"] = (14, 10)                      # 走了一截, 没到
+        elif len(ticks) == 2:
+            pos["p"] = (20, 10)                      # 到了
+        elif len(ticks) == 3:
+            raise _Done
+        return "moved"
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(_Done):
+        main.auto_farming(AREA_WALL, 30, enemy_ai_enabled=True)
+    assert len(picks) == 2         # 第 1、2 拍共用一个目标; 到了之后第 3 拍才重新挑
+
+
+def test_auto_farming_in_a_maze_drops_the_goal_after_a_stall(monkeypatch, factory_scale):
+    m = _wall_map()
+    _farming_env(monkeypatch, m)
+    monkeypatch.setattr(main, "get_player_position", lambda: (10, 10))
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [], 0.0, True))
+    picks = []
+    monkeypatch.setattr(main, "_pick_wander_goal", lambda *a, **k: picks.append(1) or (20, 10))
+    monkeypatch.setattr(main.enemy_detect, "current_center", lambda: (960, 540))
+    n = []
+
+    def drive(*a, **kw):
+        n.append(1)
+        if len(n) == 2:
+            raise _Done
+        return "stuck"
+    monkeypatch.setattr(main, "_drive_and_check_stall", drive)
+    with pytest.raises(_Done):
+        main.auto_farming(AREA_WALL, 30, enemy_ai_enabled=True)
+    assert len(picks) == 2         # 卡住(已脱困)后换个目标
+
+
+# ── 路径只在刷怪区里走: 绕路 / 漫游的 BFS 带区域边界 ─────────────────────────────────────
+# 2026-10-10 实机: 工厂刷怪区下沿 y=98, 区外一格 y=99 是条走廊, 绕路 / 漫游的路径从那儿穿出去(143,99) ->
+# 「离开刷怪区域」-> 回区
+
+def test_bfs_reach_stays_inside_the_bounds():
+    m = _np.full((30, 30), 255, dtype=_np.uint8)
+    dist, _ = main._bfs_reach(m, (10, 10), 20, bounds=(5, 5, 15, 15))
+    assert dist and all(5 <= x <= 15 and 5 <= y <= 15 for x, y in dist)
+    # 起点在边界外一格(人刚飘出去)也能走回来, 只是不往外扩
+    dist2, _ = main._bfs_reach(m, (10, 16), 20, bounds=(5, 5, 15, 15))
+    assert (10, 15) in dist2 and not any(y > 16 for _, y in dist2)
+
+
+def test_path_approach_never_routes_outside_the_area(factory_scale):
+    m = _wall_map()
+    # 墙上下口子在 y<10 和 y>49; 区域只到 y<=45 -> 绕不过去, 不该规划出一条出区的路
+    area = [(5, 5), (55, 45)]
+    det = _det("spider", "Legendary", (33, 30), factory_scale)
+    assert main._plan_path_approach([det], (28, 30), m, area, max_cells=80, max_px=2000) is not None  # 走上口子(y<10)可以
+    area_low = [(5, 20), (55, 45)]                    # 上口子也被切掉
+    assert main._plan_path_approach([det], (28, 30), m, area_low, max_cells=80, max_px=2000) is None
+
+
+def test_wander_goal_only_uses_paths_inside_the_area():
+    m = _wall_map()
+    area = [(5, 20), (55, 45)]                        # 把两个口子都切在区外
+    import random
+    for seed in range(20):
+        g = main._pick_wander_goal(m, (20, 30), area, rng=random.Random(seed))
+        assert g is not None and g[0] < 30            # 墙另一侧走不到
+
+
+def test_wander_waypoint_is_none_when_the_only_path_leaves_the_area():
+    m = _wall_map()
+    area_low = [(5, 20), (55, 45)]                    # 墙的两个口子都在区外
+    assert main._wander_waypoint(m, (28, 30), (33, 30), area_low) is None
+    # 区域放开(口子在区内)就有路, 路点从这里直线看得到
+    wp = main._wander_waypoint(m, (28, 30), (33, 30), [(5, 5), (55, 55)])
+    assert wp is not None and main.line_of_sight(m, main._Pt(28, 30), main._Pt(*wp))
+
+
+# ── 离开刷怪区域后回哪儿: 最近的边内点是墙时不能退回区域中心(中心也可能是墙) ──────────────
+# 2026-10-10 实机: 区域 [(46,25),(193,98)], 人在 (143,99): 夹出来的边内点 (143,90) 是墙 -> None -> 退回区域中心
+# (119,61), 那也是墙且从这儿走不到 -> 寻路 18 秒后「路径规划失败」-> 「无法回到刷怪区域」整轮报废。
+
+def test_nearest_reachable_inside_finds_a_walkable_cell_by_path():
+    m = _np.zeros((300, 300), dtype=_np.uint8)
+    m[95:100, 100:150] = 255                          # 一条 y=95..99 的走廊, 区域下沿 y=98
+    area = [(46, 25), (193, 98)]
+    assert main._nearest_inside(area, (143, 99), m) is None          # 老办法: 夹出来的点是墙
+    got = main._nearest_reachable_inside(area, (143, 99), m)
+    assert got is not None and m[got[1], got[0]] == 255
+    assert 46 <= got[0] <= 193 and 25 <= got[1] <= 98
+    assert main.if_in_area([area], got)
+    assert math.hypot(got[0] - 143, got[1] - 99) > main.ARRIVE_RADIUS   # 不能落在到达半径里: 一个 moveTo 都不发
+
+
+def test_nearest_reachable_inside_is_none_when_nothing_inside_is_reachable():
+    m = _np.zeros((300, 300), dtype=_np.uint8)
+    m[100:104, 100:110] = 255                          # 区外的一小块, 够不着区内
+    assert main._nearest_reachable_inside([(46, 25), (193, 98)], (105, 101), m) is None
+
+
+def test_auto_farming_returns_to_a_reachable_cell_not_a_wall_center(monkeypatch):
+    m = _np.zeros((300, 300), dtype=_np.uint8)
+    m[95:100, 100:150] = 255
+    _pathing_env(monkeypatch)
+    monkeypatch.setattr(main, "load_binary_map", lambda: m)
+    monkeypatch.setattr(main, "get_player_position", lambda: (143, 99))    # 区外一格
+    area = [(46, 25), (193, 98)]
+    seen = {}
+
+    def path(target, areas, **kw):
+        seen["target"] = target
+        raise _Done
+    monkeypatch.setattr(main, "lazy_theta_pathing", path)
+    with pytest.raises(_Done):
+        main.auto_farming(area, 30, enemy_ai_enabled=False)
+    tx, ty = seen["target"]
+    assert m[ty, tx] == 255                          # 不是区域中心(119,61)那堵墙
+
+
+# ── 路径离墙要有净空(2026-10-10 录像: 规划出的每一跳离墙都只有 0.95 格, 贴着墙走) ──────────────────
+# 工厂 (180,145) 那个走廊转角在 8 份录像里卡了 9 次: Lazy Theta* 的任意角直线只看"没穿墙", 最短路天然贴着
+# 内侧墙角, 小地图 ±1 格的误差 + 角色有体积 + 鼠标驱动的滑动 = 蹭墙卡住。规划时给"贴墙"的格子加代价,
+# 路径自然走通道中线; 实在只有窄通道(密道)可走的地方照样走, 只是更贵。
+
+def _min_clearance(m, nodes):
+    import cv2
+    walk = (m == 255).astype(np.uint8)
+    cl = cv2.distanceTransform(cv2.copyMakeBorder(walk, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0),
+                               cv2.DIST_L2, 3)[1:-1, 1:-1]
+    lo = 99.0
+    for a, b in zip(nodes, nodes[1:]):
+        n = max(1, int(math.hypot(b[0] - a[0], b[1] - a[1]) * 2))
+        for i in range(n + 1):
+            x = int(round(a[0] + (b[0] - a[0]) * i / n))
+            y = int(round(a[1] + (b[1] - a[1]) * i / n))
+            lo = min(lo, float(cl[y, x]))
+    return lo
+
+
+def _wide_l_corridor(width=5):
+    """从左下往右上拐一个直角弯的走廊(宽 width), 外面全是墙。"""
+    m = np.zeros((60, 60), dtype=np.uint8)
+    m[40:40 + width, 5:50] = 255          # 横段
+    m[5:40 + width, 45:45 + width] = 255  # 竖段
+    return m
+
+
+def test_planned_path_keeps_off_the_walls_where_the_corridor_allows(monkeypatch):
+    m = _wide_l_corridor(5)
+    start, goal = (6, 42), (47, 6)
+    nodes = main.lazy_theta_star(m, start, goal)
+    assert nodes is not None and nodes[0] == start and nodes[-1] == goal
+    # 起点终点各贴在走廊头尾(净空小, 躲不掉); 中间的路点要在通道中线附近
+    inner = nodes[1:-1] or nodes
+    for x, y in inner:
+        assert _min_clearance(m, [(x, y), (x, y)]) >= 1.9, (x, y)
+    assert _min_clearance(m, nodes[1:-1] if len(nodes) > 2 else nodes) >= 1.9
+    # 旧行为(不带净空)在同一张图上贴着墙角, 净空 < 1.5 —— 守住"这条测试真的在测净空"
+    plain = main.lazy_theta_star(m, start, goal, clearance=False)
+    assert _min_clearance(m, plain[1:-1] if len(plain) > 2 else plain) < 1.5
+
+
+def test_planned_path_still_threads_a_one_wide_tunnel(monkeypatch):
+    m = np.zeros((40, 60), dtype=np.uint8)
+    m[5:35, 5:15] = 255                              # 左厅
+    m[5:35, 45:55] = 255                             # 右厅
+    m[20, 15:45] = 255                               # 一格宽的密道
+    nodes = main.lazy_theta_star(m, (10, 20), (50, 20))
+    assert nodes is not None and nodes[-1] == (50, 20)
+    assert all(m[y, x] == 255 for x, y in nodes)
+
+
+def test_planned_path_prefers_the_short_tunnel_over_a_long_wide_detour():
+    # 密道 14 格 vs 绕大宽走廊 ~100 格: 窄通道再贵也该走密道(净空惩罚不能大到把密道判死刑)
+    m = np.zeros((70, 60), dtype=np.uint8)
+    m[5:15, 5:15] = 255
+    m[5:15, 45:55] = 255
+    m[10, 15:45] = 255                               # 一格宽的密道(30 格长)
+    m[10:60, 5:15] = 255                             # 左厅往下接一条宽走廊
+    m[55:65, 5:55] = 255
+    m[10:65, 45:55] = 255                            # 绕一大圈回右厅
+    nodes = main.lazy_theta_star(m, (10, 10), (50, 10))
+    assert nodes is not None
+    assert all(y <= 20 for _, y in nodes), "该走密道, 却绕了下面的大圈"     # 任意角路径: 密道是一条直线段, 没有中间路点
+
+
+def test_clearance_planning_can_be_switched_off():
+    m = _wide_l_corridor(5)
+    a = main.lazy_theta_star(m, (6, 42), (47, 6), clearance=False)
+    assert a is not None
+
+
+# ── 规划结果缓存: 工厂每次死亡都从同一个出生点 (58,285) 规划到同一个刷怪点, Windows 上一次 9~12 秒 ──────────
+# 2026-10-10 三小时录像: 56 轮里 25 轮从 (58,285) 出发走同一条长路线, 光规划就 ~4 分钟。同一张图 + 同一起点 + 同一
+# 终点, Lazy Theta* 的结果是确定的 —— 命中就直接给, 不重算。键里带地图内容指纹(开了传送门缺口的图是另一张图)。
+
+def test_lazy_theta_star_caches_identical_requests(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _wide_l_corridor(5)
+    calls = []
+    real_pen = main._wall_penalty
+    monkeypatch.setattr(main, "_wall_penalty", lambda mm: calls.append(1) or real_pen(mm))
+    a = main.lazy_theta_star(m, (6, 42), (47, 6))
+    n_first = len(calls)
+    b = main.lazy_theta_star(m, (6, 42), (47, 6))
+    assert a == b and a is not None
+    assert len(calls) == n_first, "第二次相同请求不该重新规划"
+    a.append((0, 0))                                     # 调用方改了拿到的列表, 缓存里的不能跟着变
+    assert main.lazy_theta_star(m, (6, 42), (47, 6)) == b
+
+
+def test_plan_cache_is_keyed_on_map_start_goal_and_clearance():
+    main._PLAN_CACHE.clear()
+    m = _wide_l_corridor(5)
+    p1 = main.lazy_theta_star(m, (6, 42), (47, 6))
+    assert main.lazy_theta_star(m, (7, 42), (47, 6)) is not None          # 起点不同 -> 另一条
+    m2 = m.copy()
+    m2[40:45, 25:30] = 0                                                  # 把走廊整段封死(地图内容变了) -> 不能命中旧路径
+    assert main.lazy_theta_star(m2, (6, 42), (47, 6)) is None
+    plain = main.lazy_theta_star(m, (6, 42), (47, 6), clearance=False)    # 带不带净空是两个键
+    assert plain is not None and plain != p1
+    assert main.lazy_theta_star(m, (6, 42), (47, 6)) == p1                # 原图原请求仍命中老结果
+
+
+def test_plan_cache_does_not_remember_failures_forever():
+    main._PLAN_CACHE.clear()
+    m = np.zeros((20, 20), dtype=np.uint8)
+    m[2, 2] = 255
+    m[15, 15] = 255
+    assert main.lazy_theta_star(m, (2, 2), (15, 15)) is None
+    m[2:16, 2:16] = 255                                                   # 同一个数组被改成通的(地图内容变了)
+    assert main.lazy_theta_star(m, (2, 2), (15, 15)) is not None
+
+
+# ── 纯追踪走路径(工厂) ───────────────────────────────────────────────────────────
+# 2026-10-10 工厂录像 + 官方 factory.tmj: 反复卡住的 (151,188) / (180,145) 都在官方 shortcut(通风管)层的瓦片上
+# —— 密道, 实际可走宽度恰好 1 个瓦片(512 世界单位 ≈ 3.2 个小地图格, 小地图画成 4 格); 跑图装的速度 1000~3000 u/s
+# (12 格/秒), 而 move_to_position 一拍要 ~0.35 秒(每拍两次抓屏查死亡), 一拍跑 4 格, 逐点"追节点 + 比例鼠标偏移"
+# 的闭环在这种延迟下会振荡: 录像里在竖井口沿墙来回荡 ±7 格, 14 拍后判卡住, 脱困 + 重规划又十几秒。
+# 纯追踪: 瞄**路径上前方 PURSUIT_LOOKAHEAD 格**的点(永远在前面, 不存在"冲过节点"), 鼠标偏移满量(不做比例
+# 增益), 只有临近终点才减速; 查死亡画面降到每 0.5 秒一次。
+
+class _PursuitFlower:
+    """离线物理: 速度朝鼠标方向走(满量偏移=vmax 格/秒), 撞墙沿轴滑; 位置每次读取推进 dt 秒。
+    坐标跟实机读数一致: 像素下标 i 的中心在读数 i+0.5(像素 = floor(读数)); start 给像素下标, 站在它的中心。
+    身体有半径 RADIUS(实机 ~0.2 格, 这里取 0.3 偏保守): 四个角任何一个进墙就算撞上 —— 贴着拐角内侧擦过去会被顶住。"""
+
+    RADIUS = 0.3
+
+    def __init__(self, walk, start, vmax=6.0, dt=0.12):
+        self.walk, self.vmax, self.dt = walk, vmax, dt
+        self.p = [float(start[0]) + 0.5, float(start[1]) + 0.5]
+        self.mouse = None
+
+    def _wall(self, x, y):
+        h, w = self.walk.shape
+        for ox in (-self.RADIUS, self.RADIUS):
+            for oy in (-self.RADIUS, self.RADIUS):
+                xi, yi = int(math.floor(x + ox)), int(math.floor(y + oy))
+                if not (0 <= xi < w and 0 <= yi < h) or self.walk[yi, xi] == 0:
+                    return True
+        return False
+
+    def read(self, precise=False):
+        if self.mouse is not None:
+            ox = self.mouse[0] - main.SCREEN_WIDTH // 2
+            oy = self.mouse[1] - main.SCREEN_HEIGHT // 2
+            d = (ox * ox + oy * oy) ** 0.5
+            if d >= 1:
+                sp = self.vmax * min(d / (250 * main.mouse_scale()), 1.0)
+                for _ in range(6):
+                    for tx, ty in ((self.p[0] + sp * ox / d * self.dt / 6, self.p[1] + sp * oy / d * self.dt / 6),
+                                   (self.p[0] + sp * ox / d * self.dt / 6, self.p[1]),
+                                   (self.p[0], self.p[1] + sp * oy / d * self.dt / 6)):
+                        if not self._wall(tx, ty):
+                            self.p = [tx, ty]
+                            break
+        return (self.p[0], self.p[1]) if precise else (int(math.floor(self.p[0])), int(math.floor(self.p[1])))
+
+
+def _pursuit_env(monkeypatch, walk, start, **kw):
+    _stub_move_env(monkeypatch)
+    flower = _PursuitFlower(walk, start, **kw)
+    monkeypatch.setattr(main, "get_player_position", lambda precise=False, **k: flower.read(precise))
+    monkeypatch.setattr(main, "_move_mouse_safely", lambda p: setattr(flower, "mouse", p))
+    monkeypatch.setattr(main, "reset_keyboard", lambda: setattr(flower, "mouse", None))
+    monkeypatch.setattr(main, "release_keys", lambda: None)
+    return flower
+
+
+def _zigzag_map():
+    """宽 60 的图里一条 4 格宽、带三个直角弯的走廊(像工厂的密道)。"""
+    m = np.zeros((60, 60), dtype=np.uint8)
+    m[8:12, 5:40] = 255      # 横 1
+    m[8:30, 36:40] = 255     # 竖 1
+    m[26:30, 20:40] = 255    # 横 2 (向左)
+    m[26:52, 20:24] = 255    # 竖 2
+    return m
+
+
+def _vent_map():
+    """工厂 (180,161) 井口的几何: 4 格宽的横走廊拐进 4 格宽、往北的竖井(像素 180..183)。"""
+    m = np.zeros((200, 200), dtype=np.uint8)
+    m[161:165, 150:190] = 255        # 横走廊(4 格宽)
+    m[140:161, 180:184] = 255        # 竖井(4 格宽, 可走 c.x ∈ [180, 184))
+    return m
+
+
+def test_follow_path_does_not_cut_the_corner_into_the_vent_mouth(monkeypatch):
+    """2026-10-11 录像: 横走廊拐进竖井, 前瞻点落在拐角后面, 瞄点连线从内侧墙角擦过 -> 人贴着井口左墙
+    (c.x≈180.0)往北顶, 4 秒进度不涨判卡住, 同一个地方 4 次。瞄点要离墙边够远, 拐角前瞄拐角本身。"""
+    m = _vent_map()
+    start, goal = (152, 162), (181, 142)
+    path = main.lazy_theta_star(m, start, goal)
+    assert path is not None
+    flower = _pursuit_env(monkeypatch, m, start, vmax=12.0, dt=0.15)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main.time, "sleep", lambda s: clock.update(t=clock["t"] + max(s, 0.05)))
+    real_read = main.get_player_position
+    monkeypatch.setattr(main, "get_player_position",
+                        lambda precise=False, **k: (clock.update(t=clock["t"] + 0.15), real_read(precise))[1])
+    assert main.follow_path(path, binary_map=m) is True
+    assert flower.p[1] < 148                                    # 真的钻进井里往北走了(到终点 5 格内就算到)
+
+
+def test_inset_areas_shrinks_farm_areas_but_not_portal_boxes():
+    farm = [[(46, 25), (193, 98)]]
+    assert main._inset_areas(farm, 4) == [((50, 29), (189, 94))]
+    assert main._inset_areas([[(193, 98), (46, 25)]], 4) == [((50, 29), (189, 94))]     # 两个角顺序不限
+    portal = [[(145, 35), (155, 45)]]                                  # 传送点到达框 10x10: 原样
+    assert main._inset_areas(portal, 4) == [((145, 35), (155, 45))]
+
+
+def test_lazy_pathing_only_stops_a_few_cells_inside_the_farm_area(monkeypatch):
+    """进区就收手贴着边界, 惯性一滑就出区, 「离开刷怪区域 -> 重新寻路回去」每 25 秒一轮(2026-10-11)。"""
+    _stub_move_env(monkeypatch)
+    m = np.full((120, 220), 255, dtype=np.uint8)
+    monkeypatch.setattr(main, "load_binary_map", lambda: m)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "_on_wrong_map", lambda: None)
+    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
+    monkeypatch.setattr(main.cdp_bridge, "inject_canvas_hook", lambda *a, **k: None, raising=False)
+    seen = {}
+    pos = {"p": (170, 120 - 5)}
+
+    def fake_exec(path, stop_when=None, **kw):
+        seen["stop"] = stop_when
+        pos["p"] = (170, 60)
+        return True
+
+    monkeypatch.setattr(main, "execute_path", fake_exec)
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: pos["p"])
+    monkeypatch.setattr(main, "_use_pursuit", lambda: False)
+    area = [[(46, 25), (193, 98)]]
+    main.lazy_theta_pathing((145, 72), area)
+    assert seen["stop"]((170, 98)) is False          # 刚踩进边界: 还要往里走
+    assert seen["stop"]((170, 96)) is False
+    assert seen["stop"]((170, 93)) is True           # 离边 5 格: 够了
+
+
+def test_pursuit_aim_stops_short_of_a_corner_that_would_graze_the_wall():
+    m = _vent_map()
+    clear = main._clearance_map(m)
+    # 路径: 沿横走廊中线往东到拐角 (182.0, 163.0), 再往北进井
+    pts = [(152.0, 163.0), (182.0, 163.0), (182.0, 141.0)]
+    cum = [0.0, 30.0, 52.0]
+    pos = (178.0, 163.0)                                        # 离拐角 4 格, 前瞻 6 格会越过拐角
+    raw = main._path_point(pts, cum, 28.0 + main.PURSUIT_LOOKAHEAD)
+    assert raw == (182.0, 159.0)
+    assert not main._clear_los(clear, pos, raw)                 # 直奔它要从井口左墙角(180,161)上擦过去
+    aim = main._pursuit_aim(pts, cum, 28.0, pos, m, clear)
+    assert aim is not None and aim != raw
+    assert main._clear_los(clear, pos, aim)                     # 选的瞄点连线离墙边够远
+    assert aim[0] > pos[0]                                      # 朝拐角方向, 没往墙里削
+
+
+def test_pursuit_aim_pulls_a_wall_hugging_path_point_to_the_corridor_middle():
+    """工厂 (181,161)->(180,143) 那条路径: 节点是像素下标, 竖井里它走在最左一列(c.x∈[180,181), 离墙边 0.5 格),
+    人瞄着它稍有横向误差就蹭墙。瞄点要先挪到井的中线(c.x≈182)。"""
+    m = _vent_map()
+    clear = main._clearance_map(m)
+    hug = (180.5, 150.5)                                         # 井里最左一列的中心
+    assert main._edge_dist(clear, *hug) < 0.6
+    mid = main._centered(m, clear, hug)
+    assert 181.4 <= mid[0] <= 182.6 and abs(mid[1] - hug[1]) <= 1.0
+    assert main._edge_dist(clear, *mid) >= 1.3
+    # 本来就在中间的点不动
+    assert main._centered(m, clear, (182.0, 150.5)) == (182.0, 150.5)
+
+
+def test_centering_never_jumps_through_a_wall_into_the_next_corridor(monkeypatch):
+    monkeypatch.setattr(main, "PURSUIT_CENTER_RADIUS", 4.0)
+    m = np.zeros((40, 60), dtype=np.uint8)
+    m[10:12, 5:50] = 255                    # 上面一条 2 格宽的走廊, 隔 1 格墙
+    m[13:17, 5:50] = 255                    # 下面一条 4 格宽, 中线(y=15)净空更大, 在挪动半径内, 诱惑挪过去
+    clear = main._clearance_map(m)
+    assert main._edge_dist(clear, 20.5, 15.0) > main._edge_dist(clear, 20.5, 11.0) + 0.5
+    q = main._centered(m, clear, (20.5, 11.0))
+    assert 10.0 <= q[1] < 12.0              # 还在上面那条里
+
+
+def test_pursuit_aim_uses_the_centered_point_when_the_path_hugs_the_wall():
+    m = _vent_map()
+    clear = main._clearance_map(m)
+    pts = [(180.5, 160.5), (180.5, 141.5)]                   # 路径走在竖井最左一列
+    cum = [0.0, 19.0]
+    pos = (182.0, 158.0)
+    aim = main._pursuit_aim(pts, cum, 2.5, pos, m, clear)
+    assert aim is not None and aim[0] >= 181.4               # 瞄的是井中线, 不是贴墙的那一列
+
+
+def test_pursuit_aim_from_a_wall_hugging_start_heads_along_the_corridor_not_into_the_corner():
+    """录像里的停滞点: 人贴着走廊上沿(c.y=161.4)走到 c.x=180.0, 井口就在前面。瞄点不能再往北削拐角
+    (人身子已经压着井口左墙角, 往北直接顶墙); 要沿走廊往东、往中间走, 过了井口再进井。"""
+    m = _vent_map()
+    clear = main._clearance_map(m)
+    path = [(152, 163), (170, 163), (181, 161), (181, 143)]
+    off = main.PURSUIT_NODE_OFFSET
+    pts = [(x + off, y + off) for x, y in path]
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    pos = (180.0, 161.4)
+    s = main._path_progress(pts, cum, pos, 0.0)
+    aim = main._pursuit_aim(pts, cum, s, pos, m, clear)
+    assert aim is not None
+    assert aim[0] - pos[0] > abs(aim[1] - pos[1])               # 往东为主, 不是往北
+
+
+def _pillar_gap_scene():
+    """工厂 (125,246) 的几何缩小版: 沿墙垛左面往北的长直路, 拐进墙垛之间的口子往东, 出口再往北。
+    人满速冲过口子往北多跑了一截(overshoot)。"""
+    m = np.zeros((60, 40), dtype=np.uint8)
+    m[:, 0:6] = 255                  # 左边的长走廊
+    m[19:24, 0:12] = 255             # 口子(5 格宽)通到右边
+    m[0:24, 9:12] = 255              # 口子出口往北的走廊
+    path = [(4, 50), (4, 21), (10, 21), (10, 2)]
+    off = main.PURSUIT_NODE_OFFSET
+    pts = [(x + off, y + off) for x, y in path]
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    return m, pts, cum
+
+
+def test_path_progress_does_not_jump_across_a_wall_to_a_later_leg():
+    m, pts, cum = _pillar_gap_scene()
+    pos = (4.5, 12.0)                                    # 冲过口子往北 9 格
+    s0 = 29.0                                            # 进度停在拐角
+    assert main._path_progress(pts, cum, pos, s0) > s0 + 8       # 几何上最近的点在墙那边的后一段
+    # 不许跳: 那一点从人这里看不见(隔着墙垛), 只推进到看得见的那几格(口子入口), 不是跳 8 格过墙
+    assert main._advance_progress(pts, cum, pos, s0, m) <= s0 + main.PURSUIT_ADVANCE_MAX / 2
+    assert main._advance_progress(pts, cum, pos, s0, None) == s0 + main.PURSUIT_ADVANCE_MAX   # 没地图只封顶
+    # 正常往前走(同一条走廊里, 看得见)照常推进, 但一次不超过上限
+    pos2 = (4.5, 40.0)
+    assert main._advance_progress(pts, cum, pos2, 2.0, m) > 2.0
+    assert main._advance_progress(pts, cum, pos2, 2.0, m) <= 2.0 + main.PURSUIT_ADVANCE_MAX
+
+
+def test_pursuit_aim_goes_back_to_the_path_when_every_point_ahead_is_behind_a_wall():
+    m, pts, cum = _pillar_gap_scene()
+    clear = main._clearance_map(m)
+    pos = (4.5, 12.0)
+    s0 = 33.0                                           # 进度已经在口子里面, 前面的点全在墙垛后面
+    assert not any(main._visible(m, pos, main._path_point(pts, cum, s0 + d)) for d in (0.6, 1.5, 3, 6))
+    aim = main._pursuit_aim(pts, cum, s0, pos, m, clear)
+    assert aim is not None                              # 不再返回 None 让调用方瞎绕
+    assert main._visible(m, pos, aim)                   # 瞄的是看得见的点(先回到路径上)
+    assert aim[1] > pos[1]                              # 往南回到口子那一层, 不是继续往北
+
+
+def test_edge_dist_is_the_distance_to_the_wall_edge():
+    m = np.zeros((20, 20), dtype=np.uint8)
+    m[5:15, 5:15] = 255                                         # 10x10 可走, 外面是墙
+    clear = main._clearance_map(m)
+    assert main._edge_dist(clear, 10.0, 10.0) == pytest.approx(4.5, abs=0.6)   # 中心 ~5 格到边
+    assert main._edge_dist(clear, 5.0, 10.0) == pytest.approx(0.0, abs=0.05)   # 贴在墙边上
+    assert main._edge_dist(clear, 5.5, 10.0) == pytest.approx(0.5, abs=0.05)
+    assert main._edge_dist(clear, 2.0, 2.0) < 0                                # 墙里是负的
+
+
+def test_follow_path_walks_a_zigzag_corridor_at_speed(monkeypatch):
+    m = _zigzag_map()
+    start, goal = (6, 10), (22, 50)
+    path = main.lazy_theta_star(m, start, goal)
+    flower = _pursuit_env(monkeypatch, m, start, vmax=14.0)        # 跑图装速度(一拍 ~1.7 格)
+    assert main.follow_path(path, binary_map=m) is True
+    assert math.hypot(flower.p[0] - goal[0] - 0.5, flower.p[1] - goal[1] - 0.5) < main.ARRIVE_RADIUS + 0.5
+
+
+def test_follow_path_aims_ahead_on_the_path_not_at_the_node_it_just_passed(monkeypatch):
+    m = np.full((40, 80), 255, dtype=np.uint8)
+    flower = _pursuit_env(monkeypatch, m, (10, 20), vmax=6.0)
+    aims = []
+    orig = main._move_mouse_safely
+    monkeypatch.setattr(main, "_move_mouse_safely", lambda p: (aims.append(p), orig(p))[1])
+    assert main.follow_path([(10, 20), (50, 20), (50, 5)], binary_map=m) is True
+    # 过了第二个节点之后鼠标朝上(往 (50,5) 去), 不会回头朝 (50,20)
+    assert any(a[1] < main.SCREEN_HEIGHT // 2 - 50 for a in aims)
+    assert not any(a[0] < main.SCREEN_WIDTH // 2 - 50 for a in aims)     # 全程没往回(左)推
+    # 还在第一段上(离拐角远于前瞻)时瞄的是这一段上前方的点, 不是直奔终点(终点在右上, 直奔会往上偏)
+    early = aims[:6]
+    assert early and all(abs(a[1] - main.SCREEN_HEIGHT // 2) < 25 for a in early)
+
+
+def test_follow_path_slows_down_near_the_end_only(monkeypatch):
+    m = np.full((40, 120), 255, dtype=np.uint8)
+    flower = _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    offsets = []
+    orig = main._move_mouse_safely
+    monkeypatch.setattr(main, "_move_mouse_safely",
+                        lambda p: (offsets.append((flower.p[0], abs(p[0] - main.SCREEN_WIDTH // 2))), orig(p))[1])
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=m) is True
+    far = [o for x, o in offsets if x < 70]
+    near = [o for x, o in offsets if x > 94]
+    assert min(far) >= 499 * main.mouse_scale() - 1                         # 路上满量, 不做比例增益
+    assert near and min(near) < max(far) * 0.6                              # 临近终点才收
+
+
+def test_follow_path_brakes_before_a_sharp_turn_but_not_on_a_straight_run(monkeypatch):
+    # 满量偏移 + 控制延迟 = 速度大时冲过拐角撞墙: 离急转弯不到 PURSUIT_BRAKE_DIST 格才收偏移, 直路满量
+    m = np.full((80, 80), 255, dtype=np.uint8)
+    flower = _pursuit_env(monkeypatch, m, (5, 60), vmax=6.0)
+    log = []
+    orig = main._move_mouse_safely
+
+    def spy(p):
+        d = math.hypot(p[0] - main.SCREEN_WIDTH // 2, p[1] - main.SCREEN_HEIGHT // 2)
+        log.append((flower.p[0], flower.p[1], d))
+        orig(p)
+    monkeypatch.setattr(main, "_move_mouse_safely", spy)
+    # 先沿 y=60 往右走 60 格, 在 (65,60) 直角拐上去走 40 格
+    assert main.follow_path([(5, 60), (65, 60), (65, 20)], binary_map=m) is True
+    full = 500 * main.mouse_scale()
+    straight = [d for x, y, d in log if y > 59 and x < 65 - main.PURSUIT_BRAKE_DIST - 3]
+    corner = [d for x, y, d in log if y > 59 and 65 - main.PURSUIT_BRAKE_DIST / 2 < x < 64.5]
+    assert straight and min(straight) >= full - 1                         # 直路满量
+    assert corner and max(corner) < full * 0.9                            # 拐角前收了
+    assert min(d for _, _, d in log if _ > 0) >= main.PURSUIT_BRAKE_FLOOR * full * 0.9   # 收也有下限
+
+
+def test_follow_path_hands_over_on_stop_when_deadline_and_enemy(monkeypatch):
+    m = np.full((40, 120), 255, dtype=np.uint8)
+    flower = _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=m, stop_when=lambda p: p[0] > 30) is True
+    assert flower.p[0] < 45                                                  # 进区就收手, 没走完
+    flower = _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main.time, "sleep", lambda s: clock.update(t=clock["t"] + max(s, 0.1)))
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=m, deadline=3.0) == "timeout"
+
+    class W:
+        def should_flee(self):
+            return True
+    flower = _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=m, enemy_watch=W()) == "enemy"
+
+
+def test_follow_path_calls_a_wall_pinned_player_stuck(monkeypatch):
+    m = np.full((40, 120), 255, dtype=np.uint8)
+    m[:, 40:44] = 0                                      # 路径穿墙(用错的图规划): 人顶着墙进不去
+    flower = _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main.time, "sleep", lambda s: clock.update(t=clock["t"] + max(s, 0.1)))
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=None) == "stuck"
+
+
+def test_follow_path_waits_out_a_brief_position_loss_instead_of_calling_it_stuck(monkeypatch):
+    """传送刚落地 / 画布这一瞬没画小地图: 位置读不到几次再回来。原来第一次读不到就返回 stuck, 紧跟着的
+    脱困在出生点旁边乱走进了回花园的门(2026-10-11 录像)。"""
+    m = np.full((40, 120), 255, dtype=np.uint8)
+    flower = _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main.time, "sleep", lambda s: clock.update(t=clock["t"] + max(s, 0.05)))
+    real_read = main.get_player_position
+    calls = {"n": 0}
+
+    def read(precise=False, **k):
+        calls["n"] += 1
+        clock["t"] += 0.1
+        if calls["n"] <= 5:                    # 前 5 次读不到
+            return None
+        return real_read(precise)
+
+    monkeypatch.setattr(main, "get_player_position", read)
+    assert main.follow_path([(5, 20), (60, 20)], binary_map=m) is True
+
+
+def test_follow_path_gives_up_when_the_position_never_comes_back(monkeypatch):
+    m = np.full((40, 120), 255, dtype=np.uint8)
+    _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main.time, "sleep", lambda s: clock.update(t=clock["t"] + max(s, 0.05)))
+    monkeypatch.setattr(main, "get_player_position",
+                        lambda precise=False, **k: (clock.update(t=clock["t"] + 0.1), None)[1])
+    assert main.follow_path([(5, 20), (60, 20)], binary_map=m) == "stuck"
+    assert clock["t"] >= main.PURSUIT_POS_LOST_S              # 等满了才放弃, 不是第一次读不到就走
+
+
+def test_follow_path_reports_death_and_menu(monkeypatch):
+    m = np.full((40, 120), 255, dtype=np.uint8)
+    _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    monkeypatch.setattr(main, "on_death_screen", lambda: True)
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=m) == "in_game_dead"
+    _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0)
+    monkeypatch.setattr(main, "on_death_screen", lambda: False)
+    monkeypatch.setattr(main, "on_start_screen", lambda: True)
+    assert main.follow_path([(5, 20), (100, 20)], binary_map=m) == "in_menu"
+
+
+def test_follow_path_checks_the_death_screen_only_twice_a_second(monkeypatch):
+    m = np.full((40, 200), 255, dtype=np.uint8)
+    _pursuit_env(monkeypatch, m, (5, 20), vmax=6.0, dt=0.12)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(main.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(main.time, "sleep", lambda s: clock.update(t=clock["t"] + s))
+    checks = []
+    monkeypatch.setattr(main, "on_death_screen", lambda: checks.append(clock["t"]) or False)
+    real_read = main.get_player_position
+    monkeypatch.setattr(main, "get_player_position",
+                        lambda precise=False, **k: (clock.update(t=clock["t"] + 0.12), real_read(precise))[1])
+    assert main.follow_path([(5, 20), (150, 20)], binary_map=m) is True
+    gaps = [b - a for a, b in zip(checks, checks[1:])]
+    assert len(checks) >= 3 and min(gaps) >= main.PURSUIT_SCREEN_CHECK_S - 1e-9
+
+
+def test_follow_path_with_a_single_node_is_already_there(monkeypatch):
+    m = np.full((20, 20), 255, dtype=np.uint8)
+    _pursuit_env(monkeypatch, m, (5, 5))
+    assert main.follow_path([(5, 5)], binary_map=m) is True
+    assert main.follow_path([], binary_map=m) == "stuck"
+    assert main.follow_path(None, binary_map=m) == "stuck"
+
+
+def test_pathing_uses_the_pursuit_executor_only_on_pursuit_maps(monkeypatch):
+    for map_name, want in (("factory", True), ("desert", False), ("anthell", False)):
+        monkeypatch.setattr(main.utils, "MAP", map_name)
+        assert main._use_pursuit() is want, map_name
+    monkeypatch.setattr(main, "PURSUIT_ENABLED", False)
+    monkeypatch.setattr(main.utils, "MAP", "factory")
+    assert main._use_pursuit() is False                                      # 总开关

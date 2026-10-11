@@ -366,6 +366,33 @@ def capture_screenshot(timeout=5):
     return base64.b64decode(result["result"]["data"])
 
 
+def screenshot_jpeg_small(cdp=None, *, quality=55, scale=0.5, timeout=10):
+    """给录像用的缩小 JPEG 截图(返回字节)。cdp: 发 CDP 命令的函数(测试里注入假的), 默认 _send_cdp_command。
+
+    **别给 Page.captureScreenshot 传 clip / scale 来缩小**: 带 clip.scale 时 Chrome 会临时按缩小后的尺寸重排合成,
+    玩家看到的是每次截图一闪白屏 + 整个画面缩一下(2026-10-08 用户反馈; 实测合成帧在截图期间变成一半大小, 不带 clip
+    或 scale=1 都没有)。所以整幅截下来, 缩小留到本地用 cv2 做; 缩小失败(没有 cv2 / 解不开)就原样返回整幅。
+    整幅那次用较高画质(缩小后还要再编一次, 最终文件才按 quality)。"""
+    cdp = cdp or _send_cdp_command
+    resp = cdp("Page.captureScreenshot",
+               {"format": "jpeg", "quality": quality if scale >= 1 else 85}, timeout=timeout)
+    data = base64.b64decode(resp["result"]["data"])
+    if scale >= 1:
+        return data
+    try:
+        import cv2
+        import numpy as np
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return data
+        small = cv2.resize(img, (max(1, round(img.shape[1] * scale)), max(1, round(img.shape[0] * scale))),
+                           interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
+        return buf.tobytes() if ok else data
+    except Exception:
+        return data
+
+
 # 未打包: 跟本模块同目录. PyInstaller 打包后: main.spec 把它作为 datas 塞进
 # _internal/ (onedir 下就是 sys._MEIPASS), 冻结模块的 __file__ 不一定指到真实
 # 路径, 所以 frozen 时改从 _MEIPASS 取.

@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import traceback
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
@@ -133,6 +133,35 @@ def start_afk(*, exe_exists, running, confirm_download):
             return "declined"
         return "downloaded" if afk_watch.download_florr_auto_afk() else "download_failed"
     return "started"
+
+
+def afk_launch_plan(*, running, ours, exe_exists):
+    """AFK 开关打开时, 对"segment.exe 已经在跑"这件事怎么处置(纯函数)。
+    start:   没在跑, 走 start_afk 的下载 / 启动流程
+    already: 在跑而且是本次启动自己拉起的, 不动
+    restart: 在跑但不是本进程拉起的 —— 上次退出 / 崩溃时遗留的实例(2026-10-11 粉丝: 退出应用后它
+             还留着, 再启动就认不出 AFK 弹窗了), 收掉重开一个干净的
+    我们没装 exe 时没法重开(在跑的多半是用户自己另装的一份), 保持"已经在跑, 不动"。
+    """
+    if not running:
+        return "start"
+    if ours or not exe_exists:
+        return "already"
+    return "restart"
+
+
+def manual_afk_install(zip_path, *, install, start):
+    """「手动安装」选好 zip 之后的决策(纯函数, 副作用由调用方传进来的 install / start 做).
+    cancelled: 没选文件
+    install_failed: 校验不过 / 坏 zip / 读不了(install 返回 False), 不启动
+    installed: 装好了, 并已调用 start()
+    """
+    if not zip_path:
+        return "cancelled"
+    if not install(zip_path):
+        return "install_failed"
+    start()
+    return "installed"
 
 
 def plan_transition(running_id, new_block, chrome_profile):
@@ -348,12 +377,16 @@ class App(ctk.CTk):
                                        command=self._on_afk_toggle)
         self.afk_switch.pack(anchor="w", padx=12, pady=(4, 0))
         theme.hint(afk, "后台跑 florr-auto-afk,\n自动点掉 AFK 检测弹窗" if _IS_WINDOWS
-                   else "仅 Windows 可用").pack(anchor="w", padx=12, pady=(2, 10))
+                   else "仅 Windows 可用").pack(anchor="w", padx=12, pady=(2, 4))
+        # 自动下载(约 380MB)在有的网络下下不动: 留一个手动选已下载 zip 的入口
+        self.afk_manual_btn = theme.ghost_button(afk, "手动安装", self._manual_afk_install, height=26)
+        self.afk_manual_btn.pack(anchor="w", padx=12, pady=(0, 10))
         if self._cfg["afk_enabled"]:
             self.afk_switch.select()
             self.after(400, self._ensure_afk)
         if not _IS_WINDOWS:
             self.afk_switch.configure(state="disabled")
+            self.afk_manual_btn.configure(state="disabled")
 
         theme.ghost_button(side, "反馈问题", self._on_feedback, height=30).grid(
             row=5, column=0, padx=12, pady=(0, 8), sticky="ew")
@@ -387,7 +420,16 @@ class App(ctk.CTk):
                              width=72).pack(side="left")
         self._login_guide = gui_chrome_flow.LoginGuide(
             _GuideHost(self._guide_frame, self._guide_grid_kw, self._guide_state),
-            after=self.after)
+            after=self.after, on_launch_error=self._on_chrome_launch_error)
+
+    def _on_chrome_launch_error(self, err):
+        """点「登录」时 Chrome 起不来(没装): 弹窗说清楚, 别让它变成未捕获异常 / bug 上报。"""
+        self._log_line(f"⚠️ 起 Chrome 失败: {err}\n")
+        messagebox.showerror(
+            "没找到 Chrome",
+            f"{err}\n\n本程序用 Chrome 打开 florr.io 并读取游戏画面,需要先安装 Google Chrome。\n"
+            "装好后再点一次「登录」。",
+            parent=self)
 
     # ---- 状态展示 ----
     _STATUS_COLORS = {"off": theme.FAINT, "run": theme.SUCCESS, "idle": theme.WARN}
@@ -549,6 +591,13 @@ class App(ctk.CTk):
 
     def _enter_block(self, blk, relaunch):
         self._stop_worker_sync()
+        # plan_transition 只比账号名: self._chrome_profile 是"上次开过哪个账号"的记忆, 不是 Chrome 现在
+        # 还活着的证据。刷怪中被强关 Chrome 后记忆没变 -> 判"同一账号, 不用重开" -> worker 一起来自检
+        # 不过就退出 -> 下个 tick 又是同样的判断, 永远循环(2026-10-11 粉丝反馈"专用 Chrome 未就绪")。
+        # 跟 worker 自检用同一个判据, 进时块前核对一次。
+        if not relaunch and not cdp_bridge.is_dedicated_chrome_ready():
+            self._log_line("专用 Chrome 不在了 (被关掉 / florr.io 标签页没了), 重新打开…\n")
+            relaunch = True
         if relaunch:
             rel = gui_accounts.profile_dir(self._cfg, blk["profile"])
             if rel is None:
@@ -561,6 +610,9 @@ class App(ctk.CTk):
                 self._set_running_block(None)
                 return
             self._log_line(f"切到账号『{blk['profile']}』, 重开 Chrome…\n")
+            # launch 会先杀掉所有 Chrome: 旧的"开着哪个账号"从这一刻起就不作数了。重开没成的话
+            # 留着它, 下个 tick 又会把一个已经死掉的 Chrome 当成还在用。
+            self._chrome_profile = None
             try:
                 cdp_bridge.launch_chrome_for_profile(pdir, fullscreen=True)
             except RuntimeError as e:
@@ -743,9 +795,14 @@ class App(ctk.CTk):
             return
         exe_exists = os.path.isfile(afk_watch._EXE_PATH)
         running = afk_watch.is_florr_auto_afk_running()
-        if running:
+        plan = afk_launch_plan(running=running, ours=afk_watch.started_by_this_session(),
+                               exe_exists=exe_exists)
+        if plan == "already":
             self._log_line("AFK: already\n")
             return
+        stale = plan == "restart"
+        if stale:
+            self._log_line("AFK: 发现上次遗留的 florr-auto-afk, 收掉后重新启动\n")
         if not exe_exists:
             if not messagebox.askyesno(
                     "下载 florr-auto-afk?",
@@ -760,6 +817,8 @@ class App(ctk.CTk):
 
         def _work():
             try:
+                if stale:
+                    afk_watch.stop_florr_auto_afk()
                 outcome = start_afk(exe_exists=exe_exists, running=False,
                                     confirm_download=lambda: True)
                 if outcome in ("started", "downloaded"):
@@ -778,6 +837,63 @@ class App(ctk.CTk):
             pass
         close_busy_modal(modal, self.after)      # 不能直接 destroy, 见 close_busy_modal
         self._log_line(f"AFK: {outcome}\n")
+        if outcome == "installed":
+            # 手动装好并已启动: 开关跟着打开并记住, 不然下次启动又不管它了
+            try:
+                self.afk_switch.select()
+            except Exception:
+                pass
+            self._persist_afk(True)
+        # 弹窗晚一点再开: 等"请稍候"小窗先收掉, 不然两个窗叠在一起
+        if outcome == "download_failed":
+            self.after(MODAL_DESTROY_DELAY_MS + 200, self._offer_manual_afk_install)
+        elif outcome == "install_failed":
+            self.after(MODAL_DESTROY_DELAY_MS + 200, self._explain_afk_install_failed)
+
+    def _offer_manual_afk_install(self):
+        """自动下载没成: 讲清手动怎么装, 用户说已经下好了就直接去选文件。"""
+        if messagebox.askyesno(
+                "自动下载失败",
+                afk_watch.manual_install_instructions()
+                + "\n\n已经下载好了吗? 点「是」现在选择这个 zip 文件。",
+                parent=self):
+            self._manual_afk_install()
+
+    def _explain_afk_install_failed(self):
+        messagebox.showerror(
+            "安装失败",
+            "这个文件不能用: 校验值对不上(不是 florr-auto-afk 的安装包, 或者没下载完整),\n"
+            "也可能是压缩包损坏。请重新下载:\n"
+            f"{afk_watch._MIRROR_URL}\n\n"
+            "下好后再点「手动安装」选择它。",
+            parent=self)
+
+    def _manual_afk_install(self):
+        """让用户选一份自己下好的 florr-auto-afk zip, 校验后装上并启动(侧栏「手动安装」/ 下载失败的出口)。"""
+        if not _IS_WINDOWS or getattr(self, "_afk_busy", False):
+            return
+        opts = {"parent": self, "title": "选择下载好的 florr-auto-afk 安装包",
+                "filetypes": [("zip 压缩包", "*.zip"), ("所有文件", "*.*")]}
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        if os.path.isdir(downloads):
+            opts["initialdir"] = downloads
+        path = filedialog.askopenfilename(**opts)
+        if not path:
+            return
+        self._afk_busy = True
+        self.afk_switch.configure(state="disabled")
+        modal = self._busy_modal("正在校验并安装 AFK 助手，请稍候…\n(约 380MB, 解压需要一会儿)")
+
+        def _work():
+            try:
+                outcome = manual_afk_install(
+                    path, install=afk_watch.install_from_zip,
+                    start=afk_watch.ensure_florr_auto_afk_running)
+            except Exception as e:
+                outcome = f"出错: {e}"
+            self.after(0, self._finish_ensure_afk, modal, outcome)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _on_afk_toggle(self):
         enabled = bool(self.afk_switch.get())
@@ -928,10 +1044,22 @@ class App(ctk.CTk):
             except Exception:
                 pass
         self._stop_worker_sync()
+        self._stop_afk_on_exit()
         t = self._hb_thread
         if t is not None:
             t.join(2)      # 最后那条心跳发出去: telemetry.send 是 daemon 线程, 窗口一销毁进程就退
         self.destroy()
+
+    def _stop_afk_on_exit(self):
+        """退出时把 florr-auto-afk(segment.exe)一起收掉。它是我们拉起的外部进程, 应用退出不会带走它
+        (2026-10-11 粉丝反馈: 退出后它还留着, 下次启动认不出 AFK 弹窗)。只收归本程序管的:
+        AFK 开关开着(生命周期委托给本程序), 或本次启动拉起过; 跟本程序无关的(用户自己开的一份)不碰。
+        退出流程里绝不抛。"""
+        try:
+            if self._cfg.get("afk_enabled") or afk_watch.started_by_this_session():
+                afk_watch.stop_florr_auto_afk()
+        except Exception:
+            pass
 
 
 # ---- 黑匣子(blackbox.py): 模块级小函数, 测试里的假 app 不用带这些属性 ----

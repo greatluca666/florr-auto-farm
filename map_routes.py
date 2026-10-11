@@ -78,6 +78,37 @@ ANTHELL_TO_GARDEN_PORTAL = (121, 102)
 # 而出生点附近 maps/anthell.png 画的墙比游戏里多, 寻路绕远。
 ANTHELL_TO_GARDEN_PORTAL_WORLD = (25344.0, 21248.0)
 
+# 工厂里回花园的传送门(小地图坐标 / 世界坐标)。工厂小地图上只有一个 #7EEF6D 绿点, 2026-10-10 三份工厂录像
+# 里 829 帧反解出来世界坐标一模一样 (7680.0, 45460.0) —— 在 maps/factory.png 左下角出生点(53,288)的正下方,
+# 门那一格在地图上是墙(出生点旁的下边界), 寻路不会踩进去被传走。跟蚁穴那个同一套办法: 走进它、传送那一下换服。
+FACTORY_TO_GARDEN_PORTAL = (54, 290)
+FACTORY_TO_GARDEN_PORTAL_WORLD = (7680.0, 45460.0)
+
+
+class SwitchDoor:
+    """走门换服要用的门: cell = 小地图格, world = 世界坐标(自己的世界坐标画布每帧都有, 直接比),
+    timeout = 从复活点走到门旁的预算(秒)。"""
+
+    def __init__(self, cell, world, timeout):
+        self.cell, self.world, self.timeout = cell, world, timeout
+
+
+# 换服时要走进去的门, 按 worker 的 map_name 查。蚁穴: 复活点离门 ~6 格, 90 秒绰绰有余; 工厂: 复活后可能在
+# 离出生点很远的地方(录像里死后复活在刷怪区那头), 整条走廊 ~340 格要走 80~90 秒, 预算给到 180 秒。
+SWITCH_DOORS = {
+    "anthell": SwitchDoor(ANTHELL_TO_GARDEN_PORTAL, ANTHELL_TO_GARDEN_PORTAL_WORLD, 90.0),
+    "factory": SwitchDoor(FACTORY_TO_GARDEN_PORTAL, FACTORY_TO_GARDEN_PORTAL_WORLD, 180.0),
+}
+
+
+def door_for_cell(cell):
+    """按小地图格找走门换服的门; 没有 -> None。"""
+    for door in SWITCH_DOORS.values():
+        if tuple(door.cell) == tuple(cell):
+            return door
+    return None
+
+
 # 下水道 / 工厂的门也在花园里(官方 garden.tmj 的 warps: to_sewers / to_factory), 而且它们在标题页
 # 没有格子 —— 只有这一条路。像素坐标 = debug_garden_raw.png 上那两个绿斑的中心(跟官方世界坐标按
 # 300/(61952+2000) 换算出来的像素差不到 1 格); 世界坐标直接是官方数据, 给 main._run_entry_route

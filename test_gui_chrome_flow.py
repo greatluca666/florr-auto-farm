@@ -1,3 +1,5 @@
+import pytest
+
 import gui_chrome_flow as flow
 
 
@@ -90,3 +92,33 @@ def test_manual_finish_before_detection_still_works():
     g.start("d", on_done=lambda: done.append(1), on_cancel=lambda: None)
     g.finish()      # 用户没等检测就手点「完成」
     assert done == [1]
+
+
+# ── 没装 Chrome: 点「登录」不能变成一个未捕获的 GUI 异常(用户 2026-10-09 南京, v1.0.6) ──
+
+def _guide_whose_launch_fails(after, **kw):
+    def launch(profile_dir, **_kw):
+        raise RuntimeError("没找到 Chrome, 请先安装: https://www.google.com/chrome/")
+
+    host = FakeHost()
+    return flow.LoginGuide(host, after=after, launch=launch, poll=lambda t: None, **kw), host
+
+
+def test_a_missing_chrome_is_reported_to_the_user_instead_of_crashing_the_callback():
+    after = FakeAfter()
+    errors, cancelled = [], []
+    g, host = _guide_whose_launch_fails(after, on_launch_error=errors.append)
+    g.start("d", on_done=lambda: pytest.fail("没起来不能算登录完成"),
+            on_cancel=lambda: cancelled.append(1))
+    assert len(errors) == 1 and "没找到 Chrome" in str(errors[0])
+    assert cancelled == [1]                 # 调用方照常收到「没登成」
+    assert host.visible is False            # 引导区不该亮着等一个永远不会出现的页面
+    assert after.calls == []                # 也没有在后台轮询
+    g.finish()                              # 点晚了的「完成」也不能当作成功
+    g.cancel()
+
+
+def test_without_an_error_handler_a_failed_launch_still_raises_as_before():
+    g, _host = _guide_whose_launch_fails(FakeAfter())
+    with pytest.raises(RuntimeError):
+        g.start("d", on_done=lambda: None, on_cancel=lambda: None)

@@ -100,13 +100,15 @@ def test_it_records_one_minute_segments_and_keeps_only_the_last_six(tmp_path):
     assert 11 <= len(shots) <= 13 and shots[0].read_bytes() == JPG
 
 
-def test_screenshots_are_small_jpegs_of_the_whole_page(tmp_path):
+def test_screenshots_are_jpegs_of_the_whole_page_taken_without_a_clip(tmp_path):
     clock = Clock()
     box, _, shots = make_box(tmp_path, clock)
     run(box, clock, 1)
     method, params = shots[0]
+    # 带 clip+scale 会让 Chrome 临时按缩小后的尺寸重排合成 —— 玩家看到的就是周期性白屏 + 整体缩小(见 test_cdp_shot.py)。
+    # 缩小留到本地做, 所以这里整幅截, 不传 clip。
     assert method == "Page.captureScreenshot" and params["format"] == "jpeg"
-    assert params["clip"]["width"] == 1920 and params["clip"]["height"] == 1080 and params["clip"]["scale"] == 0.5
+    assert "clip" not in params and "scale" not in params
 
 
 def test_what_it_records_packs_and_reads_back(tmp_path):

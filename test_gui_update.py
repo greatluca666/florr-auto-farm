@@ -370,9 +370,10 @@ def test_on_closing_proceeds_if_user_confirms(monkeypatch):
         _closing=False, _tick_job=None, _telemetry_job=None, _hb_thread=None,
         after_cancel=lambda *_: calls.append("after_cancel"),
         _stop_worker_sync=lambda: calls.append("worker"),
+        _stop_afk_on_exit=lambda: calls.append("afk"),
         destroy=lambda: calls.append("destroy"))
     gui_app.App.on_closing(fake)
-    assert calls == ["worker", "destroy"]
+    assert calls == ["worker", "afk", "destroy"]
     assert fake._closing is True
 
 
@@ -386,8 +387,9 @@ def test_on_closing_skips_prompt_when_not_updating(monkeypatch):
         _closing=False, _tick_job=None, _telemetry_job=None, _hb_thread=None,
         after_cancel=lambda *_: calls.append("after_cancel"),
         _stop_worker_sync=lambda: calls.append("worker"),
+        _stop_afk_on_exit=lambda: calls.append("afk"),
         destroy=lambda: calls.append("destroy"))
     gui_app.App.on_closing(fake)
     assert asked == []
-    assert calls == ["worker", "destroy"]
+    assert calls == ["worker", "afk", "destroy"]
     assert fake._closing is True

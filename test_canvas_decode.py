@@ -610,7 +610,39 @@ def test_hook_label_gate_matches_python_side():
     assert dy >= canvas_decode.LABEL_MAX_DY
 
 
+def test_hook_keeps_zone_label_at_any_ui_scale():
+    """1024x768 实机(2026-10-11): 区域名按 UI 缩放 x 0.8 = 0.711 画, 不在 1.0 上也不在血条旁边,
+    hook 的"只记 UI 缩放文本/名牌"门把它丢了 90% 的帧 —— 进场路线读不到人在哪张图。
+    hook 里的区域名清单必须覆盖 canvas_decode.ZONE_LABELS 的每一个字。"""
+    import re
+    from pathlib import Path
+    import canvas_decode
+    js = Path(__file__).with_name("canvas_hook.js").read_text(encoding="utf-8")
+    block = re.search(r"var ZONE_TEXTS = \{(.*?)\};", js, re.S).group(1)
+    in_js = set(re.findall(r'"([^"]+)"\s*:', block))
+    assert set(canvas_decode.ZONE_LABELS) <= in_js
+    # 而且 recordText 真的用了它(只声明不用 = 白写)
+    assert "!ZONE_TEXTS[String(text)]" in js
+
+
 # ── 区域名 (2026-09-27 实机: 蚁穴帧里一直有 "蚂蚁地狱", 沙漠帧里一直有 "沙漠") ──────────
+
+def test_zone_label_survives_when_its_scale_equals_the_world_zoom_but_it_is_not_under_a_bar():
+    """1024x768: 区域名按 UI 缩放 x 0.8 = 0.7111, 世界缩放默认也是 0.7111 —— 光看缩放相等会把真区域名丢掉
+    (2026-10-11 录像 72 帧里 31 帧)。它在小地图下面, 不在任何血条的名牌位置上, 该认。"""
+    from canvas_decode import zone_map_from_frame
+    recs = gameplay_frame(0, mobs=[(300.0, 300.0, "Rock", 1.0)])           # 有血条, 画在世界缩放 ZOOM 上
+    label = text_rec(0, 974.0, 96.0, "工厂", scale=ZOOM)                    # 区域名缩放恰好 == 世界缩放
+    assert zone_map_from_frame(recs + [label] * 2) == "factory"
+
+
+def test_a_player_nametag_that_says_a_zone_name_is_still_ignored():
+    """玩家起名叫"工厂": 名牌字紧挨在血条下面、画在世界缩放上 —— 不能被当成区域名。"""
+    from canvas_decode import zone_map_from_frame
+    recs = gameplay_frame(0, mobs=[(300.0, 300.0, "Rock", 1.0)])
+    tag = text_rec(0, 300.0, 340.0, "工厂", scale=ZOOM)                    # 血条下方 40 像素
+    assert zone_map_from_frame(recs + [tag] * 2) is None
+
 
 def test_zone_map_reads_the_zone_label():
     from canvas_decode import zone_map_from_frame

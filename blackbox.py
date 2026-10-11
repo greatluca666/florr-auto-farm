@@ -18,7 +18,6 @@ nohook(截图照拍), 永远不重载页面(注入 / 重载归刷图程序管)�
 写到 logs/blackbox/seg-YYYYmmdd-HHMMSS-ffffff/(frames.jsonl.gz + shots/<毫秒>.jpg), 60 秒换一段, 只留最近 6 段。
 任何异常都吞掉: 黑匣子是附带的, 不能影响刷图和界面。
 """
-import base64
 import gzip
 import io
 import json
@@ -280,14 +279,11 @@ class BlackBox:
         now = self._clock()
         seg = os.path.join(self.dir, datetime.fromtimestamp(now).strftime("seg-%Y%m%d-%H%M%S-%f"))
         wh = self._session.eval_value("[window.innerWidth, window.innerHeight, window.devicePixelRatio]")
-        w, h = int(wh[0]), int(wh[1])
         cdp = self._cdp
 
         def shot():
-            resp = cdp("Page.captureScreenshot", {
-                "format": "jpeg", "quality": 55,
-                "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": 0.5}}, timeout=10)
-            return base64.b64decode(resp["result"]["data"])
+            # 不能用 clip+scale 缩小: 会让 Chrome 每次截图临时缩小重排, 玩家看到周期性白屏(见 cdp_bridge.screenshot_jpeg_small)
+            return cdp_bridge.screenshot_jpeg_small(cdp)
 
         rec = _Recorder(seg, ev=self._session.eval_value, screenshot=shot, os_mouse=self._os_mouse,
                         clock=self._clock, sleep=time.sleep, shot_every=self.shot_every)

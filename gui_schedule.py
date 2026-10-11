@@ -82,12 +82,29 @@ def validate_block(block, others):
         return "刷怪时长要是正整数"
     if not _positive_int(block.get("consecutive_short_round_limit")):
         return "连续短局阈值要是正整数"
+    if block.get("enabled", True):          # 存成停用的不会进调度, 不用查重叠
+        clash = overlap_with(block, others)
+        if clash is not None:
+            return f"跟{describe_block(clash)}时间重叠"
+    return None
+
+
+def overlap_with(block, others):
+    """others 里第一个跟 block 时间重叠的**已启用**时块, 没有 -> None; 同 id(自己)跳过。
+    停用的时块不参与调度(卡片开关的提示、active_block、启动时的重叠告警都是这么算的),
+    所以也不算重叠 —— 以前只有保存时的校验把停用的算进去, 用户停掉旧时块想腾时间, 保存新的
+    还是报「时间重叠」(苏州用户 2026-10-10: 「总是会重合」)。"""
     for o in others:
-        if o.get("id") == block.get("id"):
+        if o.get("id") == block.get("id") or not o.get("enabled"):
             continue
         if app_config.blocks_overlap(block, o):
-            return f"跟时块 {o.get('id')} 时间重叠"
+            return o
     return None
+
+
+def describe_block(blk):
+    """给人看的时块称呼: 界面卡片上显示的就是星期和时段, 内部 id 用户看不到。"""
+    return f"时块「{weekday_text(blk.get('days') or [])} {blk.get('start')}–{blk.get('end')}」"
 
 
 def _map_radio_state(map_name):
@@ -287,7 +304,37 @@ def recommendation_for(style, petal, map_name):
     return {k: rec.get(k) for k in enemy_recommend.GOVERNED_KNOBS if applies[k]}, None
 
 
-def recommendation_note(values):
+def species_recommendation_for(petal, map_name):
+    """(花瓣稀有度, 地图) -> {slug: {稀有度档: "avoid"/"cautious"}}: Ultra 档(起点以下的)按物种该躲 / 该谨慎的。
+    不是所有 Ultra 都躲(用户 2026-10-10: 螃蟹完全可以打); 没列的物种照起点打。petal 不合法 -> {}。"""
+    if petal not in enemy_recommend.PETAL_RARITIES:
+        return {}
+    return enemy_recommend.species_rules_for(petal, map_name)
+
+
+def species_recommendation_note(rules, map_name):
+    """物种规则那半句提示, 没有规则返回空串。"""
+    if not rules:
+        return ""
+    import enemy_detect
+    names = {}
+    for slug in rules:
+        try:
+            names[slug] = enemy_detect.SPECIES_NAMES[slug]["zh"]
+        except KeyError:
+            names[slug] = slug
+    parts = []
+    for state, label in (("avoid", "躲"), ("cautious", "谨慎")):
+        got = [names[slug] for slug, cells in rules.items() if state in cells.values()]
+        if got:
+            parts.append(f"{label} {'/'.join(got)}")
+    evidence = enemy_recommend.TOP_TIER_EVIDENCE.get(map_name, "")
+    tiers = "/".join(sorted({t for cells in rules.values() for t in cells},
+                            key=enemy_species.RARITY_ORDER.index))
+    return f" 物种({tiers} 档): {', '.join(parts)}; 其余照打" + (f"(依据: {evidence})。" if evidence else "。")
+
+
+def recommendation_note(values, species_rules=None, map_name=None):
     """套用推荐之后, 子窗里那行提示: 填了什么、没填什么、有什么风险。values 是 recommendation_for 的结果。"""
     parts = [f"{_REC_KNOB_NAMES[k]} {'默认' if values[k] is None else values[k]}"
              for k in enemy_recommend.GOVERNED_KNOBS if k in values]
@@ -300,6 +347,9 @@ def recommendation_note(values):
     order = enemy_species.RARITY_ORDER
     if tier in order and order.index(tier) > order.index("Ultra"):
         text += " ⚠ 起点高于 Ultra: Ultra 当普通怪打, 连内置要躲的 Ultra 蝎子 / 甲虫也一样。"
+        if species_rules:
+            text = text.replace(" ⚠ 起点高于 Ultra: Ultra 当普通怪打, 连内置要躲的 Ultra 蝎子 / 甲虫也一样。", "")
+    text += species_recommendation_note(species_rules, map_name)
     return text
 
 
@@ -446,8 +496,9 @@ class EnemyRulesDialog(ctk.CTkToplevel):
                     "不改躲开后继续躲的那 450px 滞回, 也不改蚁穴究极冲过来时 400px 的提前躲。",
     }
     _TIP_SWARM = "蚁群 = 一堆挤在一起的怪, 默认先打蚁群并保持距离。关掉就把它们当单只处理。"
-    _HINT_RECOMMEND = ("躲避起点 = 花瓣稀有度高一档。近战用内置停步半径; 远程 / 召唤的停步半径是占位值, "
-                       "没有实机数据, 套用后请按手感改。只填下面的控件, 不会自动保存。")
+    _HINT_RECOMMEND = ("躲避起点 = 花瓣稀有度高一档; Ultra 档再按物种给打法(危险的躲 / 谨慎, 没列的照打, 比如螃蟹)。"
+                       "近战用内置停步半径; 远程 / 召唤的停步半径是占位值, 没有实机数据, 套用后请按手感改。"
+                       "只填下面的控件, 不会自动保存。")
     _TIP_TIER = ("没设规则的怪, 稀有度达到这一档才躲, 默认 Ultra。调低 = 更谨慎(比如 Mythic: 神话怪也会触发躲避); "
                  "调高 = 更莽(比如 Super: Ultra 也当普通怪打); 「从不」= 不按稀有度躲。"
                  "你给物种设的「打 / 躲」优先于这个。")
@@ -658,7 +709,15 @@ class EnemyRulesDialog(ctk.CTkToplevel):
                 e.delete(0, "end")
                 if val is not None:
                     e.insert(0, str(val))
-        self._rec_hint.configure(text=recommendation_note(values))
+        # 物种: Ultra 档按物种该躲 / 该谨慎的。推荐管的那几格(这张图表里的物种 x Ultra/Super 两档)先清回默认再填,
+        # 套用别的花瓣时不留着上一次的; 表外的格子(用户手配的别的物种 / 别的稀有度)不碰。
+        species = species_recommendation_for(self._rec_petal.get(), self._map)
+        for slug in enemy_recommend.governed_species(self._map):
+            if slug not in self._cell_widgets:
+                continue
+            for tier in enemy_recommend.RULE_TIERS:
+                self._set_cell(slug, tier, species.get(slug, {}).get(tier, ""))
+        self._rec_hint.configure(text=recommendation_note(values, species, self._map))
 
     def _reset(self):
         self._rec_style.set(_REC_PICK)
@@ -1258,6 +1317,20 @@ class ScheduleList(ctk.CTkScrollableFrame):
 
     def _toggle(self, blk, var):
         cfg = self._get_cfg()
+        if var.get():
+            # 开启前查一遍: 停用的时块不参与重叠校验, 开回去时才可能跟别的已启用时块撞上 ——
+            # 撞上了调度只会跑列表里靠前的那块, 另一块悄悄不跑。不如当场拒绝并说清楚撞了谁。
+            clash = overlap_with(blk, cfg["schedule"])
+            if clash is not None:
+                from tkinter import messagebox
+                var.set(0)
+                messagebox.showwarning(
+                    "不能启用",
+                    f"这个时块跟{describe_block(clash)}时间重叠。\n"
+                    "先改一下其中一个的时间, 或者把另一个停用, 再来启用它。",
+                    parent=self)
+                self.refresh()
+                return
         for b in cfg["schedule"]:
             if b["id"] == blk["id"]:
                 b["enabled"] = bool(var.get())

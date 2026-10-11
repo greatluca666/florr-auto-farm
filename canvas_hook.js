@@ -190,9 +190,17 @@
     function isUIScale(m) {
       return Math.abs(Math.hypot(m[0], m[1]) - 1.0) < UI_SCALE_TOL;
     }
+    // 区域名(小地图下面那行字)按 UI 缩放 x 0.8 画, 只有 1920x1080 上才恰好是 1.0 —— 1024x768
+    // (UI 缩放 0.711)的录像里它只剩血条附近那 ~10% 的帧被记下来, 进场路线读不到"人在哪张图",
+    // 工厂里死了重生后拿花园的图走了 3 分钟。区域名这几个字不管缩放多少都记。
+    // 跟 canvas_decode.ZONE_LABELS 保持一致(test_canvas_decode 钉着)。
+    var ZONE_TEXTS = {
+      "蚂蚁地狱": 1, "沙漠": 1, "花园": 1, "下水道": 1, "工厂": 1,
+      "Ant Hell": 1, "Desert": 1, "Garden": 1, "Sewers": 1, "Factory": 1,
+    };
     function recordText(ctx, text, x, y) {
       var s = state(ctx);
-      if (!nearABarAnchor(s.m) && !isUIScale(s.m)) return;
+      if (!nearABarAnchor(s.m) && !isUIScale(s.m) && !ZONE_TEXTS[String(text)]) return;
       var pt = apply(s.m, x, y);
       pushRecord({
         frame: window.__canvasFrame, op: "text", text: String(text),

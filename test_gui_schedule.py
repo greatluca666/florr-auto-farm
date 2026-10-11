@@ -154,10 +154,84 @@ def test_validate_bad_numbers():
     assert gs.validate_block(_blk(consecutive_short_round_limit=-1), [])
 
 
-def test_validate_overlap_reports_other_id():
-    other = _blk(id="blk-9", start="11:00", end="13:00")
+def test_validate_overlap_names_the_other_block_by_its_days_and_times():
+    # 界面上时块卡片只显示星期和时段, 不显示内部 id —— 报错要让人认得出是哪张卡
+    other = _blk(id="blk-9", days=[0, 2], start="11:00", end="13:00")
     msg = gs.validate_block(_blk(id="mine"), [other])
-    assert "blk-9" in msg
+    assert "重叠" in msg
+    assert "11:00" in msg and "13:00" in msg and gs.weekday_text([0, 2]) in msg
+    assert "blk-9" not in msg
+
+
+def test_a_disabled_block_does_not_count_as_overlapping():
+    # 卡片上的开关写着「停用的不参与调度」, 调度(active_block)和启动时的重叠告警也都跳过停用的;
+    # 以前只有保存时的校验还把停用的算进去 —— 用户停掉旧时块想腾出时间, 保存新的还是报「时间重叠」
+    # (苏州用户 2026-10-10: 「总是会重合」)。
+    other = _blk(id="blk-9", start="11:00", end="13:00", enabled=False)
+    assert gs.validate_block(_blk(id="mine"), [other]) is None
+
+
+def test_a_block_being_saved_as_disabled_may_overlap_anything():
+    other = _blk(id="blk-9", start="11:00", end="13:00")
+    assert gs.validate_block(_blk(id="mine", enabled=False), [other]) is None
+
+
+def test_overlap_with_returns_the_first_enabled_overlapping_block():
+    a = _blk(id="a", start="08:00", end="10:00")            # 跟 09:00-12:00 重叠
+    off = _blk(id="off", start="09:30", end="10:30", enabled=False)
+    b = _blk(id="b", start="11:00", end="13:00")            # 也重叠
+    far = _blk(id="far", start="20:00", end="22:00")
+    mine = _blk(id="mine")
+    assert gs.overlap_with(mine, [far, off, a, b]) is a
+    assert gs.overlap_with(mine, [far, off]) is None
+    assert gs.overlap_with(mine, [mine]) is None             # 自己不算
+
+
+class _Var:
+    def __init__(self, v):
+        self.v = v
+
+    def get(self):
+        return self.v
+
+    def set(self, v):
+        self.v = v
+
+
+def _list_with(blocks, monkeypatch):
+    import tkinter.messagebox as mb
+    warned, saved, refreshed = [], [], []
+    monkeypatch.setattr(mb, "showwarning", lambda title, msg, **k: warned.append(msg))
+    cfg = {"schedule": blocks}
+    fake = type("List", (), {})()
+    fake._get_cfg = lambda: cfg
+    fake._save_cfg = lambda c: saved.append([dict(b) for b in c["schedule"]])
+    fake.refresh = lambda: refreshed.append(1)
+    return fake, cfg, warned, saved, refreshed
+
+
+def test_turning_on_a_block_that_would_overlap_an_enabled_one_is_refused(monkeypatch):
+    on = _blk(id="on", start="09:00", end="12:00")
+    off = _blk(id="off", start="11:00", end="13:00", enabled=False)
+    fake, cfg, warned, saved, refreshed = _list_with([on, off], monkeypatch)
+    var = _Var(1)                                            # 用户刚把开关拨到「开」
+    gs.ScheduleList._toggle(fake, off, var)
+    assert off["enabled"] is False and saved == []           # 没落盘
+    assert var.get() == 0 and refreshed                      # 开关弹回去、列表刷新
+    assert len(warned) == 1 and "09:00" in warned[0] and "12:00" in warned[0]
+
+
+def test_turning_on_a_block_without_overlap_works_and_turning_off_always_does(monkeypatch):
+    on = _blk(id="on", start="09:00", end="12:00")
+    off = _blk(id="off", start="13:00", end="15:00", enabled=False)
+    fake, cfg, warned, saved, refreshed = _list_with([on, off], monkeypatch)
+    gs.ScheduleList._toggle(fake, off, _Var(1))
+    assert off["enabled"] is True and saved and not warned
+    # 关掉任何一块都不需要校验
+    clash = _blk(id="clash", start="09:30", end="10:30", enabled=True)       # 手改 config 造出来的重叠
+    fake, cfg, warned, saved, refreshed = _list_with([on, clash], monkeypatch)
+    gs.ScheduleList._toggle(fake, clash, _Var(0))
+    assert clash["enabled"] is False and saved and not warned
 
 
 def test_validate_ignores_self_in_others():
@@ -668,65 +742,75 @@ def test_recommendation_note_says_when_the_map_ignores_the_stop_radii():
 
 
 def test_recommendation_note_warns_when_the_tier_would_fight_ultra_as_ordinary_mobs():
-    # 花瓣 Ultra -> 起点 Super: Ultra 当普通怪打, 连内置躲的 Ultra 蝎子 / 甲虫也一起放掉(README 写明的后果)
-    hot = gs.recommendation_note(gs.recommendation_for("melee", "Ultra", "garden")[0])
+    # 起点 Super: Ultra 当普通怪打, 连内置躲的 Ultra 蝎子 / 甲虫也一起放掉(README 写明的后果)。
+    # 推荐给出了 Ultra 档的物种规则(危险的躲 / 谨慎)时, 这条警告就不吓人了; 没有物种规则(这张图没表 / 手调)才警告。
+    hot = gs.recommendation_note(gs.recommendation_for("melee", "Ultra", "nowhere")[0])
     assert "⚠" in hot and "Ultra" in hot and "蝎子" in hot
+    assert "⚠" in gs.recommendation_note({"avoid_min_rarity": "Super"})
     for petal in ("Rare", "Epic", "Legendary", "Mythic"):         # 起点 <= Ultra: 没有这条警告
         cool = gs.recommendation_note(gs.recommendation_for("melee", petal, "garden")[0])
         assert "⚠" not in cool, petal
+    for map_name in ("factory", "desert", "garden"):              # 起点 Super 但 Ultra 档有物种规则: 也没有
+        rules = gs.species_recommendation_for("Ultra", map_name)
+        note = gs.recommendation_note(gs.recommendation_for("melee", "Ultra", map_name)[0], rules, map_name)
+        assert "⚠" not in note and "物种(" in note, map_name
 
 
-def test_enemy_rules_dialog_recommendation_fills_the_controls_and_is_only_saved_by_ok(monkeypatch):
+def test_recommendation_note_lists_the_species_rules_with_their_evidence():
+    rules = gs.species_recommendation_for("Ultra", "factory")
+    values = gs.recommendation_for("ranged", "Ultra", "factory")[0]
+    note = gs.recommendation_note(values, rules, "factory")
+    assert "躲 " in note and "胡蜂" in note and "蜘蛛" in note and "谨慎 机械花" in note
+    assert "螃蟹" not in note and "其余照打" in note and "三小时工厂录像" in note
+    assert "⚠ 起点高于 Ultra" not in note            # 物种规则已经把危险的 Ultra 管住了, 不再吓人
+    # 没规则(花瓣 <= Mythic)就没这半句; 手调到 Super 且没物种规则时警告照旧
+    plain = gs.recommendation_note(gs.recommendation_for("melee", "Mythic", "factory")[0],
+                                   gs.species_recommendation_for("Mythic", "factory"), "factory")
+    assert "物种(" not in plain
+    assert "⚠" in gs.recommendation_note({"avoid_min_rarity": "Super"})
+
+
+def test_species_recommendation_ignores_unknown_petals():
+    assert gs.species_recommendation_for("???", "factory") == {}
+    assert gs.species_recommendation_for("Ultra", "nowhere") == {}
+
+
+def test_enemy_rules_dialog_recommendation_fills_the_species_cells(monkeypatch):
     monkeypatch.setattr(gui_map_picker, "_MAP_DIR",
                         os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps"))
     root = gs.ctk.CTk()
     root.withdraw()
     try:
         got = []
-        saved = {"species": {"bubble": "ignore"}, "knobs": {"chase_max_px": 350}}
-        dlg = gs.EnemyRulesDialog(root, map_name="ocean", rules=saved, on_ok=got.append)
-        assert dlg._rec_style.get() == gs._REC_PICK and dlg._rec_petal.get() == gs._REC_PICK
-
-        # 没选全就点套用: 红字、什么都不动
-        dlg._apply_recommendation()
-        assert "流派" in dlg._err.cget("text")
-        assert dlg._tier.get() == gs._TIER_LABELS[""] and dlg._knob_entries["hold_active_px"].get() == ""
+        saved = {"species": {"crab": {"Mythic": "cautious"}, "wasp": {"Epic": "fight"}, "barrel": "ignore"},
+                 "knobs": {}}
+        dlg = gs.EnemyRulesDialog(root, map_name="factory", rules=saved, on_ok=got.append)
         dlg._rec_style.set(gs._STYLE_LABELS["ranged"])
-        dlg._apply_recommendation()                                 # 还缺花瓣
-        assert dlg._err.cget("text") and dlg._tier.get() == gs._TIER_LABELS[""]
-
-        # 选全: 填进下面的控件, 提示行写明填了什么; 物种选择和别的数值不动; 红字清掉
-        dlg._rec_petal.set("Legendary")
+        dlg._rec_petal.set("Ultra")
         dlg._apply_recommendation()
-        assert dlg._err.cget("text") == ""
-        assert dlg._tier.get() == "Mythic"
-        want, _ = gs.recommendation_for("ranged", "Legendary", "ocean")
-        assert dlg._knob_entries["hold_active_px"].get() == str(want["hold_active_px"])
-        assert dlg._knob_entries["hold_passive_px"].get() == str(want["hold_passive_px"])
-        assert dlg._knob_entries["chase_max_px"].get() == "350"
-        assert dlg._cell_get("bubble", "*") == "ignore"
-        assert "躲避起点稀有度 Mythic" in dlg._rec_hint.cget("text")
+        assert dlg._tier.get() == "Super"
+        assert dlg._cell_get("wasp", "Ultra") == "avoid" and dlg._cell_get("spider", "Ultra") == "avoid"
+        assert dlg._cell_get("mecha_flower", "Ultra") == "cautious"
+        assert dlg._cell_get("crab", "Ultra") == ""                 # 螃蟹照打: 不写规则
+        assert dlg._cell_get("crab", "Mythic") == "cautious"        # 用户手配的别的档不碰
+        assert dlg._cell_get("wasp", "Epic") == "fight" and dlg._cell_get("barrel", "*") == "ignore"
+        assert "胡蜂" in dlg._rec_hint.cget("text")
         assert got == []                                            # 套用不落盘
         dlg._ok()
-        assert got == [{"species": {"bubble": "ignore"},
-                        "knobs": {"chase_max_px": 350, "avoid_min_rarity": "Mythic", **{
-                            k: want[k] for k in ("hold_active_px", "hold_passive_px")}}}]
+        species = got[0]["species"]
+        assert species["wasp"] == {"Epic": "fight", "Ultra": "avoid"} and species["spider"] == {"Ultra": "avoid"}
+        assert "crab" in species and "Ultra" not in species["crab"]
 
-        # 换成近战 + Epic: 停步半径清回默认, 起点跟着变
-        dlg2 = gs.EnemyRulesDialog(
-            root, map_name="ocean", on_ok=got.append,
-            rules={"species": {}, "knobs": {"hold_active_px": 222, "hold_passive_px": 77}})
-        dlg2._rec_style.set(gs._STYLE_LABELS["melee"])
-        dlg2._rec_petal.set("Epic")
+        # 换成 Mythic 花瓣(「确定」会关掉子窗, 拿上一次存下的规则重开一个): 起点 Ultra, Ultra 本来就全躲 ->
+        # 上一次填的 Ultra 物种格清回默认(别留着)
+        dlg2 = gs.EnemyRulesDialog(root, map_name="factory", rules=got[0], on_ok=got.append)
+        assert dlg2._cell_get("wasp", "Ultra") == "avoid"
+        dlg2._rec_style.set(gs._STYLE_LABELS["ranged"])
+        dlg2._rec_petal.set("Mythic")
         dlg2._apply_recommendation()
-        assert dlg2._tier.get() == "Legendary"
-        assert dlg2._knob_entries["hold_active_px"].get() == ""
-        assert dlg2._knob_entries["hold_passive_px"].get() == ""
-
-        # 全部恢复默认: 推荐的两个下拉和提示行一并回到初始
-        dlg2._reset()
-        assert dlg2._rec_style.get() == gs._REC_PICK and dlg2._rec_petal.get() == gs._REC_PICK
-        assert dlg2._rec_hint.cget("text") == gs.EnemyRulesDialog._HINT_RECOMMEND
+        assert dlg2._tier.get() == "Ultra"
+        assert dlg2._cell_get("wasp", "Ultra") == "" and dlg2._cell_get("spider", "Ultra") == ""
+        assert dlg2._cell_get("wasp", "Epic") == "fight"            # 手配的还在
     finally:
         root.destroy()
 

@@ -39,6 +39,42 @@ except Exception:
 
 _REF_WIDTH, _REF_HEIGHT = 1920, 1080  # 下面这些函数里所有写死的坐标常量都是照这个分辨率量出来的
 
+_GRAB_RETRY_S = 2.0         # 抓屏失败后隔多久再试
+_GRAB_LOG_EVERY_S = 60.0    # 一直抓不到时, 隔多久在日志里补报一次"仍在等待"
+
+
+def grab_screen(region=None):
+    """pyautogui.screenshot 的包装: 抓屏本身失败(OSError)时等桌面回来再试, 不让它把 worker 带崩。
+
+    2026-10-10 用户上报: 连挂 16 小时后 16:50 起读不到位置、Chrome 的 CDP 全部超时, 16:55
+    PIL.ImageGrab 抛 OSError("screen grab failed"), worker 整个退出, 之后三个小时没人发现。这个
+    报错在 Windows 上是桌面不可用 —— 锁屏 / 显示器休眠 / 远程桌面断开 —— 的典型表现, 人回来解锁
+    就好了, 所以该做的是等, 不是退出(跟「寻路永不放弃」一个思路)。只接 OSError; 别的异常是真 bug,
+    照常抛。日志不刷屏: 开头说一次原因, 之后约每分钟补报一次, 恢复时报一次。
+    """
+    started = None
+    last_logged = None
+    while True:
+        try:
+            if region is None:
+                image = pyautogui.screenshot()
+            else:
+                image = pyautogui.screenshot(region=region)
+        except OSError as e:
+            now = time.monotonic()
+            if started is None:
+                started = last_logged = now
+                print(f"⚠️ 抓屏失败({e}): 桌面可能被锁屏 / 显示器休眠 / 远程桌面断开, "
+                      f"等它恢复后继续(不退出)")
+            elif now - last_logged >= _GRAB_LOG_EVERY_S:
+                last_logged = now
+                print(f"⏳ 抓屏仍在等待桌面恢复(已等 {now - started:.0f} 秒)")
+            time.sleep(_GRAB_RETRY_S)
+            continue
+        if started is not None:
+            print(f"✅ 抓屏恢复(等了 {time.monotonic() - started:.0f} 秒)")
+        return image
+
 
 def scale_x(value):
     """把一个照1920宽量出来的x坐标/宽度, 换算成实际屏幕宽度下的等效值."""
@@ -370,7 +406,7 @@ def execute_anti_stuck(duration=1.5):
     连续多轮"卡住→脱困→还是卡住"打印的坐标一模一样)。改成力小于阈值(以屏幕
     像素为单位, 5px)就当没找到有效方向, 退化成随机方向硬闯.
     """
-    pyautogui_img = pyautogui.screenshot(region=[0, 0, SCREEN_WIDTH, SCREEN_HEIGHT])
+    pyautogui_img = grab_screen(region=[0, 0, SCREEN_WIDTH, SCREEN_HEIGHT])
     opencv_img = cv2.cvtColor(np.array(pyautogui_img), cv2.COLOR_RGB2BGR)
     borders = check_map_border(opencv_img)
     suggested_position = calc_anti_stuck(borders)
@@ -381,8 +417,16 @@ def execute_anti_stuck(duration=1.5):
     if max_delta < 5:
         # 没标定墙壁色的图(蚁穴/花园): 先试地图感知脱困, 动不了才随机蒙. 标定过的
         # 图(沙漠/海洋)行为不变 —— 它们是开阔地图, 随机蒙也能蒙出来.
-        if MAP not in _MAP_BORDER_COLOR and _map_aware_escape(duration):
-            return
+        if MAP not in _MAP_BORDER_COLOR:
+            if _map_aware_escape(duration):
+                return
+            if get_player_position() is None:
+                # 位置读不到(传送刚落地的黑屏 / 画布这一瞬没画小地图)时不能蒙着头乱走: 工厂出生点离回花园的
+                # 门只有几格, 2026-10-11 录像里这一下随机朝南, 走进门被传回花园, 白丢 1 分多钟。
+                # 这种时候没有任何可逃的东西(卡住判定本身就需要位置), 站着等位置回来。
+                print("⚠️ 玩家位置读不到, 不乱走(出生点旁边可能有传送门), 等一等再说")
+                time.sleep(duration)
+                return
         direction = random.choice(["w", "a", "s", "d", "wa", "wd", "sa", "sd"])
         print(f"⚠️ 附近没找到足够强的墙壁排斥力(力度{max_delta:.1f}), 退化成随机方向脱困: {direction}")
         keydown(direction)
@@ -731,7 +775,7 @@ def _green_button_ratio(pos, half_w=15, half_h=10, scale=None):
         half_w, half_h = max(1, scale_x(half_w)), max(1, scale_y(half_h))
     else:
         half_w, half_h = max(1, round(half_w * scale)), max(1, round(half_h * scale))
-    region = pyautogui.screenshot(region=[x - half_w, y - half_h, half_w * 2, half_h * 2])
+    region = grab_screen(region=[x - half_w, y - half_h, half_w * 2, half_h * 2])
     arr = np.array(region)[:, :, :3]
     match = np.all(np.abs(arr.astype(int) - np.array(_BUTTON_GREEN_RGB)) <= 25, axis=-1)
     return match.sum() / match.size
@@ -830,6 +874,22 @@ def _continue_click_target():
             return cur
         last = cur
     return last or _CONTINUE_BUTTON_POS
+
+
+def screen_health():
+    """整屏截一张, 一行话说清它长什么样, 返回 (说明, 是不是几乎全黑)。不抛。
+
+    "无法检测玩家位置"一直读不出来时, 最先要分清的是**截图本身是黑的 / 取不到**(锁屏、远程桌面断开、
+    显示器休眠……)还是**画面在、只是认不出来**。2026-10-08 第一份录像死后回到标题页, 开始按钮明明在,
+    屏幕检测连续 5 分钟什么都认不出, 用户一动鼠标就好了 —— 当时没任何线索分得清这两种。"""
+    try:
+        arr = np.array(pyautogui.screenshot())[:, :, :3]
+    except Exception as e:
+        return f"屏幕截图失败: {type(e).__name__}: {e}", True
+    mean, std = float(arr.mean()), float(arr.std())
+    black = mean < 6 and std < 6
+    note = " —— 几乎全黑!(锁屏 / 远程桌面断开 / 显示器休眠?)" if black else ""
+    return f"屏幕截图亮度 {mean:.0f} 起伏 {std:.0f}{note}", black
 
 
 def on_start_screen():
@@ -1045,13 +1105,13 @@ def select_biome_on_title(biome):
 
 def check_stage():
     full_screen = [0, 0, SCREEN_WIDTH, SCREEN_HEIGHT]
-    color = pyautogui.screenshot(region=full_screen).getpixel(scale_point(316, 32))
+    color = grab_screen(region=full_screen).getpixel(scale_point(316, 32))
     if color == (187, 85, 85):
         return "in_game"
     elif color == (255, 255, 255):
         return "in_game_dead"
     else:
-        color = pyautogui.screenshot(region=full_screen).getpixel(scale_point(156, 35))
+        color = grab_screen(region=full_screen).getpixel(scale_point(156, 35))
         if color == (155, 181, 107):
             return "in_menu"
         else:
@@ -1091,7 +1151,7 @@ def minimap_capture_region():
 
 def get_map():
     region = minimap_capture_region()
-    image = pyautogui.screenshot(region=region)
+    image = grab_screen(region=region)
     image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     if image.shape[:2] != (300, 300):
         # maps/anthell.png、maps/desert.png、maps/ocean.png都是固定300x300模板,

@@ -15,11 +15,13 @@ class LoginGuide:
     after = 某个 widget 的 .after(ms, fn); launch / poll 可注入, 便于单测."""
 
     def __init__(self, host, *, after, launch=cdp_bridge.launch_chrome_for_profile,
-                 poll=cdp_bridge.wait_for_florr_tab):
+                 poll=cdp_bridge.wait_for_florr_tab, on_launch_error=None):
         self._host = host
         self._after = after
         self._launch = launch
         self._poll = poll
+        # Chrome 起不来(最常见: 没装)时怎么告诉用户; 不给就保持老行为, 异常往上抛
+        self._on_launch_error = on_launch_error
         self._on_done = None
         self._on_cancel = None
         self._detected = False
@@ -29,7 +31,19 @@ class LoginGuide:
         self._on_done, self._on_cancel = on_done, on_cancel
         self._detected = False
         self._active = True
-        self._launch(profile_dir, open_url="https://florr.io", fullscreen=False)
+        try:
+            self._launch(profile_dir, open_url="https://florr.io", fullscreen=False)
+        except RuntimeError as e:
+            # 没装 Chrome 时 launch 抛 RuntimeError。2026-10-09 南京用户点「登录」就这样变成了一次
+            # 未捕获的 GUI 异常(还被当成 bug 上报)。起不来 = 这次登录没成: 不亮引导区、不轮询,
+            # 告诉用户原因, 再按「取消」通知调用方。
+            if self._on_launch_error is None:
+                raise
+            self._active = False
+            self._on_launch_error(e)
+            if on_cancel:
+                on_cancel()
+            return
         self._host.show()
         self._after(_POLL_MS, self._poll_once)
 

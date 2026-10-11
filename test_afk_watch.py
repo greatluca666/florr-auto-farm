@@ -302,6 +302,8 @@ def _patch_install_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(afk_watch, "_INSTALL_ROOT", str(tmp_path))
     monkeypatch.setattr(afk_watch, "_INSTALL_DIR", str(install_dir))
     monkeypatch.setattr(afk_watch, "_EXE_PATH", str(install_dir / "segment.exe"))
+    # 手动放进来的 zip 也会在这些目录里找 —— 指到 tmp_path, 别去翻跑测试那台机器的真 ~/Downloads
+    monkeypatch.setattr(afk_watch, "_local_zip_dirs", lambda: [str(tmp_path)])
     return install_dir
 
 
@@ -449,6 +451,177 @@ def test_download_and_extract_returns_false_when_zip_has_no_exe(tmp_path, monkey
     ):
         result = afk_watch._download_and_extract()
     assert result is False
+
+
+# ── 下载源: 国内镜像优先, GitHub 兜底; 手动放进来的 zip 优先于下载 ────────────────────────
+# 2026-10-10 用户上报(北京): 自动下载 GitHub 上 384MB 的包失败("AFK: download_failed"), 要求给手动放的办法。
+# 镜像早就在 florrfarm.cc.cd/afk/ 上了(SHA-256 跟 _DOWNLOAD_SHA256 一致), 客户端一直没用上。
+
+def _fake_urlopen(*plan):
+    """按请求顺序给每次 urlopen 一个结果(响应对象或异常), 并记下请求过的 URL。"""
+    results = list(plan)
+    asked = []
+
+    def opener(req, *_a, **_kw):
+        asked.append(req.full_url)
+        result = results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    opener.asked = asked
+    return opener
+
+
+def test_the_mirror_serves_the_same_file_as_github():
+    # 镜像文件名跟 GitHub 上那个 zip 同名, 下一次换包时只改一处就容易漏掉另一处 ——
+    # 至少文件名对不上会在这里报出来; 摘要不用另配, 两个源共用 _DOWNLOAD_SHA256。
+    assert afk_watch._MIRROR_URL.startswith("https://")
+    assert os.path.basename(afk_watch._MIRROR_URL) == os.path.basename(afk_watch._DOWNLOAD_URL)
+    assert afk_watch._download_sources() == [afk_watch._MIRROR_URL, afk_watch._DOWNLOAD_URL]
+
+
+def test_download_tries_the_mirror_first_and_stops_there_when_it_works(tmp_path, monkeypatch):
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    opener = _fake_urlopen(_fake_response(payload))
+
+    with patch("afk_watch.urllib.request.urlopen", opener):
+        assert afk_watch._download_and_extract() is True
+
+    assert opener.asked == [afk_watch._MIRROR_URL]
+    assert (install_dir / "segment.exe").exists()
+
+
+def test_download_falls_back_to_github_when_the_mirror_is_unreachable(tmp_path, monkeypatch):
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    opener = _fake_urlopen(OSError("mirror down"), _fake_response(payload))
+
+    with patch("afk_watch.urllib.request.urlopen", opener):
+        assert afk_watch._download_and_extract() is True
+
+    assert opener.asked == [afk_watch._MIRROR_URL, afk_watch._DOWNLOAD_URL]
+    assert (install_dir / "segment.exe").exists()
+
+
+def test_download_falls_back_when_the_mirror_serves_the_wrong_bytes(tmp_path, monkeypatch):
+    # 镜像文件被换 / 传坏了: 摘要对不上不能装, 但也别就此放弃 —— GitHub 那份可能是好的
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    opener = _fake_urlopen(_fake_response(b"not what we pinned"), _fake_response(payload))
+
+    with patch("afk_watch.urllib.request.urlopen", opener):
+        assert afk_watch._download_and_extract() is True
+
+    assert opener.asked == [afk_watch._MIRROR_URL, afk_watch._DOWNLOAD_URL]
+    assert (install_dir / "segment.exe").read_bytes() == b"fake exe content"
+    assert not _tmp_zip_path(tmp_path).exists()
+
+
+def test_download_gives_up_after_every_source_failed_and_says_how_to_install_by_hand(
+        tmp_path, monkeypatch, capsys):
+    _patch_install_paths(monkeypatch, tmp_path)
+    opener = _fake_urlopen(OSError("a"), OSError("b"))
+
+    with patch("afk_watch.urllib.request.urlopen", opener):
+        assert afk_watch._download_and_extract() is False
+
+    assert opener.asked == [afk_watch._MIRROR_URL, afk_watch._DOWNLOAD_URL]
+    out = capsys.readouterr().out
+    assert "手动" in out and afk_watch._MIRROR_URL in out and str(tmp_path) in out
+
+
+def test_a_zip_already_placed_in_the_app_folder_is_used_without_downloading(tmp_path, monkeypatch):
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    placed = tmp_path / os.path.basename(afk_watch._DOWNLOAD_URL)
+    placed.write_bytes(payload)
+
+    def no_network(*_a, **_kw):
+        raise AssertionError("手动放了 zip 就不该再下载")
+
+    with patch("afk_watch.urllib.request.urlopen", no_network):
+        assert afk_watch._download_and_extract() is True
+
+    assert (install_dir / "segment.exe").exists()
+    assert placed.exists()          # 是用户自己的文件, 装完不删
+
+
+def test_a_browser_renamed_copy_of_the_zip_is_found_too(tmp_path, monkeypatch):
+    # 浏览器重复下载会改名成 "xxx (1).zip"
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    stem, ext = os.path.splitext(os.path.basename(afk_watch._DOWNLOAD_URL))
+    (tmp_path / f"{stem} (1){ext}").write_bytes(payload)
+
+    with patch("afk_watch.urllib.request.urlopen", _fake_urlopen()):
+        assert afk_watch._download_and_extract() is True
+    assert (install_dir / "segment.exe").exists()
+
+
+def test_a_half_downloaded_or_wrong_zip_is_ignored_and_the_download_goes_ahead(tmp_path, monkeypatch):
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    junk = tmp_path / os.path.basename(afk_watch._DOWNLOAD_URL)
+    junk.write_bytes(b"half a zip")
+    opener = _fake_urlopen(_fake_response(payload))
+
+    with patch("afk_watch.urllib.request.urlopen", opener):
+        assert afk_watch._download_and_extract() is True
+
+    assert opener.asked == [afk_watch._MIRROR_URL]
+    assert junk.read_bytes() == b"half a zip"      # 不碰用户的文件
+    assert (install_dir / "segment.exe").exists()
+
+
+def test_local_zip_dirs_cover_the_app_folder_and_the_downloads_folder():
+    dirs = afk_watch._local_zip_dirs()
+    assert afk_watch._INSTALL_ROOT in dirs
+    assert os.path.join(os.path.expanduser("~"), "Downloads") in dirs
+
+
+def test_install_from_zip_installs_a_verified_zip(tmp_path, monkeypatch):
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    payload = _fake_zip_bytes()
+    _patch_expected_digest(monkeypatch, payload)
+    chosen = tmp_path / "somewhere" / "my-afk.zip"
+    chosen.parent.mkdir()
+    chosen.write_bytes(payload)
+
+    assert afk_watch.install_from_zip(str(chosen)) is True
+    assert (install_dir / "segment.exe").exists()
+
+
+def test_install_from_zip_refuses_a_zip_with_the_wrong_digest(tmp_path, monkeypatch, capsys):
+    # 用户手选的任意 zip 里的 exe 下一步就要被 Popen —— 摘要不符一个文件都不能解出来
+    install_dir = _patch_install_paths(monkeypatch, tmp_path)
+    chosen = tmp_path / "other.zip"
+    chosen.write_bytes(_fake_zip_bytes())            # 真常量对不上这份假 zip
+
+    assert afk_watch.install_from_zip(str(chosen)) is False
+    assert not install_dir.exists()
+    assert "校验" in capsys.readouterr().out
+
+
+def test_install_from_zip_survives_a_missing_or_unreadable_file(tmp_path, monkeypatch):
+    _patch_install_paths(monkeypatch, tmp_path)
+    assert afk_watch.install_from_zip(str(tmp_path / "nope.zip")) is False
+    assert afk_watch.install_from_zip("") is False
+
+
+def test_manual_install_instructions_name_the_link_the_file_and_the_folder(tmp_path, monkeypatch):
+    _patch_install_paths(monkeypatch, tmp_path)
+    text = afk_watch.manual_install_instructions()
+    assert afk_watch._MIRROR_URL in text
+    assert os.path.basename(afk_watch._DOWNLOAD_URL) in text
+    assert str(tmp_path) in text
 
 
 def test_ensure_florr_auto_afk_running_skips_entirely_on_non_windows(monkeypatch):
@@ -1037,3 +1210,50 @@ def test_canvas_afk_popup_survives_cdp_errors(monkeypatch):
         raise ConnectionError("x")
     monkeypatch.setattr(cdp_bridge, "_eval_value", boom)
     assert afk_watch._canvas_afk_popup_once() is None
+
+
+# ── 退出时 segment.exe 不能留下 / 陈旧实例不能被当成"已经在跑"(2026-10-11 粉丝: 退出应用后 AFK 助手
+#    还留着, 再启动就认不出弹窗了) ──
+
+def _start_ours(monkeypatch):
+    monkeypatch.setattr(afk_watch.sys, "platform", "win32")
+    with patch("afk_watch.os.path.isfile", return_value=True), \
+         patch("afk_watch._is_florr_auto_afk_running", return_value=False), \
+         patch("afk_watch._write_afk_config"), \
+         patch("afk_watch._wait_for_segment_started", return_value=True), \
+         patch("afk_watch.subprocess.Popen"):
+        afk_watch.ensure_florr_auto_afk_running()
+
+
+def test_the_instance_we_launched_is_remembered_as_ours(monkeypatch):
+    monkeypatch.setattr(afk_watch, "_started_here", False)
+    _start_ours(monkeypatch)
+    assert afk_watch.started_by_this_session() is True
+
+
+def test_an_instance_that_was_already_running_is_not_ours(monkeypatch):
+    # 上次留下的 / 别处开的: 这个进程没拉起过它, 不能说是自己的
+    monkeypatch.setattr(afk_watch, "_started_here", False)
+    monkeypatch.setattr(afk_watch.sys, "platform", "win32")
+    with patch("afk_watch._is_florr_auto_afk_running", return_value=True):
+        afk_watch.ensure_florr_auto_afk_running()
+    assert afk_watch.started_by_this_session() is False
+
+
+def test_a_failed_launch_is_not_remembered_as_ours(monkeypatch):
+    monkeypatch.setattr(afk_watch, "_started_here", False)
+    monkeypatch.setattr(afk_watch.sys, "platform", "win32")
+    with patch("afk_watch.os.path.isfile", return_value=True), \
+         patch("afk_watch._is_florr_auto_afk_running", return_value=False), \
+         patch("afk_watch._write_afk_config"), \
+         patch("afk_watch.subprocess.Popen", side_effect=OSError("boom")):
+        afk_watch.ensure_florr_auto_afk_running()
+    assert afk_watch.started_by_this_session() is False
+
+
+def test_stopping_it_forgets_it_was_ours(monkeypatch):
+    monkeypatch.setattr(afk_watch, "_started_here", True)
+    monkeypatch.setattr(afk_watch.sys, "platform", "win32")
+    monkeypatch.setattr(afk_watch.subprocess, "run", lambda *a, **k: None)
+    afk_watch.stop_florr_auto_afk()
+    assert afk_watch.started_by_this_session() is False

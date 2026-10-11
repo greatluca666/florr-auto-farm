@@ -373,6 +373,8 @@ def test_entering_a_block_reports_a_heartbeat_right_away(monkeypatch):
     app._set_running_block = lambda bid: setattr(app, "_running_block_id", bid)
     monkeypatch.setattr(gui_app.app_config, "save_config", lambda cfg: None)
     monkeypatch.setattr(gui_app.gui_schedule, "block_to_active", lambda b: {})   # 这里不关心 active 怎么算
+    # 进时块前会核对 Chrome 还活着没有(真去探 CDP 端口); 这条测的是心跳, 别依赖本机开没开 Chrome
+    monkeypatch.setattr(gui_app.cdp_bridge, "is_dedicated_chrome_ready", lambda: True)
     gui_app.App._enter_block(app, blk, False)
     assert len(sent) == 1 and sent[0]["v"] == 2 and sent[0]["dur"] == 0
     assert sent[0]["map"] == blk["map"]
@@ -384,9 +386,10 @@ def test_closing_the_window_waits_for_the_last_heartbeat_to_go_out():
     app = types.SimpleNamespace(
         _updates=None, _closing=False, _tick_job=None, _telemetry_job=None, after_cancel=lambda j: None,
         _stop_worker_sync=lambda: order.append("stop"), _hb_thread=t,
+        _stop_afk_on_exit=lambda: order.append("afk"),
         destroy=lambda: order.append("destroy"))
     gui_app.App.on_closing(app)
-    assert order == ["stop", "destroy"] and t.joined == [2]
+    assert order == ["stop", "afk", "destroy"] and t.joined == [2]
 
 
 def test_spawned_workers_are_asked_to_print_phase_markers(monkeypatch):

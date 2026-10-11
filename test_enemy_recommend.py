@@ -15,6 +15,7 @@ def test_the_option_lists():
 
 
 # 花瓣档 +1 起躲(用户 2026-10-03 定的换算); 下限夹到旋钮可选范围的最低档 Epic。
+# (一度封顶 Ultra, 用户 2026-10-10 指出「不是所有 Ultra 都要躲」 —— 改成按物种给规则, 见下面 species_rules_for。)
 @pytest.mark.parametrize("petal, tier", [
     ("Common", "Epic"), ("Unusual", "Epic"), ("Rare", "Epic"),      # +1 落在 Epic 以下 -> 夹到 Epic
     ("Epic", "Legendary"), ("Legendary", "Mythic"), ("Mythic", "Ultra"),
@@ -89,3 +90,72 @@ def test_recommend_returns_a_fresh_dict_each_call():
 def test_unknown_style_or_petal_is_a_value_error_not_a_guess(style, petal):
     with pytest.raises(ValueError):
         rec.recommend(style, petal)
+
+
+# ── 按物种的 Ultra 档打法 ─────────────────────────────────────────────────────────
+# 2026-10-10 用户: "不是所有的 Ultra 都要躲避, 黄蜂和蜘蛛躲避没问题, 但螃蟹完全可以打, 蚁穴和沙漠里也是一部分怪"。
+
+def test_factory_with_ultra_petals_avoids_wasp_and_spider_but_fights_crab():
+    rules = rec.species_rules_for("Ultra", "factory")
+    assert rules["wasp"] == {"Ultra": "avoid"} and rules["spider"] == {"Ultra": "avoid"}
+    assert "crab" not in rules                                      # 螃蟹照打(起点是 Super, Ultra < Super 就是正常打)
+    assert rules["barrel"] == {"Ultra": "cautious"}                 # 2026-10-11 录像: Ultra 铀桶 8 次挨打占 6 次, 打但离远点
+    assert rec.avoid_min_rarity_for("Ultra") == "Super"
+
+
+def test_desert_with_ultra_petals_keeps_the_builtin_ultra_table():
+    # 起点高过 Ultra 时内置的 Ultra 蝎子 / 甲虫躲、沙尘暴等谨慎会一起失效 —— 推荐把它们写成显式规则, 行为不丢
+    import enemy_detect
+    rules = rec.species_rules_for("Ultra", "desert")
+    for slug, tier in enemy_detect._AVOID_PAIRS:
+        assert rules[slug][tier] == "avoid"
+    for slug, tier in enemy_detect._CAUTIOUS_PAIRS:
+        assert rules[slug][tier] == "cautious"
+
+
+def test_anthell_fights_the_harmless_ants_and_avoids_the_soldiers_and_queen():
+    rules = rec.species_rules_for("Ultra", "anthell")
+    assert set(rules) == {"soldier_ant", "queen_ant"}
+    for harmless in ("baby_ant", "worker_ant", "ant_egg", "worm"):
+        assert harmless not in rules
+
+
+def test_no_species_rules_when_ultra_is_already_avoided_across_the_board():
+    # 花瓣 <= Mythic: 起点 <= Ultra, Ultra 本来就全躲, 不用再逐物种写
+    for petal in ("Common", "Rare", "Epic", "Legendary", "Mythic"):
+        for map_name in rec.TOP_TIER_RULES:
+            assert rec.species_rules_for(petal, map_name) == {}
+
+
+def test_super_petals_get_rules_for_both_tiers_below_the_start():
+    rules = rec.species_rules_for("Super", "factory")
+    assert rules["wasp"] == {"Ultra": "avoid", "Super": "avoid"}
+    assert rec.species_rules_for("Super", "factory")["mecha_flower"] == {"Ultra": "cautious", "Super": "cautious"}
+
+
+def test_maps_without_a_table_get_nothing_and_fresh_dicts_come_back():
+    assert rec.species_rules_for("Ultra", "nowhere") == {}
+    a = rec.species_rules_for("Ultra", "factory")
+    a["wasp"]["Ultra"] = "fight"
+    assert rec.species_rules_for("Ultra", "factory")["wasp"] == {"Ultra": "avoid"}
+
+
+@pytest.mark.parametrize("map_name", sorted(enemy_species.MAP_SPECIES))
+def test_every_table_entry_is_a_real_species_of_that_map_and_a_valid_rule(map_name):
+    # 表里的物种必须是这张图认得的(否则子窗里没这一行 / 配置校验会拒), 状态必须在打法循环里
+    table = rec.TOP_TIER_RULES.get(map_name, {})
+    assert map_name in rec.TOP_TIER_RULES and map_name in rec.TOP_TIER_EVIDENCE
+    for state, slugs in table.items():
+        assert state in ("avoid", "cautious")
+        for slug in slugs:
+            assert slug in enemy_species.MAP_SPECIES[map_name], (map_name, slug)
+    assert rec.governed_species(map_name) == {s for slugs in table.values() for s in slugs}
+
+
+def test_the_species_rules_pass_the_config_layer():
+    for petal in ("Ultra", "Super"):
+        for map_name in enemy_species.MAP_SPECIES:
+            rules = rec.species_rules_for(petal, map_name)
+            cfg = {"species": rules, "knobs": {"avoid_min_rarity": rec.avoid_min_rarity_for(petal)}}
+            # 配置层逐条校验、不认的会丢掉(只打警告): 原样出来 = 一条都没被丢
+            assert app_config._coerce_enemy_rules(cfg, map_name) == cfg, (petal, map_name)
