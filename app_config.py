@@ -40,6 +40,13 @@ DEFAULTS = {
     # enabled 打开时: 按住 mod (若非 none) → 按 digit → 松开 mod (像 Ctrl+C).
     "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
     "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
+    # 刷怪区内用哪套战斗: "rules" = 现有的索敌/追击/清青怪那一套; "rl" = 交给学出来的
+    # 策略。寻路、进图、死亡重开、换服、AFK 解题两种都归脚本, 不受这个开关影响。
+    # rl 模式会**强制**把反转攻击/防御键关掉(见 main._apply_worker_config): 反转开着
+    # 时花朵一直自动打, 策略的攻击维按不按都一样, 那一维是死的。
+    "combat": "rules",
+    "rl_model": "runs/desert",     # 策略存档前缀(sb3 会存成 <前缀>.zip)
+    "rl_train": False,             # True = 一边刷一边接着学并回存; False = 只推理
     "afk_enabled": False,
     # 索敌用户规则(见 enemy_detect.set_rules / _coerce_enemy_rules): 每个时块一份。空 = 内置行为。
     "enemy_rules": {"species": {}, "knobs": {}},
@@ -61,10 +68,13 @@ _ACTIVE_KEYS = (
     "consecutive_short_round_limit", "enemy_ai_enabled", "auto_switch_server",
     "enter_game_swap", "reach_area_swap",
     "invert_attack", "invert_defense",
+    "combat", "rl_model", "rl_train",
     "enemy_rules",
 )
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
+# 刷怪区内的战斗模式。tuple 不是 str —— 子串匹配会把 "ru" 判成合法。
+_COMBAT_MODES = ("rules", "rl")
 
 # loadout 切换和弦: 修饰键 + 数字键. tuple 不是 str —— `"12" in "1234567890"` 会
 # 子串匹配误判成合法, tuple 成员判定才对.
@@ -239,7 +249,11 @@ def _coerce_v1(raw):
             ok = isinstance(val, int) and not isinstance(val, bool) and val > 0
         elif key == "consecutive_short_round_limit":
             ok = isinstance(val, int) and not isinstance(val, bool) and val >= 1
-        else:  # 其余全是 bool 开关
+        elif key == "combat":
+            ok = val in _COMBAT_MODES
+        elif key == "rl_model":
+            ok = isinstance(val, str) and bool(val.strip())
+        else:  # enemy_ai_enabled / auto_switch_server / afk_enabled / invert_* / rl_train
             ok = isinstance(val, bool)
 
         if ok:
@@ -251,12 +265,71 @@ def _coerce_v1(raw):
 
 
 # ─────────────────────────── v2 schema ───────────────────────────
-# 顶层: version / afk_enabled / profiles / schedule / active.
+# 顶层: version / afk_enabled / profiles / schedule / active / recorder.
 # 阶段2 新增: 按星期几的时块调度 + 独立 Chrome profile.
+
+# 自动录像(session_recorder.py)的参数。默认关: 录像占盘, 不该悄悄开。dir 是相对 config.json 所在目录的路径(也可写绝对路径)。
+# 范围只防手滑: segment_min 分钟一段; cap_gb 超了删最旧的; hz 每秒录几帧 canvas; shot_every 几秒一张截图, 0 = 不截。
+RECORDER_DEFAULTS = {"auto": False, "dir": "recordings/auto", "segment_min": 10, "cap_gb": 10.0,
+                     "hz": 2.0, "shot_every": 5.0, "counters": True}
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+_RECORDER_CHECKS = {
+    "auto": lambda v: isinstance(v, bool),
+    "counters": lambda v: isinstance(v, bool),
+    "dir": lambda v: isinstance(v, str) and bool(v.strip()),
+    "segment_min": lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 120,
+    "cap_gb": lambda v: _is_num(v) and 0.5 <= v <= 2000,
+    "hz": lambda v: _is_num(v) and 0.5 <= v <= 5,
+    "shot_every": lambda v: _is_num(v) and (v == 0 or 1 <= v <= 60),
+}
+
+
+def recorder_field_ok(key, val):
+    """recorder 小节里这个键的这个值合不合法(界面表单提交前用; 不认识的键 -> False)。"""
+    ok = _RECORDER_CHECKS.get(key)
+    return bool(ok and ok(val))
+
+
+def coerce_recorder(v):
+    """recorder 小节 -> 规整后的完整一份。不是对象 -> 全默认; 某个键缺 / 坏 -> 只那个键回落默认(警告一句)。"""
+    out = dict(RECORDER_DEFAULTS)
+    if v is None:
+        return out
+    if not isinstance(v, dict):
+        print(f"⚠️ config.json recorder 应是对象, 实际是 {type(v).__name__}, 用默认值")
+        return out
+    for key, ok in _RECORDER_CHECKS.items():
+        if key not in v:
+            continue
+        val = v[key]
+        if not ok(val):
+            print(f"⚠️ config.json recorder.{key} 值不合法({val!r}), 用默认 {RECORDER_DEFAULTS[key]!r}")
+        elif key == "dir":
+            out[key] = val.strip()
+        elif key in ("cap_gb", "hz", "shot_every"):
+            out[key] = float(val)
+        else:
+            out[key] = val
+    return out
+
+
+def _validate_recorder(v):
+    """报错式(不纠正): 缺省的键不报, 出现了就必须合法。"""
+    if not isinstance(v, dict):
+        return [f"recorder 必须是对象, 实际是 {type(v).__name__}"]
+    return [f"recorder.{key} 值不合法: {v[key]!r}"
+            for key, ok in _RECORDER_CHECKS.items() if key in v and not ok(v[key])]
+
 
 DEFAULTS_V2 = {
     "version": 2,
     "afk_enabled": False,
+    "recorder": dict(RECORDER_DEFAULTS),
     "profiles": [{"alias": "默认", "dir": "chrome-profiles/默认"}],
     # 全新装是空的 —— 用户自己加时块. 空 schedule 时 worker 不会真跑.
     "schedule": [],
@@ -353,6 +426,14 @@ def _coerce_block(raw, aliases, n):
         "reach_area_swap": _coerce_swap_obj(raw.get("reach_area_swap")),
         "invert_attack": _bool_or("invert_attack", DEFAULTS["invert_attack"]),
         "invert_defense": _bool_or("invert_defense", DEFAULTS["invert_defense"]),
+        # combat/rl_*: 同样是后加的键, 缺了或写错一律回落默认, 不要整块丢。
+        # 认不出的 combat 值回落 "rules" —— 宁可按老办法刷, 也不要因为拼错一个词
+        # 就把这个时块整个作废。
+        "combat": (raw.get("combat") if raw.get("combat") in _COMBAT_MODES
+                   else DEFAULTS["combat"]),
+        "rl_model": (raw["rl_model"] if isinstance(raw.get("rl_model"), str)
+                     and raw["rl_model"].strip() else DEFAULTS["rl_model"]),
+        "rl_train": _bool_or("rl_train", DEFAULTS["rl_train"]),
         # 后加的键: 缺了 / 写坏了一律回落空规则(逐条丢坏条目), 不丢整块 —— 同 invert / swap / combat。
         "enemy_rules": _coerce_enemy_rules(raw.get("enemy_rules"), raw["map"]),
     }
@@ -588,6 +669,9 @@ def validate_config(raw):
     if "active" in raw:
         errs.extend(_validate_active(raw["active"]))
 
+    if "recorder" in raw:
+        errs.extend(_validate_recorder(raw["recorder"]))
+
     return errs
 
 
@@ -598,6 +682,7 @@ def _coerce(raw):
         return copy.deepcopy(DEFAULTS_V2)
     cfg = {"version": 2}
     cfg["afk_enabled"] = raw["afk_enabled"] if isinstance(raw.get("afk_enabled"), bool) else False
+    cfg["recorder"] = coerce_recorder(raw.get("recorder"))
     cfg["profiles"] = _coerce_profiles(raw.get("profiles"))
     aliases = {p["alias"] for p in cfg["profiles"]}
     cfg["schedule"] = _coerce_schedule(raw.get("schedule"), aliases)

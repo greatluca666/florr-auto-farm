@@ -33,6 +33,15 @@ import telemetry_clock
 import version
 import worker_log
 
+# 自动录像只在私有树里有(依赖 record_session, 公开版不带); 打包版没带探针 js 也不建这一页。
+try:
+    import gui_recorder
+    import session_recorder
+    if not session_recorder.available():
+        raise ImportError("frozen build")
+except ImportError:
+    gui_recorder = session_recorder = None
+
 _IS_WINDOWS = sys.platform == "win32"
 _LOG_MAX_LINES = 2000  # 日志框最多留这么多行, 再多就从头截掉
 _TICK_MS = 30_000      # 调度器 tick 间隔
@@ -245,6 +254,9 @@ class App(ctk.CTk):
         self._bug_dialog = None                       # 正开着的「要不要上报」弹窗(同一时间最多一个)
         self._bug_attach_job = None                   # 那个弹窗的附件打包(blackbox.PackJob)
         self._blackbox = None                         # worker 在跑时滚动录最近几分钟(blackbox.BlackBox)
+        self._recorder = None                         # 自动录像(session_recorder.AutoRecorder), 只在私有树里有
+        if gui_recorder is not None:
+            self._PAGES = App._PAGES + (("录像", "刷图时自动录制画面数据并存盘, 离线能重跑分析"),)
         self._tclock = telemetry_clock.TelemetryClock()   # 统计: worker 活着的秒数 + 各阶段耗时
         self._hb_thread = None                            # 最近一次心跳的发送线程(关窗口时等它一下)
 
@@ -326,6 +338,11 @@ class App(ctk.CTk):
         self._set_start_btn(False)
 
         self._page_widgets = {"时间表": self._sched_list, "账号": self._accounts}
+        if gui_recorder is not None:
+            self._page_widgets["录像"] = gui_recorder.RecorderPage(
+                self.content, get_rec_cfg=self._get_rec_cfg, save_rec_cfg=self._save_rec_cfg,
+                recorder=_ensure_recorder(self), root=os.path.dirname(app_config.CONFIG_PATH),
+                worker_running=lambda: self.proc is not None, on_auto_changed=self._on_recorder_auto)
         self._show_page("时间表")
 
         # 放在最后: 这个钩子会往 self.log_box 里写, 得等控件都建好.
@@ -350,7 +367,8 @@ class App(ctk.CTk):
         side.grid(row=0, column=0, sticky="nsew")
         side.grid_propagate(False)
         side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(3, weight=1)  # spacer
+        spacer = 1 + len(self._PAGES)          # 导航按钮之后的弹性空白行(页面数不同, 行号跟着走)
+        side.grid_rowconfigure(spacer, weight=1)
 
         brand = ctk.CTkFrame(side, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(20, 18))
@@ -368,7 +386,7 @@ class App(ctk.CTk):
             self._nav[name] = b
 
         afk = theme.card(side, fg_color=theme.SURFACE)
-        afk.grid(row=4, column=0, padx=10, pady=12, sticky="ew")
+        afk.grid(row=spacer + 1, column=0, padx=10, pady=12, sticky="ew")
         row = ctk.CTkFrame(afk, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=(10, 0))
         ctk.CTkLabel(row, text="AFK 自动处理", font=theme.font(13, "bold"),
@@ -389,10 +407,10 @@ class App(ctk.CTk):
             self.afk_manual_btn.configure(state="disabled")
 
         theme.ghost_button(side, "反馈问题", self._on_feedback, height=30).grid(
-            row=5, column=0, padx=12, pady=(0, 8), sticky="ew")
+            row=spacer + 2, column=0, padx=12, pady=(0, 8), sticky="ew")
 
         ver = ctk.CTkFrame(side, fg_color="transparent")
-        ver.grid(row=6, column=0, padx=18, pady=(0, 14), sticky="ew")
+        ver.grid(row=spacer + 3, column=0, padx=18, pady=(0, 14), sticky="ew")
         theme.hint(ver, gui_update.version_label(version.__version__)).pack(side="left")
         theme.ghost_button(ver, "检查更新", lambda: self._updates.check(manual=True),
                            width=72, height=24).pack(side="right")
@@ -682,6 +700,7 @@ class App(ctk.CTk):
                                         args=(self.proc, wlog, self._bug_watcher), daemon=True)
         self._reader.start()
         _start_blackbox(self)
+        _start_recorder(self)
 
     def _pump_log(self, proc, wlog=None, watcher=None):
         try:
@@ -711,6 +730,7 @@ class App(ctk.CTk):
         收完把 self.proc 置 None —— 慢半拍的 _pump_log 回调会因 proc != self.proc 早退.
         黑匣子也一起停(worker 崩了还没重启、这时用户点停止, proc 已经是 None, 所以放在最前面)."""
         _stop_blackbox(self)
+        _stop_recorder(self)
         proc = self.proc
         if proc is None:
             return
@@ -753,6 +773,7 @@ class App(ctk.CTk):
             self._send_heartbeat(blk)             # 崩溃 / 自己退出: 补报最后一段
         if not self._sched_running:
             _stop_blackbox(self)                  # 调度还在跑的话马上会自动重启, 黑匣子接着录
+            _stop_recorder(self, wait=False)      # 自动录像同理; 打包交给录制线程, 不卡界面
         if self._sched_running:
             # 崩溃自愈: 清掉当前时块记号, 下次 tick 会重新进这个时块.
             self._set_running_block(None)
@@ -1045,6 +1066,7 @@ class App(ctk.CTk):
                 pass
         self._stop_worker_sync()
         self._stop_afk_on_exit()
+        _stop_recorder(self, manual_too=True)      # 手动开的录像也在退出时收尾存盘
         t = self._hb_thread
         if t is not None:
             t.join(2)      # 最后那条心跳发出去: telemetry.send 是 daemon 线程, 窗口一销毁进程就退
@@ -1058,6 +1080,34 @@ class App(ctk.CTk):
         try:
             if self._cfg.get("afk_enabled") or afk_watch.started_by_this_session():
                 afk_watch.stop_florr_auto_afk()
+        except Exception:
+            pass
+
+    # ---- 自动录像(只在私有树里有) ----
+    def _get_rec_cfg(self):
+        return self._cfg.get("recorder") or app_config.coerce_recorder(None)
+
+    def _save_rec_cfg(self, rec):
+        """只改 recorder 小节: 先从盘上读最新的整份再写回, 不拿内存里可能过时的整份覆盖别的小节。"""
+        cfg = app_config.load_config()
+        cfg["recorder"] = rec
+        app_config.save_config(cfg)
+        self._cfg["recorder"] = app_config.load_config()["recorder"]
+
+    def _on_recorder_auto(self, enabled):
+        """页面上「跟刷图自动录像」开关变了: worker 正在跑就立刻开 / 停; 没在跑的话下次 worker 起来时生效。"""
+        if enabled:
+            if self.proc is not None:
+                _start_recorder(self)
+        else:
+            _stop_recorder(self, wait=False)
+
+    def _recorder_log(self, msg):
+        """录制线程往日志框写一行(线程里不能直接碰 Tk)。"""
+        if self._closing:
+            return
+        try:
+            self.after(0, self._log_line, msg + "\n")
         except Exception:
             pass
 
@@ -1081,6 +1131,38 @@ def _stop_blackbox(app):
         box = getattr(app, "_blackbox", None)
         if box is not None:
             box.stop(timeout=1.0)
+    except Exception:
+        pass
+
+
+# ---- 自动录像(session_recorder.py): 同样是模块级小函数, 测试里的假 app 不用带这些属性 ----
+def _ensure_recorder(app):
+    rec = getattr(app, "_recorder", None)
+    if rec is None:
+        rec = app._recorder = session_recorder.AutoRecorder(
+            os.path.dirname(app_config.CONFIG_PATH), lambda: (getattr(app, "_cfg", None) or {}).get("recorder"),
+            log=getattr(app, "_recorder_log", None))
+    return rec
+
+
+def _start_recorder(app):
+    """worker 起来时, 配置里「跟刷图自动录像」开着就开录(已经在录就什么也不做)。不抛。"""
+    try:
+        if session_recorder is None:
+            return
+        if not ((getattr(app, "_cfg", None) or {}).get("recorder") or {}).get("auto"):
+            return
+        _ensure_recorder(app).start("auto")
+    except Exception:
+        pass
+
+
+def _stop_recorder(app, *, wait=True, manual_too=False):
+    """worker 停时停自动开的录像(手动开的不停); 退出程序时 manual_too=True 连手动的一起收尾。不抛。"""
+    try:
+        rec = getattr(app, "_recorder", None)
+        if rec is not None:
+            rec.stop("manual" if manual_too else "auto", wait=wait)
     except Exception:
         pass
 

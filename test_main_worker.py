@@ -217,6 +217,7 @@ def test_run_worker_does_not_start_florr_auto_afk(monkeypatch):
         "route": map_routes.route_for("desert"),
         "invert_attack": True,
         "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)  # 本测跟生态区无关
     monkeypatch.setattr(main.florr_settings, "ensure_flag",
@@ -882,6 +883,7 @@ def _stub_run_worker_env(monkeypatch, overlay=None):
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     # 服务器号读取也得打桩: 不打桩的话每条用到本 fixture 的用例都会真的走到
     # cdp_bridge.eval_js —— 而真正的部署机是 Windows, 那台的 Chrome 就是带
@@ -938,6 +940,7 @@ def test_run_worker_toggle_wants_come_from_active_slice(monkeypatch):
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": False, "invert_defense": True,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     calls = []
     monkeypatch.setattr(main.florr_settings, "ensure_flag",
@@ -1085,6 +1088,7 @@ def test_run_worker_switch_server_uses_configured_biome(monkeypatch):
         "route": map_routes.route_for("ocean"),
         "enter_game_swap": "none", "reach_area_swap": "none",
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     # 每轮都真进游戏(否则 d9592fd 后"没进游戏的轮"不计短局, 到不了换服分支)
     monkeypatch.setattr(main, "on_start_screen", lambda: True)
@@ -1120,6 +1124,7 @@ def test_run_worker_skips_death_click_right_after_switch_server(monkeypatch):
         "route": map_routes.route_for("desert"),
         "enter_game_swap": "none", "reach_area_swap": "none",
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
     monkeypatch.setattr(main, "_wait_for_start_menu", lambda *a, **k: True)
@@ -1163,6 +1168,7 @@ def test_run_worker_clears_switch_flag_when_start_screen_seen_first(monkeypatch)
         "route": map_routes.route_for("desert"),
         "enter_game_swap": "none", "reach_area_swap": "none",
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
     monkeypatch.setattr(main, "_wait_for_start_menu", lambda *a, **k: True)
@@ -1311,6 +1317,7 @@ def _swap_env(monkeypatch, *, enter="k", reach="l"):
         "route": map_routes.route_for("desert"),
         "enter_game_swap": enter, "reach_area_swap": reach,
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main.florr_settings, "ensure_flag",
                         lambda ej, addr, want: ("unchanged", ""))
@@ -1334,6 +1341,7 @@ def _location_check_env(monkeypatch, *, binary_map, location=(1, 2)):
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "load_binary_map", lambda: binary_map, raising=False)
     targets = []
@@ -1517,6 +1525,36 @@ def test_run_worker_swaps_again_after_real_respawn(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         main.run_worker({})
     assert seen == ["k", "k"]            # 两轮都真重进了游戏 → 两轮都切 enter
+
+
+def test_run_worker_marks_a_loadout_baseline_on_every_real_reentry(monkeypatch):
+    """florr 重进游戏会把 loadout 重置 —— 就算时块没配预设和弦、一个键都没按。RL 环境
+    靠这个把 R 的奇偶归零; 漏了的话, 两局之间死过一次, 下一局的奇偶观测就是错的。"""
+    _swap_env(monkeypatch, enter="k", reach="l")
+    marks = []
+    monkeypatch.setattr(main.loadout_swap, "mark_baseline", lambda: marks.append(1))
+    monkeypatch.setattr(main, "click_start_game", lambda: None)
+    monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_wait_for_start_menu", lambda *a, **k: True)
+    starts = {"n": 0}
+
+    def fake_start_screen():
+        starts["n"] += 1
+        return starts["n"] <= 2          # 第 1、2 轮都从开局菜单重进
+
+    monkeypatch.setattr(main, "on_start_screen", fake_start_screen)
+    calls = {"n": 0}
+
+    def fake_path(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return False
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main, "lazy_theta_pathing", fake_path)
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert len(marks) == 2               # 第 3 轮没重进 -> 不算
 
 
 class TestWorkerStdinWatcher:
@@ -2040,6 +2078,7 @@ def _respawn_env(monkeypatch):
         "route": map_routes.route_for("factory"),
         "enter_game_swap": "none", "reach_area_swap": "none",
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
     monkeypatch.setattr(main, "_wait_for_start_menu", lambda *a, **k: True)
@@ -3047,6 +3086,7 @@ def test_run_worker_entry_route_timeout_never_counts_as_a_full_round(monkeypatch
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     # 洞口坐标还没标定、maps/garden.png 还没采 —— 启动闸门不是这条用例要测的东西.
     monkeypatch.setattr(main, "_route_blocker", lambda route: None)
@@ -3101,6 +3141,7 @@ def test_run_worker_counts_entry_timeout_even_when_the_round_never_re_entered(mo
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "_route_blocker", lambda route: None)
     # _stub_run_worker_env 里 on_death_screen / on_start_screen / on_guest_screen 全恒 False
@@ -3152,6 +3193,7 @@ def test_run_worker_entry_route_interrupted_near_boot_never_counts_as_a_short_ro
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "_route_blocker", lambda route: None)
     # _stub_run_worker_env 里 on_death_screen/on_start_screen/on_guest_screen
@@ -3197,6 +3239,7 @@ def test_run_worker_entry_route_interrupted_after_death_reentry_never_counts_as_
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "_route_blocker", lambda route: None)
     # 每轮循环顶都撞见死亡画面 -> entered_game 恒 True(模拟"死后一直在重进"
@@ -3245,6 +3288,7 @@ def test_run_worker_resets_stage_state_after_switching_servers(monkeypatch):
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "_route_blocker", lambda r: None)
     monkeypatch.setattr(main, "apply_map", lambda n: None)      # maps/garden.png 还没采
@@ -3314,6 +3358,7 @@ def test_run_worker_resets_stage_state_when_re_entering_from_the_title_screen(mo
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "_route_blocker", lambda r: None)
     monkeypatch.setattr(main, "apply_map", lambda n: None)      # maps/garden.png 还没采
@@ -3416,6 +3461,62 @@ def test_circling_does_not_feed_the_stall_detector(monkeypatch):
                                       center=(960.0, 540.0), track_stall=False)
     assert got == "moved" and moved == [(1000.0, 540.0)]
     assert history == []
+
+
+# ── 换服计数: 只要死了就算一次 ──────────────────────────────────────────────
+#
+# 用户(2026-09-25): 自动换服不好使 —— "只要死了就算一次死亡"。换服只看"连续 N 轮没刷
+# 满时长"; RL 模式死了是就地复活, 那一轮照样跑满 300 秒, 于是永远攒不够次数。
+
+def _switch_env(monkeypatch, deaths_per_round, *, limit=2):
+    """每轮都"刷满"(farming_duration=0), 但 RL 那一段报告就地复活了几次。"""
+    _stub_run_worker_env(monkeypatch)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+        "location": (1, 2), "farming_area": [(0, 0), (9, 9)], "farming_duration": 0,
+        "short_round_limit": limit, "enemy_ai_enabled": False, "auto_switch_server": True,
+        "biome": "desert", "map_name": "desert", "route": map_routes.route_for("desert"),
+        "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
+        "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
+        "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
+    })
+    monkeypatch.setattr(main.florr_settings, "ensure_flag", lambda *a: ("unchanged", ""))
+    monkeypatch.setattr(main, "lazy_theta_pathing", lambda *a, **k: True)
+    rounds = iter(deaths_per_round)
+
+    def farm(*a, **k):
+        try:
+            main._RL_ROUND_DEATHS = next(rounds)
+        except StopIteration:
+            raise KeyboardInterrupt
+        return True
+
+    monkeypatch.setattr(main, "auto_farming", farm)
+    switched = []
+    monkeypatch.setattr(main, "switch_server", lambda *a, **k: switched.append(1))
+    return switched
+
+
+def test_deaths_inside_a_full_rl_round_count_towards_switching(monkeypatch):
+    switched = _switch_env(monkeypatch, [2])
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert switched == [1]                  # 一轮里死两次 = 攒够 2
+
+
+def test_single_deaths_add_up_across_rounds(monkeypatch):
+    switched = _switch_env(monkeypatch, [1, 1])
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert switched == [1]
+
+
+def test_a_clean_full_round_clears_the_count(monkeypatch):
+    """跑满而且一次没死 = 这个服务器没问题, 计数清零。"""
+    switched = _switch_env(monkeypatch, [1, 0, 1])
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert switched == []
 
 
 # ── 死在蚁穴 -> 重生还在蚁穴, 但阶段猜测回到花园 (2026-09-27 实机: 3 轮各白烧 180 秒) ──
@@ -5033,6 +5134,7 @@ def test_run_worker_marks_the_short_round_server_switch_as_travel(monkeypatch):
         "biome": "ocean", "map_name": "ocean", "route": map_routes.route_for("ocean"),
         "enter_game_swap": "none", "reach_area_swap": "none",
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
     })
     monkeypatch.setattr(main, "on_start_screen", lambda: True)
     monkeypatch.setattr(main, "click_start_game", lambda: True)

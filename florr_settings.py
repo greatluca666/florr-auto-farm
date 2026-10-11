@@ -20,6 +20,12 @@ import json
 INVERT_ATTACK_ADDR = 0x53430E
 INVERT_DEFENSE_ADDR = 0x534310
 
+# 设置→控制→键盘移动(WASD). florr 默认**关**着 —— 用户实机确认。
+# 关着的时候 WASD 一点反应都没有, 而且没有任何报错: 花朵就是不动。所以 RL 的移动
+# 默认走鼠标(见 rl_backend.MouseMover); 真要走键盘, 这个必须先打开。
+# 地址未标定 —— settings_finder.js 是通用的 bool 标志定位器, 对着这个复选框跑一遍
+# (begin / 勾 mark / 取消 mark / 反复 4~6 次 / solve), 把地址填这里。
+KEYBOARD_MOVE_ADDR = None
 
 _JS_TEMPLATE = r"""JSON.stringify((() => {{
   const M = window.Module;

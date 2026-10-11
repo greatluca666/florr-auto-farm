@@ -420,6 +420,69 @@ def _secondary_stroke(frame, ax, ay, frac, width=60.0):
             "m": [ZOOM, 0, 0, ZOOM, ax, ay]}
 
 
+def test_player_from_frame_reads_own_hp_and_shield():
+    from canvas_decode import player_from_frame
+    px, py = 600.0, 453.5
+    recs = gameplay_frame(0, player_world=(5640.0, 6911.0),
+                          mobs=[(800.0, -60.0, "岩石", 1.0)])
+    recs += healthbar_recs(0, px, py, hp=0.62) + [_secondary_stroke(0, px, py, 0.25)]
+    cam = camera_from_frame(recs)
+
+    me = player_from_frame(recs, cam)
+    assert me is not None
+    assert abs(me["hp"] - 0.62) < 1e-6
+    assert abs(me["hp_secondary"] - 0.25) < 1e-6
+    assert (me["sx"], me["sy"]) == (px, py)
+    assert abs(me["x"] - 5640.0) < 1.0 and abs(me["y"] - 6911.0) < 1.0
+
+
+def test_player_from_frame_none_when_no_bar_at_player_anchor():
+    """怪的血条不能被当成自己的 —— 这一帧只有怪画了血条, 自己没画."""
+    from canvas_decode import player_from_frame
+    recs = gameplay_frame(0, mobs=[(800.0, -60.0, "岩石", 0.5)])
+    cam = camera_from_frame(recs)
+    assert player_from_frame(recs, cam) is None
+
+
+def test_other_players_carry_level_and_are_not_mobs():
+    from canvas_decode import other_players_from_frame
+    recs = gameplay_frame(0, mobs=[(800.0, -60.0, "岩石", 1.0)])
+    recs += nameplate(0, 300.0, 200.0, "小明", rarity="37级",
+                      rarity_color="#FFFFFF", hp=0.8)
+    cam = camera_from_frame(recs)
+
+    players = other_players_from_frame(recs, cam)
+    assert len(players) == 1
+    assert players[0]["name"] == "小明"
+    assert players[0]["level"] == 37
+    assert abs(players[0]["hp"] - 0.8) < 1e-6
+
+    # 同一帧里那个玩家不能同时出现在怪列表里
+    names = [m["name"] for m in mobs_from_frame(recs, cam)]
+    assert "岩石" in names and "小明" not in names
+
+
+def test_other_players_excludes_self_and_plain_mobs():
+    from canvas_decode import other_players_from_frame
+    px, py = 600.0, 453.5
+    recs = gameplay_frame(0, mobs=[(800.0, -60.0, "岩石", 1.0)])
+    recs += healthbar_recs(0, px, py, hp=1.0)
+    cam = camera_from_frame(recs)
+    assert other_players_from_frame(recs, cam) == []
+
+
+def test_player_level_reads_both_clients_and_never_crashes():
+    """中文 "37级" 和英文 "Lvl 37" 都解成整数; 形状对不上 -> None, 不能抛."""
+    from canvas_decode import _player_level
+    assert _player_level(["小明", "37级"]) == 37
+    assert _player_level(["Alice", "Lvl 37"]) == 37
+    assert _player_level(["Alice", "[ulgr]", "Lvl 120"]) == 120
+    assert _player_level(["小明"]) is None
+    assert _player_level(["Lvl"]) is None
+    assert _player_level(["Lvl 37 Flower"]) is None      # HUD 的 LevelLong, 不是名牌
+    assert _player_level([]) is None
+
+
 @pytest.mark.parametrize("text, is_level", [
     ("37级", True), ("Lvl 37", True), ("Lvl 5", True),
     ("Lvl 37 Flower", False), ("lvl 37", False), ("Lvl", False), ("37", False),
@@ -432,10 +495,14 @@ def test_player_rarity_pattern_matches_levels_not_rarity_words(text, is_level):
 
 def test_english_client_players_carry_level_and_are_not_mobs():
     """英文客户端的名牌第二格是 "Lvl 37"(游戏本地化表 UI/Flower/Level)。"""
+    from canvas_decode import other_players_from_frame
     recs = gameplay_frame(0, mobs=[(800.0, -60.0, "Rock", 1.0)])
     recs += nameplate(0, 300.0, 200.0, "Alice", rarity="Lvl 37",
                       rarity_color="#FFFFFF", hp=0.8)
     cam = camera_from_frame(recs)
+    players = other_players_from_frame(recs, cam)
+    assert len(players) == 1
+    assert players[0]["name"] == "Alice" and players[0]["level"] == 37
     names = [m["name"] for m in mobs_from_frame(recs, cam)]
     assert "Rock" in names and "Alice" not in names
 
@@ -478,6 +545,68 @@ def test_camera_keeps_gold_body_anchor_when_bars_are_lopsided():
     cam = camera_from_frame(recs, best_effort=True)
     assert cam["player_screen"] == (960.0, 540.0)
     assert not cam.get("approx")
+
+
+def test_player_hp_is_own_not_a_centipede_segment():
+    from canvas_decode import player_from_frame
+    recs = _centipede_frame()
+    cam = camera_from_frame(recs, best_effort=True)
+    me = player_from_frame(recs, cam)
+    assert me is not None
+    # 蜈蚣节段全是满血; 报 1.0 就说明读到别人身上去了
+    assert abs(me["hp"] - 0.37) < 1e-6
+
+
+def test_player_from_frame_refuses_approximate_camera():
+    """玩家死亡后自己的花朵不再绘制 —— 相机只能给近似锚点, 那上面坐着的是别的东西的
+    血条. 这种情况必须报"读不到"(None), 绝不能把别人的满血当成自己的."""
+    from canvas_decode import player_from_frame
+    recs = []
+    for i in range(9):                       # 只有蜈蚣, 没有玩家金身
+        recs += _bare_shielded_bar(0, -130.0 - i * 12, 72.0 - i * 40)
+    recs += nameplate(0, -283.0, -259.0, "蜈蚣", hp=1.0)
+    recs += [minimap_rec(0, 5640.0, 6911.0)]
+    cam = camera_from_frame(recs, best_effort=True)
+    assert cam.get("approx") is True
+    assert player_from_frame(recs, cam) is None
+
+
+def test_clan_tagged_player_is_not_a_mob():
+    """实测帧: 带战队标签的玩家名牌是 [名字, [战队], 105级] 三段, 按位置取 texts[1]
+    会拿到战队标签 -> 被当成怪, 而且战队标签色 #1FDBDE 正好是神话色."""
+    from canvas_decode import other_players_from_frame
+    recs = gameplay_frame(0, mobs=[(800.0, -60.0, "岩石", 1.0)])
+    recs += healthbar_recs(0, 300.0, 200.0, hp=1.0)
+    recs += [text_rec(0, 260.0, 226.0, "conf281630", "#FF94C9")] * 2
+    recs += [text_rec(0, 262.0, 251.0, "[ulgr]", "#1FDBDE")] * 2
+    recs += [text_rec(0, 303.0, 251.0, "105级", "#FF2B75")] * 2
+    cam = camera_from_frame(recs)
+
+    players = other_players_from_frame(recs, cam)
+    assert [p["level"] for p in players] == [105]
+    assert players[0]["name"] == "conf281630"
+    names = [m["name"] for m in mobs_from_frame(recs, cam)]
+    assert "conf281630" not in names and "岩石" in names
+
+
+def test_hud_text_is_not_claimed_by_a_world_bar():
+    """左上角 HUD 头像卡的文字画在 UI 尺度(1.25)上, 世界名牌画在相机缩放(0.9)上.
+
+    实测 canvas_combat_test.ndjson: 不卡尺度的话, 自己 HUD 上的 "2级" 会被空块救济
+    贴到自己那条裸血条上 —— 165 帧里 39 帧如此, 结果"自己"被当成另一个玩家报出来
+    (那份录像里根本没有别的玩家)。
+    """
+    from canvas_decode import other_players_from_frame, _bar_blocks
+    px, py = 600.0, 453.5
+    recs = gameplay_frame(0, mobs=[(800.0, -60.0, "岩石", 1.0)])
+    recs += healthbar_recs(0, px, py, hp=1.0)          # 自己的裸血条, 尺度 = ZOOM
+    recs += [text_rec(0, px - 20, py + 30, "2级", scale=1.25)] * 2        # HUD
+    recs += [text_rec(0, px - 30, py + 10, "Guest #8121", scale=1.25)] * 2
+    cam = camera_from_frame(recs)
+
+    own = [b for b in _bar_blocks(recs) if abs(b["anchor"][0] - px) < 1]
+    assert own and own[0]["texts"] == []        # HUD 文字没被贴上来
+    assert other_players_from_frame(recs, cam) == []
 
 
 def test_mob_rarity_read_by_colour_not_position():

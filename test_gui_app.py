@@ -1014,6 +1014,7 @@ def test_exit_never_fails_because_the_afk_helper_would_not_stop(monkeypatch):
 
 def test_closing_the_window_stops_the_afk_helper_before_it_destroys_itself(monkeypatch):
     order = []
+    monkeypatch.setattr(gui_app, "_stop_recorder", lambda *a, **k: None)
     app = _types.SimpleNamespace(
         _updates=None, _closing=False, _tick_job=None, _telemetry_job=None, _hb_thread=None,
         after_cancel=lambda j: None,

@@ -78,9 +78,11 @@ def test_it_uses_the_real_cdp_helper_by_default(monkeypatch):
     assert calls and calls[0][0] == "Page.captureScreenshot"
 
 
-@pytest.mark.parametrize("name", ["blackbox.py"])
+@pytest.mark.parametrize("name", ["blackbox.py", "record_session.py", "session_recorder.py"])
 def test_no_recorder_asks_chrome_for_a_clip_again(name):
     """三处录像截图(黑匣子 / 命令行录像 / 自动录像)用的是同一个写法, 都踩过这个坑 —— 谁再写回 clip 就拦下。"""
+    if not (ROOT / name).exists():
+        pytest.skip(f"{name} 公开树不带")
     src = (ROOT / name).read_text(encoding="utf-8")
     code = "\n".join(line.split("#", 1)[0] for line in src.splitlines())      # 注释里提到不算
     assert not re.search(r"""["']clip["']""", code), f"{name} 又在给 Page.captureScreenshot 传 clip 了"

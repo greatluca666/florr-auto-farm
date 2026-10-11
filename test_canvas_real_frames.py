@@ -47,6 +47,13 @@ def test_ultra_frame_camera_is_exact_not_approximate(ultra):
     assert cam["player_screen"] == (960, 472.5)
 
 
+def test_ultra_frame_reads_own_hp(ultra):
+    raw, cam, _ = ultra
+    me = cd.player_from_frame(raw, cam)
+    assert me is not None
+    assert 0.0 < me["hp"] < 1.0        # 实拍时是残血, 不是满血也不是读不到
+
+
 def test_every_named_mob_also_has_a_rarity(ultra):
     """这就是"大体型怪丢稀有度"那个 bug 的验收条件。
 
@@ -134,6 +141,16 @@ def test_mythic_frame_finds_all_four_mythics(mythic):
     assert len([m for m in mobs if m.get("rarity") == "神话"]) == 4
 
 
+def test_far_mythic_survives_the_monitor_row_limit(mythic):
+    """26 只怪里 18 只传奇, 最远那只神话排第 26 —— 按距离取前 14 行会把它切掉。"""
+    live_monitor = pytest.importorskip("live_monitor")      # 公开树不带它
+    raw, cam, mobs = mythic
+    me = cd.player_from_frame(raw, cam)
+    rows, n_high = live_monitor.pick_mob_rows(live_monitor.annotate(mobs, me))
+    assert n_high == 4
+    assert len([m for m in rows if live_monitor.rarity_rank(m) >= 5]) == 4
+
+
 # ── 距离判定必须用真实锚点 (2026-09-22) ──────────────────────────────────────
 
 def test_real_frame_centre_offset_flips_real_decisions(mythic):
@@ -184,10 +201,10 @@ def test_scan_enemies_reports_the_decoded_anchor(monkeypatch):
 
 # ── 自己挨打闪色 (florragent 真实战斗录像里抽的两帧) ──────────────────────────
 #
-# 实机(2026-09-24)进度行里"解出自己"常常只有 18~50%。战斗录像 165 帧里, 自己的
+# RL 实机(2026-09-24)进度行里"解出自己"常常只有 18~50%。战斗录像 165 帧里, 自己的
 # 花身颜色不是 #FFE763 的正好 39 帧 —— 跟"相机只能近似"的 39 帧一一对上。花身挨打时
 # 从金色往白/往红插值(#FFEE91 / #FFF4BB / #FF9248 / #FF7230), 只认精确色号就认不出
-# 自己: 越是在打架, 越是认不出自己。
+# 自己: 越是在打架, 策略越是看不见自己。
 
 @pytest.mark.parametrize("name", ["self_hitflash_white.json", "self_hitflash_red.json"])
 def test_self_is_still_found_while_the_body_flashes(name):
@@ -195,6 +212,8 @@ def test_self_is_still_found_while_the_body_flashes(name):
     cam = cd.camera_from_frame(raw, best_effort=True)
     assert not cam["approx"]
     assert math.hypot(cam["player_screen"][0] - 960.5, cam["player_screen"][1] - 540.5) < 2
+    me = cd.player_from_frame(raw, cam)
+    assert me is not None and me["hp"] is not None
 
 
 @pytest.mark.parametrize("color,ok", [
@@ -217,6 +236,17 @@ def test_what_counts_as_our_body_color(color, ok):
 # 残影 #DD3434 + 当前血量(绿), 所以原来的 _bar_blocks 根本不认它。
 # 满长 = 2 × (锚点 x - 起点 x): 实拍 163px, 两帧读数跟脚下血条对得上(0.748/0.749、
 # 0.834/0.837)。
+
+@pytest.mark.parametrize("name", ["desert_mythic_26mobs.json", "desert_ultra_44mobs.json",
+                                  "self_hitflash_white.json", "self_hitflash_red.json"])
+def test_the_hud_hp_agrees_with_the_bar_under_the_flower(name):
+    raw = load(name)
+    cam = cd.camera_from_frame(raw, best_effort=True)
+    world = cd.player_from_frame(raw, cam)
+    hud = cd.hud_self_from_frame(raw)
+    assert hud is not None
+    assert hud["hp"] == pytest.approx(world["hp"], abs=0.01)
+    assert hud["hp_secondary"] == 0.0
 
 
 def _hud(value_right, *, shield=None, bg=False, avatar_y=110.0):
@@ -256,6 +286,19 @@ def test_a_bar_with_no_avatar_on_its_row_is_not_ours():
     assert cd.hud_self_from_frame(_hud(279, avatar_y=400.0)) is None
 
 
+def test_a_frame_without_the_bar_under_the_flower_still_reads_hp_from_the_hud():
+    """把脚下那条血条从实拍帧里删掉 —— 原来这一帧"自己"整个是 None。"""
+    import rl_scene
+
+    raw = load("desert_mythic_26mobs.json")
+    cam = cd.camera_from_frame(raw, best_effort=True)
+    px, py = cam["player_screen"]
+    raw = [r for r in raw if not (r["op"] == "stroke" and r.get("m")
+                                  and abs(r["m"][4] - px) < 1 and abs(r["m"][5] - py) < 1)]
+    sc = rl_scene.decode(raw)
+    assert sc.player is not None and sc.player["hp"] == pytest.approx(0.749, abs=0.01)
+
+
 def test_the_hud_full_length_comes_from_the_drawing_not_a_constant():
     """实拍满长 163px 是 1920×1080 下的; 换个分辨率 UI 缩放就变。满长得从锚点和起点现算。"""
     m = [1.0, 0, 0, 1.0, 150.0, 88.0]
@@ -269,7 +312,7 @@ def test_the_hud_full_length_comes_from_the_drawing_not_a_constant():
 
 # ── 状态染色: 头像和花身跟着中毒/受伤等状态变色 ──────────────────────────────
 #
-# 实机(2026-09-25)存下的 41 帧 no_hp: 左上角头像卡其实都在, 血条也在, 但
+# RL 实机(2026-09-25)rl_debug 存下的 41 帧 no_hp: 左上角头像卡其实都在, 血条也在, 但
 # 头像是 #CE76DA(紫, 中毒)、#F9D970、#E2658C、#FFE2B5 …… 几十种色 —— 按颜色认头像,
 # 整张卡被跳过; 世界里的花身同色, 相机也找不到自己, 脚下血条那条备用路也跟着断。
 # 颜色靠不住, 靠几何: 头像 = 血条左边同一行、同缩放的"描边圈 + 身体圈"(半径比 1.128)。

@@ -11,6 +11,24 @@ import pyautogui
 _DIGITS = tuple("1234567890")
 _MODS = ("k", "l")
 
+# 装备基准纪元: 花瓣栏每"回到一个已知基准"一次就 +1 —— 按下一套预设, 或者重进游戏
+# (florr 死了重进会把 loadout 重置, 用户实机确认)。
+#
+# 给 RL 用: 策略的 R 是相对翻转, 观测里只能记"按了几次"的奇偶, 而奇偶只在花瓣栏真的
+# 回到基准时才该归零。环境每拍读一次这个数, 变了就归零。原来是每次 reset 一律归零,
+# 可 AFK / 步数上限 / 短途拉回 / 窗口失焦都会 reset、都没碰过装备 —— 观测在撒谎。
+_epoch = 0
+
+
+def baseline_epoch():
+    return _epoch
+
+
+def mark_baseline():
+    """花瓣栏回到了基准(按了预设 / 重进了游戏)。"""
+    global _epoch
+    _epoch += 1
+
 
 def press_swap(cfg, *, press=pyautogui.press,
                key_down=pyautogui.keyDown, key_up=pyautogui.keyUp):
@@ -45,3 +63,4 @@ def press_swap(cfg, *, press=pyautogui.press,
     except Exception as e:
         print(f"⚠️ 装备切换按键失败 (mod={mod} digit={digit}): {e}")
         return
+    mark_baseline()

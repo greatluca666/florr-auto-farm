@@ -84,3 +84,45 @@ def test_digit_zero_is_valid():
     ev, io = _rig()
     loadout_swap.press_swap({"enabled": True, "mod": "l", "digit": "0"}, **io)
     assert ev == [("down", "l"), ("press", "0"), ("up", "l")]
+
+
+# ── 装备基准纪元: RL 的"按了几次 R"奇偶靠它归零 ─────────────────────────────
+
+def test_an_actual_press_starts_a_new_loadout_epoch():
+    """按下一套预设 = 花瓣栏回到那套存档的样子 —— R 翻过几次都作废。RL 环境看到纪元
+    变了就把奇偶归零; 不看这个的话, 它只能在每次 reset 时一律归零, 而 AFK/步数上限/
+    短途拉回这些 reset 根本没碰过装备, 奇偶就错了。"""
+    _, io = _rig()
+    before = loadout_swap.baseline_epoch()
+    loadout_swap.press_swap({"enabled": True, "mod": "k", "digit": "2"}, **io)
+    assert loadout_swap.baseline_epoch() == before + 1
+
+
+@pytest.mark.parametrize("cfg", [
+    None,
+    {"enabled": False, "mod": "k", "digit": "3"},
+    {"enabled": True, "mod": "none", "digit": "x"},
+])
+def test_nothing_pressed_means_the_epoch_does_not_move(cfg):
+    _, io = _rig()
+    before = loadout_swap.baseline_epoch()
+    loadout_swap.press_swap(cfg, **io)
+    assert loadout_swap.baseline_epoch() == before
+
+
+def test_a_failed_press_does_not_claim_a_new_epoch():
+    """键没按出去, 花瓣栏就没变 —— 归零的话奇偶反而错。"""
+    def boom(_k):
+        raise RuntimeError("no focus")
+    before = loadout_swap.baseline_epoch()
+    loadout_swap.press_swap({"enabled": True, "mod": "none", "digit": "1"},
+                            press=boom, key_down=lambda k: None, key_up=lambda k: None)
+    assert loadout_swap.baseline_epoch() == before
+
+
+def test_reentering_the_game_starts_a_new_epoch():
+    """死了重进 / 从标题页进 florr 会把 loadout 重置(用户实机确认) —— 就算时块没配
+    预设和弦、一个键都没按, 花瓣栏也回到了基准。"""
+    before = loadout_swap.baseline_epoch()
+    loadout_swap.mark_baseline()
+    assert loadout_swap.baseline_epoch() == before + 1

@@ -200,7 +200,7 @@ def _anchor(rec):
 
 # 花身挨打会闪色: 从 PLAYER_BODY_COLOR 往白(#FFEE91、#FFF4BB)或往红(#FF9248、#FF7230)
 # 按同一个比例插值。只认精确色号的话, 一闪就认不出自己 —— florragent 战斗录像 165 帧里
-# 正好 39 帧(24%)是这样, 全落进"相机只能近似"、自身血量读不出来; 实机进度行
+# 正好 39 帧(24%)是这样, 全落进"相机只能近似"、自身血量读不出来; RL 实机进度行
 # "解出自己"只有 18~50% 就是它。
 _FLASH_MAX = 0.9          # 闪到头的纯白/纯红太常见(别的东西也这个色), 不认
 _FLASH_TOL = 0.06         # G/B 两个分量解出来的插值比例得对得上
@@ -694,6 +694,44 @@ def _split_mob_texts(texts, colors):
             colors[1] if len(colors) > 1 else None)
 
 
+def _player_level(texts):
+    """其他玩家名牌第二格是等级("37级" / 英文 "Lvl 37") —— 解成整数, 解不出返回 None.
+
+    中文写法是实机确认的; 英文 "Lvl N" 取自游戏本地化表, 没有英文实机帧核对过。
+    """
+    for t in texts:
+        s = str(t)
+        if PLAYER_RARITY_PATTERN.match(s):
+            return int(re.search(r"\d+", s).group())
+    return None
+
+
+def player_from_frame(records, camera):
+    """自己那一块血条: hp(0~1 剩余比例) + hp_secondary(护盾/再生那条青色窄条,
+    没画就是 0.0) + 屏幕/世界坐标.
+
+    移植自 florragent scripts/canvas_decode.py (2026-09-21) —— RL 观测和实时监视
+    都要读自身血量, 本仓库当初 vendor 时只搬了怪物那一半。
+
+    解出了相机、但这一帧没画玩家血条 -> None (防御式返回, 不抛)。
+    """
+    if camera.get("approx"):
+        # 近似锚点是 camera_from_frame 的 best_effort 兜底 —— 它自己的文档就写明只够
+        # 用来做 _is_player_anchor 过滤, 不是像素精确的。拿它去读血条, 读到的是坐在
+        # 那个位置上的**别的实体**: 实测战斗录像里走这条路的 70 帧, 报出来的血量
+        # 100% 都是别人的 1.0。玩家一死自己的花朵就不再绘制, 这条路必然触发 ——
+        # "死了还显示满血"就是这么来的。宁可报"读不到", 不报假的。
+        return None
+    for block in _bar_blocks(records):
+        if not _is_player_anchor(block["anchor"], camera):
+            continue
+        ax, ay = block["anchor"]
+        wx, wy = screen_to_world(ax, ay, camera)
+        return {"hp": block["hp"], "hp_secondary": block["secondary"] or 0.0,
+                "sx": ax, "sy": ay, "x": wx, "y": wy}
+    return None
+
+
 def _hud_fraction(rec):
     """头像卡上一段条的比例: 宽度 / 满长, 满长 = 2 × (锚点 x - 起点 x)(条以锚点为中心画)。"""
     bbox = rec.get("bbox")
@@ -712,7 +750,7 @@ def _hud_avatar(records, scale, row_y, left_of_x, row_tol=2.0):
     """头像卡上自己的头像(身体圈那条 fill 记录); 没有返回 None。
 
     **按几何认, 不按颜色**: 头像跟花身一起随状态变色(中毒紫 #CE76DA、#F9D970、
-    #E2658C …… 实机存下的帧里几十种), 按色认会整张卡跳过。认法: 血条左边、同一行、
+    #E2658C …… 实机 rl_debug 里几十种), 按色认会整张卡跳过。认法: 血条左边、同一行、
     同缩放, 同一锚点上一对"描边圈 + 身体圈", 半径比 1.128。
     """
     by_anchor = {}
@@ -760,7 +798,7 @@ def _hud_bar(records, row_tol=2.0):
 
 
 def hud_self_colour(records):
-    """这一帧自己花身的颜色 —— 从左上角头像读。头像和世界里的花身同色(实机存下的帧
+    """这一帧自己花身的颜色 —— 从左上角头像读。头像和世界里的花身同色(实机 rl_debug
     60 帧逐帧对得上), 相机拿它去世界里找自己。认不出返回 None。"""
     found = _hud_bar(records)
     return found[1].get("fill") if found else None
@@ -792,3 +830,37 @@ def hud_self_from_frame(records, row_tol=2.0, shield_row_tol=20.0):
             shield = _hud_fraction(sh) or 0.0
             break
     return {"hp": hp, "hp_secondary": shield}
+
+
+def _player_name(texts):
+    """玩家名牌里的名字: 跳过等级("37级")和战队标签("[ulgr]"), 取剩下的第一条。"""
+    for t in texts:
+        s = str(t)
+        if PLAYER_RARITY_PATTERN.match(s) or CLAN_TAG_PATTERN.match(s):
+            continue
+        return t
+    return None
+
+
+def other_players_from_frame(records, camera, label_radius=100.0):
+    """别的玩家(不是自己、也不是怪)的名牌块: 名字、等级、血量、屏幕/世界坐标.
+
+    判据跟 mobs_from_frame 的排除条件互为镜像 —— 名牌第二格是"37级"这种等级文本
+    (PLAYER_RARITY_PATTERN), 而不是怪的稀有度词; 没有哪个稀有度名字长这个样子。
+    """
+    players = []
+    for block in _bar_blocks(records, label_radius):
+        if _is_player_anchor(block["anchor"], camera):
+            continue
+        if not _is_player_block(block["texts"]):
+            continue
+        ax, ay = block["anchor"]
+        wx, wy = screen_to_world(ax, ay, camera)
+        texts = block["texts"]
+        players.append({
+            "name": _player_name(texts),
+            "level": _player_level(texts),
+            "hp": block["hp"],
+            "sx": ax, "sy": ay, "x": wx, "y": wy,
+        })
+    return players

@@ -240,7 +240,8 @@ def _lazy_theta_star(map, start, goal, use_clearance):
 class _NoPyautoguiPause:
     """这一段里的 pyautogui 调用不吃全局 PAUSE(默认每次调用后睡 0.1 秒)。
 
-    不改全局: 寻路每 tick 的节奏(卡住判定的次数窗口)是按有 PAUSE 调出来的。只包住"本来就该一下子做完"的地方: 松键(reset_keyboard 6 次
+    不改全局: 寻路每 tick 的节奏(卡住判定的次数窗口)是按有 PAUSE 调出来的, 见
+    rl_backend.without_pause。只包住"本来就该一下子做完"的地方: 松键(reset_keyboard 6 次
     调用 = 白睡 0.6 秒, 鼠标还停在屏幕中心 —— 前几份录像每段路之间、每次交班人都原地停
     0.4~1 秒), 和走门那种要快速反馈的循环(第六份录像: 每拍 ~0.2 秒, 刹车来回振荡)。"""
 
@@ -255,9 +256,9 @@ class _NoPyautoguiPause:
 
 
 def reset_keyboard():
-    """把脚本可能按住的键全松开。
+    """把脚本和策略可能按住的键全松开。
 
-    shift 是 2026-09-24 补的: 防御键会按住它, 而这里原来只松 space/wasd —— 实机
+    shift 是 2026-09-24 补的: RL 用它当防御键, 而这里原来只松 space/wasd —— 实机
     现象是 GUI 点"停止"之后**整台机器一直按着 shift**, 打字全变成大写。
     r 不在这里: 它是点一下就松的换装键, 从不按住。
     """
@@ -1570,6 +1571,45 @@ class _FleePlan:
 _FLEE_PLAN = _FleePlan()
 
 
+_RL_SESSION = None          # 跨局活着: 重建要重注钩子、重扫探针, 训练时还会丢掉模型
+_RL_SESSION_KEY = None
+
+# 连续这么多轮 RL 都起不来, 就退回规则战斗。
+# 实机(2026-09-24): 存档路径配错(指到了 CheckpointCallback 建的同名目录), 每轮 2 秒
+# 失败一次, 连着转了十几轮 —— 寻路、进游戏、报错、重来, 一直在烧时间却一只怪没刷。
+# 这类错(缺 sb3 / 没有存档 / 路径写错)重试多少次都一样, 而退回规则战斗至少还在刷怪。
+RL_FAILURE_FALLBACK = 3
+
+# 回刷怪区的路超过这么多格(小地图格)才值得为它换一次跑路装。出区飘一两格那种
+# 短途一局里有好多次, 两次和弦 + 换装动画比省下来的路还贵。
+SWAP_WALK_UNITS = 15
+_RL_CONSECUTIVE_FAILURES = 0
+# 上一次 RL 刷怪那一段里**就地复活**了几次。主循环拿它算换服计数 —— 就地复活的那一轮
+# 照样跑满时长, 光看"刷没刷满"的话, RL 模式下死多少次都永远攒不够次数去换服
+# (用户 2026-09-25: "只要死了就算一次死亡")。
+_RL_ROUND_DEATHS = 0
+
+
+def _get_rl_session(model_path, train):
+    """拿(必要时新建)跨局复用的 RL 会话。模型或训练开关变了就重建 —— 换时块时
+    config 可能指向另一个策略。"""
+    global _RL_SESSION, _RL_SESSION_KEY
+    key = (model_path, bool(train))
+    if _RL_SESSION is not None and _RL_SESSION_KEY == key:
+        return _RL_SESSION
+    if _RL_SESSION is not None:
+        _RL_SESSION.teardown()
+    import rl_farm      # 延迟导入: 只跑规则战斗的部署机不该为它付依赖
+    _RL_SESSION = rl_farm.FarmSession(model_path=model_path, train=bool(train),
+                                      loadout_epoch=loadout_swap.baseline_epoch,
+                                      # 游戏画面上挂一块「AI 训练」进度面板. lambda 而不是
+                                      # 直接传 overlay.show_training: overlay 是全局,
+                                      # 以后重建了也能跟上.
+                                      hud=lambda view: overlay.show_training(view))
+    _RL_SESSION_KEY = key
+    return _RL_SESSION
+
+
 def _nearest_inside(farming_area, pos, binary_map, inset=ARRIVE_RADIUS + 3):
     """把一个区域外的位置夹回区域里, 取**离它最近**的那个可走点。
 
@@ -1832,6 +1872,217 @@ def _nearest_reachable_inside(farming_area, pos, binary_map, margin=2, limit=400
     return first_inside
 
 
+def _make_revive(farming_area, route, path_back, swaps=(None, None)):
+    """给仲裁器用的"就地复活": 点继续 -> 点开始 -> 换跑路装 -> 寻路回刷怪区 ->
+    换输出装。回是否成功。
+
+    **为什么值得有**: 不复活的话, 一死这一局就结束, 而 sb3 会把这一局没收满的那批
+    rollout 整个丢掉 —— 被丢掉的恰好是死得快的那些局。训练数据于是被系统性筛成
+    "活得久的样本", "怎么会死"的证据成建制地扔掉(用户实机指出, 见 rl_supervisor)。
+
+    多阶段路线(蚁穴: 先进花园再踩洞口)返回 None —— 那种复活要跑整条进场路线, 是主
+    循环的活, 这里不重复实现一遍。那种图上行为退回原样(死亡 = 这一局结束)。
+
+    生态区选择器**不在这里点**: 主循环每个 worker 只点一次(点了会重置检查点), 这一轮
+    早就点过了。
+
+    swaps: (enter_game_swap, reach_area_swap) —— 跟主循环重进游戏那一对是同一份配置。
+    **死了重进 florr 会把 loadout 重置掉**, 跟主循环里 `entered_game` 那道 gate 是
+    同一个前提: 不按一次, 走回刷怪区这一段穿的是重置后的默认装(不是跑路装, 慢),
+    到了之后穿的也不是输出装。用户实机指出(2026-09-24)。走回去那一段的换装归
+    path_back 管(它也服务平时的出区拉回), 这里只多传一个"刚重进过"的标记 ——
+    那种情况下多短的路都得按一次, 因为要按回来的不是跑路装而是被重置掉的输出装。
+    """
+    if len(route.stages) != 1:
+        return None
+
+    _, reach_swap = swaps
+
+    def revive():
+        if on_death_screen():
+            click_continue_after_death()
+        if on_start_screen():
+            click_start_game()
+            time.sleep(3)
+        if on_death_screen() or on_start_screen():
+            return False          # 没点进去 -> 交回上层, 它有完整的重进逻辑
+        pos = get_player_position()
+        if pos is None:
+            return False
+        if if_in_area([farming_area], pos):
+            loadout_swap.press_swap(reach_swap)      # 没路要跑, 直接把输出装按回来
+            return True
+        return bool(path_back(pos, reset_loadout=True))
+
+    return revive
+
+
+def _policy_after(revive, policy_controls):
+    """复活完(不管成没成)把两个反转关回去。
+
+    florr 每次从菜单进局都会用**账号里存的值**把这两个开关盖回去(见
+    _reassert_florr_toggles)。就地复活要点继续+开始 = 重新进局; 之后没人再写一次的话,
+    账号里要是开着反转攻击, 策略这一局剩下的时间攻击维全是死的(按不按都在打), 而且
+    不报错。复活点就在区里、不用走的那种情况 path_back 不会被调, 所以得在这里兜。
+    """
+    if revive is None:
+        return None
+
+    def wrapped():
+        try:
+            return revive()
+        finally:
+            policy_controls()
+
+    return wrapped
+
+
+def _rl_farming(farming_area, duration, session, *, restore_toggles=(True, False),
+                route=None, swaps=(None, None)):
+    """combat="rl": 刷怪区**里面**的战斗交给策略。
+
+    其余一切照旧归脚本 —— 出区寻路回去、AFK 弹窗、菜单、死亡, 都由 rl_supervisor
+    在每一拍里仲裁(贵的检查节流到 1Hz, 见那边的说明)。
+
+    **反转攻击/防御键只在这一段里关掉。** 策略要自己控制攻击和防御这两维, 反转开着
+    的话按不按都一样, 那两维是死的。但寻路途中正相反 —— 脚本从不按攻击键, 全靠反转
+    开着才能边走边打, 所以一出这个函数就得立刻还原成时块配的值, 否则下一段路花朵
+    裸奔穿过怪群。
+
+    restore_toggles: 出来时还原成什么 —— 就是这个时块配的 (invert_attack, invert_defense)。
+
+    进程被强杀留在"关"的状态也能自愈: 主循环每轮进游戏后都会 _reassert_florr_toggles
+    一次。
+
+    返回值跟规则模式一个含义: True = 刷满了这一局的时长。
+    """
+    global _RL_CONSECUTIVE_FAILURES
+    if session is None:
+        print("❌ RL 模式但没有会话对象 —— 这一局作废")
+        overlay.update(state="出错", message="RL 模式缺会话对象")
+        return False
+
+    cx = (farming_area[0][0] + farming_area[1][0]) // 2
+    cy = (farming_area[0][1] + farming_area[1][1]) // 2
+    binary_map = load_binary_map()
+    # **必须给 deadline。** lazy_theta_pathing 默认是"永不放弃"的无限重试(当年特意从
+    # 上游恢复的行为)。RL 这条路不能用那个: 实机(2026-09-24)一次 path_back 在
+    # (16,97)->(17,56) 那段走廊上反复脱困**烧了 400 秒**, 整局跑成 675 秒, 期间策略
+    # 完全停摆, 连轮次预算都检查不到。这一局反正要结束了, 烧过头帮不了任何人。
+    round_deadline = time.time() + duration
+
+    enter_swap, reach_swap = swaps
+
+    def policy_controls():
+        """关掉两个反转, 把攻击/防御交给策略。脚本那几段(拉回/复活)结束后都要再调 ——
+        见 path_back / revive 的说明。"""
+        for label, addr in (("反转攻击键", florr_settings.INVERT_ATTACK_ADDR),
+                            ("反转防御键", florr_settings.INVERT_DEFENSE_ADDR)):
+            status, detail = florr_settings.ensure_flag(cdp_bridge.eval_js, addr, 0)
+            if status == "failed":
+                print(f"⚠️ {label} 没能关掉 ({detail}) —— 策略的那一维会是死的")
+
+    def path_back(pos, *, reset_loadout=False):
+        """把花朵送回刷怪区。长途穿跑路装, 到了(或没到)一律把输出装按回来。
+
+        实机(2026-09-24)第 3 轮: 同一段走廊, 进场 7 段一次没卡; 打了一段怪之后原路
+        回去, 16 段**段段** `原地打转14次, 判定卡住`, 每次挪 5~8 格、210 秒才走完。
+        差别只有身上的装: 进场穿跑路装, 回区穿的是到区时换上的输出装 —— 慢到每 tick
+        挪不满 move_to_position 的 progress_epsilon, 停滞判定必然攒满。
+
+        短途(出区飘一两格, 一局里好多次)不换: 两次和弦 + florr 的换装动画比省下来的
+        路还贵。reset_loadout=True(刚死了重进)则不看距离 —— 那时要按回来的不是跑路装,
+        而是被 florr 重置掉的输出装。
+
+        **进和出必须成对**: 中途换了装却没换回来的话, 主循环下一轮的 swap gate
+        (`entered_game or round_count == 1`)在"人没死、续命一轮"时是假的, 不会替我们
+        纠正, 花朵会穿着跑路装刷一整轮。所以 reach_swap 走 finally。
+        """
+        # 回**最近的边内点**, 不是区域中心 —— 飘出一格就被拽回中心要走 30 格 20 秒。
+        near = _nearest_inside(farming_area, pos, binary_map)
+        target = near or (cx, cy)
+        travel = reset_loadout or math.dist(pos, target) >= SWAP_WALK_UNITS
+        # 这段路是**脚本**在走, 脚本从不按攻击键, 全靠反转攻击键开着才能边走边打。
+        # 原来整段 RL 局里反转一直是关的 —— 拉回/复活回区那段花朵一下都不打, 穿过
+        # 怪群挨揍。走的时候用时块配的值, 走完(不管成没成)关回去交还给策略。
+        _reassert_florr_toggles(*restore_toggles)
+        if travel:
+            loadout_swap.press_swap(enter_swap)
+        try:
+            return bool(lazy_theta_pathing(target, [farming_area],
+                                           deadline=round_deadline))
+        finally:
+            if travel:
+                loadout_swap.press_swap(reach_swap)
+            policy_controls()
+
+    deps = {
+        "position": get_player_position,
+        "in_area": lambda p: if_in_area([farming_area], p),
+        "path_back": path_back,
+        "afk_paused": afk_watch.poll_afk_pause,
+        "on_start_screen": on_start_screen,
+        "on_death_screen": on_death_screen,
+        "revive": (_policy_after(_make_revive(farming_area, route, path_back, swaps=swaps),
+                                 policy_controls)
+                   if route else None),
+    }
+    print(f"\n🤖 开始在区域 {farming_area} 用策略刷怪...")
+    print(f"⏱️  刷怪时长: {duration}秒\n")
+    overlay.update(state="刷怪中(RL)", message=f"区域 {farming_area}")
+
+    started = time.time()
+    # 关掉反转, 把攻击/防御的控制权真正交给策略。
+    policy_controls()
+    try:
+        reason, stats = session.run(deps, duration=duration)
+    except Exception as e:
+        # 缺 sb3、没有训好的策略、CDP 断了…… 都不该把 worker 带崩: 这一局算没刷满,
+        # 上层照常走它的短局/换服逻辑。
+        _RL_CONSECUTIVE_FAILURES += 1
+        print(f"❌ RL 刷怪出错({_RL_CONSECUTIVE_FAILURES}/{RL_FAILURE_FALLBACK}): "
+              f"{type(e).__name__}: {e}")
+        overlay.update(state="出错", message=f"RL 刷怪出错: {e}")
+        session.teardown()
+        if _RL_CONSECUTIVE_FAILURES >= RL_FAILURE_FALLBACK:
+            print("⚠️ RL 连着起不来, 之后改用规则战斗 —— 上面那条错不修的话,"
+                  "再试多少轮都是同样的结果, 只会白烧时间。")
+            overlay.update(message="RL 连续失败, 已退回规则战斗")
+        return False
+    finally:
+        # 还原 —— 下一段路要靠反转攻击键开着才能边走边打。异常那条路也必须还原。
+        _reassert_florr_toggles(*restore_toggles)
+
+    _RL_CONSECUTIVE_FAILURES = 0
+    global _RL_ROUND_DEATHS
+    _RL_ROUND_DEATHS = int((stats.get("supervisor") or {}).get("deaths", 0) or 0)
+    elapsed = time.time() - started
+    print("\n" + "=" * 50)
+    print(f"✅ RL 刷怪结束 ({reason})")
+    print(f"   实际耗时: {elapsed:.1f}秒   策略步数: {stats.get('steps', 0)}"
+          f"   被脚本打断: {stats.get('resets', 0)} 次")
+    sup = stats.get("supervisor") or {}
+    print(f"   本局击杀: {stats.get('kills', 0)}   累计回报: {stats.get('reward', 0.0):+.2f}"
+          f"   就地复活: {sup.get('deaths', 0)} 次")
+    steps = stats.get("steps", 0)
+    if steps:
+        # 随机初始化时每拍 50% 按 R, 每按一次花瓣都要重新装填。练会了应该掉到 1% 以下;
+        # 跑几十局还卡在百分之几不动, 说明"按 R 的坏处"信号太弱, 熵奖励把它拉住了。
+        swaps = stats.get("swaps", 0)
+        print(f"   按 R: {swaps} 次 / {steps} 步 ({swaps * 100 / steps:.1f}%)")
+    if "updates" in stats:
+        n = stats["updates"]
+        print(f"   梯度更新: {n} 次")
+        if n == 0:
+            print(f"   ⚠️ 这一局一次都没更新 —— PPO 要收满 {stats.get('n_steps', '?')} 步才更新一次, "
+                  f"而这局只有 {stats.get('steps', 0)} 步, 那批数据被整个丢掉了。"
+                  "\n      策略这一局等于没学到任何东西。活得太短的话把 n_steps 调更小。")
+    print("=" * 50)
+    overlay.update(message=f"RL 刷怪结束({reason}), {stats.get('steps', 0)} 步, "
+                           f"击杀 {stats.get('kills', 0)}")
+    return reason == "timeout"
+
+
 FARM_SCREEN_CHECK_S = 0.5     # 刷怪时截图查死亡/开局画面的间隔(以前每拍两张截图)
 FARM_TIMING_LOG_S = 30.0      # 刷怪主循环耗时分解, 隔这么久打一行
 
@@ -1879,7 +2130,8 @@ class _LoopClock:
 
 
 def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
-                 ):
+                 combat="rules", rl_session=None, restore_toggles=(True, False),
+                 rl_route=None, rl_swaps=(None, None)):
     """自动刷怪逻辑（依赖一直攻击按钮）—— 在区域内连续走动, 不停下站桩.
 
     原来是走到一个随机点就停下等move_interval秒(靠站桩+一直攻击刷怪), 用户反馈
@@ -1892,6 +2144,15 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
     min_x, max_x = min(x1, x2), max(x1, x2)
     min_y, max_y = min(y1, y2), max(y1, y2)
     farming_area = [(min_x, min_y), (max_x, max_y)]
+    if combat == "rl" and _RL_CONSECUTIVE_FAILURES >= RL_FAILURE_FALLBACK:
+        # 已经退回规则战斗了(上面那几轮连着起不来)。这里不再打日志 —— 每轮都刷屏
+        # 反而会把真正有用的东西淹掉, 退回那一刻已经说过一次了。
+        combat = "rules"
+    if combat == "rl":
+        # 区域归一化(上面那几行)之后才分流 —— 两种模式必须看到同一个区域。
+        return _rl_farming(farming_area, duration, rl_session,
+                           restore_toggles=restore_toggles, route=rl_route,
+                           swaps=rl_swaps)
 
     binary_map = load_binary_map()
 
@@ -1987,7 +2248,7 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
             print(f"⚠️ 离开刷怪区域 (当前: {current_pos})，重新寻路回去")
             overlay.update(state="离开刷怪区域", pos=current_pos, message="重新寻路回去")
             # 回**最近的边内点**, 不是区域中心 —— 飘出一格也要横穿半张区域(用户
-            # 2026-09-25)。落在墙上时退回中心。
+            # 2026-09-25, RL 那边早就是这样)。落在墙上时退回中心。
             target = (_nearest_inside(farming_area, current_pos, binary_map)
                       or _nearest_reachable_inside(farming_area, current_pos, binary_map)
                       or ((farming_area[0][0] + farming_area[1][0]) // 2,
@@ -2201,6 +2462,12 @@ def _apply_worker_config(cfg):
         src = cfg
     d = app_config.DEFAULTS
     map_name = src.get("map", d["map"])
+    combat = src.get("combat", d["combat"])
+    if combat not in ("rules", "rl"):
+        combat = d["combat"]
+    # 反转攻击/防御键**不**在这里按 combat 强制 —— 寻路途中正是靠反转攻击键开着才能
+    # 边走边打; 整轮关掉等于让花朵裸奔穿过怪群。这两个键只在策略真正接管的那一段里
+    # 临时关掉, 出来立刻还原(见 _rl_farming)。
     invert_attack = src.get("invert_attack", d["invert_attack"])
     invert_defense = src.get("invert_defense", d["invert_defense"])
     # 索敌用户规则: 对着 map_name 规整(不属于这张图的物种丢掉并警告), 装进 enemy_detect。
@@ -2231,6 +2498,9 @@ def _apply_worker_config(cfg):
         "reach_area_swap": src.get("reach_area_swap", d["reach_area_swap"]),
         "invert_attack": invert_attack,
         "invert_defense": invert_defense,
+        "combat": combat,
+        "rl_model": src.get("rl_model", d["rl_model"]),
+        "rl_train": bool(src.get("rl_train", d["rl_train"])),
         "enemy_rules": enemy_rules,
     }
 
@@ -3252,7 +3522,7 @@ def run_launch_chrome(cfg, alias=None, timeout=30):
 def run_worker(cfg):
     """刷怪 worker: 由 GUI 以 `main.py --worker` 子进程拉起. 掉线/死亡后自动点
     开始重来, 不主动停(沿用改造前 __main__ 的行为)."""
-    global _WRONG_MAP_SEEN
+    global _RL_ROUND_DEATHS, _WRONG_MAP_SEEN
     # 收尾闸装在最前面: 后面任何一步炸了、被 GUI 停掉、或者 Ctrl+C, 都要保证键是
     # 松的。实机现象是退出后整台机器一直按着 shift(见 install_shutdown_cleanup)。
     install_shutdown_cleanup()
@@ -3318,6 +3588,16 @@ def run_worker(cfg):
     farming_duration = w["farming_duration"]
     CONSECUTIVE_SHORT_ROUND_LIMIT = w["short_round_limit"]
 
+    if w["combat"] == "rl":
+        # 开工前就判一次。缺存档这种事等到"寻路到刷怪区之后第一次交接"才发现的话,
+        # 每发现一次都要先白跑一整段寻路 —— 实机连着四轮"寻路、到区、报错、重来"
+        # 才看清是配置问题。
+        import rl_farm
+        ok, why = rl_farm.preflight(w["rl_model"], w["rl_train"])
+        if not ok:
+            print(f"⚠️ {why}\n   这个时块先按规则战斗跑。")
+            overlay.update(message="RL 配置不可用, 本时块按规则战斗跑")
+            w = dict(w, combat="rules")
 
     # 反转攻击键 / 反转防御键的目标值来自当前时块 (active 切片, 见 _apply_worker_config).
     # 调度器换时块会重启 worker, 所以整个 worker 生命周期用同一份就够. florr 每次进局
@@ -3429,6 +3709,10 @@ def run_worker(cfg):
         # farming_duration 没死的下一轮不过上面两个分支, 玩家还在场上、florr 没重置
         # loadout, 再按一次 digits 这种盲切换会让非对称配置每轮漂移. press_swap
         # 内部 warn-only, 不打断轮次.
+        if entered_game:
+            # florr 重进游戏会把 loadout 重置 —— 就算下面没配预设和弦、一个键都没按。
+            # RL 环境靠这个把 R 的奇偶归零(见 loadout_swap._epoch)。
+            loadout_swap.mark_baseline()
         swap_this_round = entered_game or round_count == 1
         if swap_this_round:
             loadout_swap.press_swap(w["enter_game_swap"])
@@ -3520,10 +3804,16 @@ def run_worker(cfg):
             if run_gear_on:
                 loadout_swap.press_swap(w["reach_area_swap"])
                 run_gear_on = False
+            _RL_ROUND_DEATHS = 0
             with phase_marks.phase("farm"):         # 统计: auto_farming 里的时间(含就地复活)算「刷怪」
                 auto_farming(farming_area, farming_duration,
                              enemy_ai_enabled=w["enemy_ai_enabled"],
-                             )
+                             combat=w["combat"],
+                             rl_session=(_get_rl_session(w["rl_model"], w["rl_train"])
+                                         if w["combat"] == "rl" else None),
+                             restore_toggles=(w["invert_attack"], w["invert_defense"]),
+                             rl_route=w["route"] if w["combat"] == "rl" else None,
+                             rl_swaps=(w["enter_game_swap"], w["reach_area_swap"]))
         else:
             print("❌ 本轮未能到达目标区域")
             overlay.update(message="本轮未能到达目标区域")
@@ -3581,9 +3871,9 @@ def run_worker(cfg):
         # 洞口永久进不去也永远攒不够短局, switch_server 再不会触发, 自愈就死了.
         # 单图路线(花园/沙漠/海洋/丛林)entry 恒 "arrived", 这里退化成原来那个比较, 行为不变.
         completed_full_duration = entry == "arrived" and round_elapsed >= farming_duration
-        # 只要死了就算一次(用户 2026-09-25): 就地复活的那一轮照样跑满时长, 光看
-        # "刷没刷满"的话死多少次都攒不够次数去换服。跑满而且一次没死才清零。
-        revived = 0                 # 死了就重开一局的话, 这一轮不会"跑满"
+        # 只要死了就算一次(用户 2026-09-25)。RL 模式死了是就地复活, 那一轮照样跑满 ——
+        # 原来只看"刷没刷满", RL 下死多少次都攒不够次数去换服。跑满而且一次没死才清零。
+        revived = _RL_ROUND_DEATHS if reached_farm else 0
         if completed_full_duration and not revived:
             consecutive_short_rounds = 0
         else:

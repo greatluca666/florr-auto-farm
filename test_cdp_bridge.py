@@ -633,3 +633,97 @@ class TestLinuxChrome:
         with patch("cdp_bridge._find_linux_chrome", return_value=None):
             with pytest.raises(RuntimeError, match="没找到 Chrome"):
                 cdp_bridge.launch_chrome_for_profile("/srv/p")
+
+
+# ── 常驻连接(给 RL 后端高频求值用) ───────────────────────────────────────────
+
+class FakeWs:
+    """假 WebSocket。queue 里每项是这一次 recv 要吐的消息列表(可以混入无关事件)。"""
+
+    def __init__(self, replies, fail_on=()):
+        self.replies = list(replies)
+        self.fail_on = set(fail_on)
+        self.sent = []
+        self.closed = 0
+        self._pending = []
+
+    def send(self, payload):
+        n = len(self.sent)
+        msg = json.loads(payload)
+        self.sent.append(msg)
+        if n in self.fail_on:
+            raise OSError("socket 挂了")
+        # 回包的 id 得跟这次请求对上。请求号是**跨重连累加**的(第二条连接上的第一次
+        # 调用可能是 id=2), 所以这里回填实际的 id, 不写死。
+        self._pending = [dict(r, id=msg["id"]) if r.get("id") == "ECHO" else r
+                         for r in (self.replies.pop(0) if self.replies else [])]
+
+    def recv(self):
+        return json.dumps(self._pending.pop(0))
+
+    def close(self):
+        self.closed += 1
+
+
+def ok(value):
+    return {"id": "ECHO", "result": {"result": {"value": json.dumps(value)}}}
+
+
+def session(sockets):
+    made = []
+
+    def connect(url, timeout):
+        made.append(url)
+        return sockets.pop(0)
+
+    s = cdp_bridge.CdpSession(connect=connect,
+                              find_tab=lambda: {"webSocketDebuggerUrl": "ws://x"})
+    return s, made
+
+
+def test_session_reuses_one_connection():
+    """实机量出来每次调用光找标签页 + 握手就 17.2ms —— 10Hz 下是一拍预算的六分之一。"""
+    ws = FakeWs([[ok(11)], [ok(22)]])
+    s, made = session([ws])
+    assert s.eval_value("a") == 11
+    assert s.eval_value("b") == 22
+    assert len(made) == 1 and ws.closed == 0
+
+
+def test_session_matches_by_id_and_skips_unrelated_events():
+    """同一条连接上会混进页面事件 —— 拿第一条当响应就会读到别人的东西。"""
+    ws = FakeWs([[{"method": "Runtime.consoleAPICalled"}, {"id": 99}, ok(7)]])
+    s, _ = session([ws])
+    assert s.eval_value("x") == 7
+
+
+def test_session_reconnects_once_after_the_socket_dies():
+    """florr 重连 / 换服的 Page.reload / 标签页被关都会把这条连接打断。"""
+    dead = FakeWs([], fail_on=[0])
+    fresh = FakeWs([[ok(5)]])
+    s, made = session([dead, fresh])
+    assert s.eval_value("x") == 5
+    assert len(made) == 2 and s.reconnects == 1 and dead.closed == 1
+
+
+def test_session_gives_up_after_the_second_failure():
+    """一直重连的话, 页面真没了会变成死循环 —— 抛出去让上层结束这段 rollout 才对:
+    页面都换了, 之前注入的钩子和计数器基准都没了。"""
+    s, made = session([FakeWs([], fail_on=[0]), FakeWs([], fail_on=[0])])
+    with pytest.raises(OSError):
+        s.eval_value("x")
+    assert len(made) == 2
+
+
+def test_session_reopens_after_close():
+    s, made = session([FakeWs([[ok(1)]]), FakeWs([[ok(2)]])])
+    assert s.eval_value("x") == 1
+    s.close()
+    assert s.eval_value("x") == 2
+    assert len(made) == 2
+
+
+def test_session_surfaces_a_cdp_error():
+    s, _ = session([FakeWs([[{"id": "ECHO", "error": {"message": "boom"}}]])])
+    with pytest.raises(RuntimeError, match="boom"):
+        s.eval_value("x")

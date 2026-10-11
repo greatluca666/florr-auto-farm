@@ -582,6 +582,42 @@ class TestValidateConfig:
         assert len(app_config.validate_config(cfg)) >= 2
 
 
+# ── 刷怪区内的战斗模式 ──────────────────────────────────────────────────────
+
+def test_combat_defaults_to_rules():
+    """新加的键 —— 老 config.json 里没有, 不能因此变成 RL(那会拿一个不存在的策略去刷)。"""
+    assert app_config.DEFAULTS["combat"] == "rules"
+    assert app_config._coerce_v1({})["combat"] == "rules"
+
+
+@pytest.mark.parametrize("bad", ["RL", "rl 模式", "", "ru", True, 1, None])
+def test_an_unknown_combat_value_falls_back_to_rules(bad):
+    """"ru" 这种必须也判非法 —— 用 str 做成员判定的话 `"ru" in "rules"` 会是 True。"""
+    assert app_config._coerce_v1({"combat": bad})["combat"] == "rules"
+
+
+def test_a_valid_combat_value_is_kept():
+    assert app_config._coerce_v1({"combat": "rl"})["combat"] == "rl"
+
+
+def test_rl_model_must_be_a_non_empty_string():
+    assert app_config._coerce_v1({"rl_model": "  "})["rl_model"] == app_config.DEFAULTS["rl_model"]
+    assert app_config._coerce_v1({"rl_model": "runs/x"})["rl_model"] == "runs/x"
+
+
+def test_a_time_block_without_the_rl_keys_is_not_thrown_away():
+    """这三个是后加的键。老时块缺了它们不能被整块丢 —— enemy_ai_enabled 那种严格
+    return None 是给一直都有的键用的。"""
+    blocks = app_config._coerce_schedule([{
+        "id": "b1", "days": [0], "start": "00:00", "end": "23:59", "profile": "默认",
+        "map": "desert", "location": [1, 2], "farming_area": [[0, 0], [9, 9]],
+        "farming_duration": 300, "consecutive_short_round_limit": 2,
+        "enemy_ai_enabled": False, "auto_switch_server": True,
+    }], {"默认": "chrome-profiles/默认"})
+    assert len(blocks) == 1
+    assert blocks[0]["combat"] == "rules" and blocks[0]["rl_train"] is False
+
+
 # ── 第②轮: enemy_rules ────────────────────────────────────────────────────────
 
 _EMPTY_RULES = {"species": {}, "knobs": {}}
@@ -1104,3 +1140,4 @@ class TestPerRarityValidation:
         cfg = _v2_cfg()
         cfg["active"] = {"map": "garden", "enemy_rules": {"species": {"bee": {"Epic": "dance"}}}}
         assert any("active.enemy_rules.species.bee.Epic" in e for e in app_config.validate_config(cfg))
+

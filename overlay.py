@@ -76,6 +76,11 @@ class _NullOverlay:
     def hide_warning(self):
         return None
 
+    def show_training(self, view):
+        return None
+
+    def hide_training(self):
+        return None
 
     def close(self):
         return None
@@ -140,7 +145,7 @@ def _hex_rgb(hex_str):
 
 def _state_level(state):
     """状态文字 -> "ok" / "warn" / "bad" / "idle". 按前缀认(main.py 里有
-    "刷怪中(xx)" 这种带后缀的), 没认出来的一律 idle(灰)."""
+    "刷怪中(RL)" 这种带后缀的), 没认出来的一律 idle(灰)."""
     if not isinstance(state, str):
         return "idle"
     for level in ("bad", "warn", "ok"):
@@ -176,6 +181,51 @@ def _advance_state(current, since, now, **fields):
     if new.get("state") != current.get("state"):
         since = now
     return new, since
+
+
+# ---- 「AI 训练」面板(show_training) ----
+# 紧贴在状态框正下方, 同样的左边距 —— 左侧这一条没有 utils.py 的探测点, florr 的
+# 小地图 / 排行在右上, 花瓣栏在底部正中, 都碰不到.
+_TRAIN_WIDTH, _TRAIN_HEIGHT = 300, 238
+_TRAIN_TOP = _TOP_OFFSET + _HEIGHT + 8
+_SPARK_MAX_BARS = 21
+# 版面(窗口坐标, 以左上为原点, (x, top, w, h)). Mac 版换算成 Cocoa 坐标, tk 版直接用.
+_TL = {
+    "title": (_PAD, 4, 170, 20),
+    "round": (_TRAIN_WIDTH - _PAD - 100, 5, 100, 18),
+    "dot": (_PAD, 34, 16, 20),
+    "phase": (_PAD + 16, 34, 180, 20),
+    "remain": (_TRAIN_WIDTH - _PAD - 100, 36, 100, 16),
+    "round_line": (_PAD, 58, _TRAIN_WIDTH - 2 * _PAD, 18),
+    "total_line": (_PAD, 78, _TRAIN_WIDTH - 2 * _PAD, 18),
+    "bar": (_PAD, 103, _TRAIN_WIDTH - 2 * _PAD, 7),
+    "fill_text": (_PAD, 113, _TRAIN_WIDTH - 2 * _PAD, 16),
+    "spark_label": (_PAD, 136, 62, 32),
+    "spark": (_PAD + 64, 134, _TRAIN_WIDTH - 2 * _PAD - 64, 34),
+    "health": (_PAD, 173, _TRAIN_WIDTH - 2 * _PAD, 16),
+    "metrics": (_PAD, 191, _TRAIN_WIDTH - 2 * _PAD, 16),
+    "warning": (_PAD, 208, _TRAIN_WIDTH - 2 * _PAD, 28),
+}
+_TRACK_HEX = "#eadfcb"
+
+
+def _spark_bars(history, width, height, max_bars=_SPARK_MAX_BARS):
+    """每局击杀 -> 柱子 [(x, 柱高), ...](以区域左下为基准). 全 0 时画 1px 的底线柱,
+    免得看起来像"面板坏了"."""
+    hist = list(history)[-max_bars:]
+    if not hist:
+        return []
+    slot = width / max_bars
+    bar_w = max(2.0, slot - 2)
+    top = max(max(hist), 1)
+    return [(i * slot, max(1.0, (v / top) * height), bar_w) for i, v in enumerate(hist)]
+
+
+def _spark_label(history):
+    hist = list(history)
+    if not hist:
+        return "每局击杀\n—"
+    return f"每局击杀\n最高 {max(hist)}"
 
 
 if Foundation is not None:
@@ -403,6 +453,106 @@ class StatusOverlay:
             self._dead = True
         return None
 
+    # ---------------------------------------------------------- AI 训练面板
+    def _build_training(self):
+        screen_h = AppKit.NSScreen.mainScreen().frame().size.height
+        W, H, B = _TRAIN_WIDTH, _TRAIN_HEIGHT, _BORDER
+        rect = Foundation.NSMakeRect(_LEFT, screen_h - _TRAIN_TOP - H, W, H)
+        window = _mac_overlay_window(rect, _ALPHA)
+        window.setIgnoresMouseEvents_(True)
+        content = window.contentView()
+
+        def R(key):
+            x, top, w, h = _TL[key]
+            return Foundation.NSMakeRect(x, H - top - h, w, h)
+
+        content.addSubview_(_ns_fill(Foundation.NSMakeRect(B, B, W - 2 * B, H - 2 * B - _HEADER_H),
+                                     _BODY_HEX))
+        t = {}
+        right = AppKit.NSTextAlignmentRight
+        t["title"] = _ns_label(R("title"), "", 12, _INK_HEX, bold=True)
+        t["round"] = _ns_label(R("round"), "", 11, _INK_HEX, align=right)
+        t["dot"] = _ns_label(R("dot"), "●", 13, _LEVEL_HEX["idle"])
+        t["phase"] = _ns_label(R("phase"), "", 13, _LEVEL_HEX["idle"], bold=True)
+        t["remain"] = _ns_label(R("remain"), "", 11, _INK_DIM_HEX, align=right)
+        t["round_line"] = _ns_label(R("round_line"), "", 12, _INK_HEX)
+        t["total_line"] = _ns_label(R("total_line"), "", 12, _INK_HEX)
+        t["fill_text"] = _ns_label(R("fill_text"), "", 11, _INK_DIM_HEX)
+        t["spark_label"] = _ns_label(R("spark_label"), "", 10, _INK_DIM_HEX, wraps=True)
+        t["health"] = _ns_label(R("health"), "", 11, _INK_HEX)
+        t["metrics"] = _ns_label(R("metrics"), "", 11, _INK_DIM_HEX)
+        t["warning"] = _ns_label(R("warning"), "", 11, _LEVEL_HEX["bad"], bold=True, wraps=True)
+        for v in t.values():
+            content.addSubview_(v)
+        self._train_track = _ns_fill(R("bar"), _TRACK_HEX)
+        content.addSubview_(self._train_track)
+        bx, _top, _bw, bh = _TL["bar"]
+        self._train_fill = _ns_fill(Foundation.NSMakeRect(bx, R("bar").origin.y, 0, bh),
+                                    _LEVEL_HEX["ok"])
+        content.addSubview_(self._train_fill)
+        # 柱子池: 建一次, 之后只改 frame / 显隐.
+        self._train_bars = []
+        for _ in range(_SPARK_MAX_BARS):
+            bar = _ns_fill(Foundation.NSMakeRect(0, 0, 0, 0), _INK_DIM_HEX)
+            bar.setHidden_(True)
+            content.addSubview_(bar)
+            self._train_bars.append(bar)
+        self._train_window = window
+        self._train_labels = t
+
+    def show_training(self, view):
+        if self._dead:
+            return None
+        try:
+            if getattr(self, "_train_window", None) is None:
+                self._build_training()
+            t = self._train_labels
+            for key in ("title", "round", "phase", "remain", "round_line", "total_line",
+                        "fill_text", "health", "metrics", "warning"):
+                t[key].setStringValue_(view.get(key) or "")
+            color = _ns_color(_LEVEL_HEX.get(view.get("level"), _LEVEL_HEX["idle"]))
+            t["dot"].setTextColor_(color)
+            t["phase"].setTextColor_(color)
+            t["spark_label"].setStringValue_(_spark_label(view.get("history") or []))
+
+            bx, _top, bw, bh = _TL["bar"]
+            by = self._train_track.frame().origin.y
+            fill = view.get("fill")
+            self._train_track.setHidden_(fill is None)
+            self._train_fill.setHidden_(fill is None)
+            if fill is not None:
+                self._train_fill.setFrame_(Foundation.NSMakeRect(bx, by, bw * max(0.0, min(1.0, fill)), bh))
+
+            sx, stop, sw, sh = _TL["spark"]
+            base = _TRAIN_HEIGHT - stop - sh
+            bars = _spark_bars(view.get("history") or [], sw, sh)
+            live = bool(view.get("history_live"))
+            for k, bar in enumerate(self._train_bars):
+                if k < len(bars):
+                    x, h, w = bars[k]
+                    bar.setFrame_(Foundation.NSMakeRect(sx + x, base, w, h))
+                    is_live = live and k == len(bars) - 1
+                    bar.layer().setBackgroundColor_(
+                        _cg_color(_ORANGE_HEX if is_live else _INK_DIM_HEX))
+                    bar.setHidden_(False)
+                else:
+                    bar.setHidden_(True)
+
+            self._train_window.orderFrontRegardless()
+            self._pump_events()
+        except Exception:
+            self._dead = True
+        return None
+
+    def hide_training(self):
+        if self._dead or getattr(self, "_train_window", None) is None:
+            return None
+        try:
+            self._train_window.orderOut_(None)
+            self._pump_events()
+        except Exception:
+            self._dead = True
+        return None
 
     def close(self):
         if self._dead:
@@ -411,6 +561,8 @@ class StatusOverlay:
             self._window.close()
             if self._warning_window is not None:
                 self._warning_window.close()
+            if getattr(self, "_train_window", None) is not None:
+                self._train_window.close()
             self._dead = True
         except Exception:
             self._dead = True
@@ -592,7 +744,7 @@ def _place(widget, k, x, y, width, height):
 
 def _tk_geometries(k, screen_w, screen_h):
     """Windows tk 版各窗口的 geometry 串(物理像素): 尺寸乘 k, HUD 锚点不动,
-    警告 / 确认弹窗在屏幕正中."""
+    训练面板贴在放大后的 HUD 下沿, 警告 / 确认弹窗在屏幕正中."""
     hud_h = _px(_HEIGHT, k)
 
     def centered(w, h):
@@ -600,6 +752,8 @@ def _tk_geometries(k, screen_w, screen_h):
         return f"{w}x{h}+{(screen_w - w) // 2}+{(screen_h - h) // 2}"
     return {
         "hud": f"{_px(_WIDTH, k)}x{hud_h}+{_LEFT}+{_TOP_OFFSET}",
+        "training": f"{_px(_TRAIN_WIDTH, k)}x{_px(_TRAIN_HEIGHT, k)}"
+                    f"+{_LEFT}+{_TOP_OFFSET + hud_h + _px(_TRAIN_TOP - _TOP_OFFSET - _HEIGHT, k)}",
         "warning": centered(_WARNING_WIDTH, _WARNING_HEIGHT),
         "confirm": centered(_CONFIRM_WIDTH, _CONFIRM_HEIGHT),
     }
@@ -634,7 +788,7 @@ def _build_tk_hud(root, k=1.0):
     w["loc"] = tk.Label(body, text="位置 -", bg=_BODY_HEX, fg=_INK_HEX,
                         font=_tk_font(10), anchor="w")
     _place(w["loc"], k, P - B, 32, bw - 2 * (P - B), 20)
-    # 消息最长两行自动换行(以前单行定宽, 长消息后半截看不到).
+    # 消息最长两行自动换行(以前单行定宽, "RL 刷怪结束(...), N 步, ..." 后半截看不到).
     w["message"] = tk.Label(body, text="", bg=_BODY_HEX, fg=_INK_DIM_HEX,
                             font=_tk_font(9), anchor="nw", justify="left",
                             wraplength=_px(bw - 2 * (P - B), k))
@@ -662,6 +816,76 @@ def _build_tk_card(win, title, width, height, k=1.0):
     body = tk.Frame(win, bg=_BODY_HEX)
     _place(body, k, 3, 32, width - 6, height - 35)
     return body
+
+
+def _build_tk_training(win, k=1.0):
+    """「AI 训练」面板的 tk 版控件(不碰 win32). win 已是 _TRAIN_WIDTH x _TRAIN_HEIGHT
+    乘 DPI 倍数 k 的大小."""
+    W, H, B = _TRAIN_WIDTH, _TRAIN_HEIGHT, _BORDER
+    win.configure(bg=_ORANGE_HEX)
+    _place(tk.Frame(win, bg=_BODY_HEX), k, B, B + _HEADER_H, W - 2 * B,
+           H - 2 * B - _HEADER_H)
+    w = {"k": k}   # _render_tk_training 画进度条 / 柱子也要按同一倍数
+
+    def lab(key, size, fg, bold=False, bg=_BODY_HEX, anchor="w", wrap=False):
+        x, top, ww, hh = _TL[key]
+        kw = dict(wraplength=_px(ww, k), justify="left") if wrap else {}
+        w[key] = tk.Label(win, text="", bg=bg, fg=fg, font=_tk_font(size, bold),
+                          anchor="nw" if wrap else anchor, **kw)
+        _place(w[key], k, x, top, ww, hh)
+
+    lab("title", 10, _INK_HEX, True, bg=_ORANGE_HEX)
+    lab("round", 9, _INK_HEX, bg=_ORANGE_HEX, anchor="e")
+    lab("dot", 11, _LEVEL_HEX["idle"])
+    w["dot"].configure(text="●")
+    lab("phase", 11, _LEVEL_HEX["idle"], True)
+    lab("remain", 9, _INK_DIM_HEX, anchor="e")
+    lab("round_line", 10, _INK_HEX)
+    lab("total_line", 10, _INK_HEX)
+    lab("fill_text", 9, _INK_DIM_HEX)
+    lab("spark_label", 8, _INK_DIM_HEX, wrap=True)
+    lab("health", 9, _INK_HEX)
+    lab("metrics", 9, _INK_DIM_HEX)
+    lab("warning", 9, _LEVEL_HEX["bad"], True, wrap=True)
+    for key in ("bar", "spark"):
+        x, top, ww, hh = _TL[key]
+        c = tk.Canvas(win, bg=_BODY_HEX, highlightthickness=0, bd=0)
+        _place(c, k, x, top, ww, hh)
+        w[key] = c
+    return w
+
+
+def _render_tk_training(w, view):
+    for key in ("title", "round", "phase", "remain", "round_line", "total_line",
+                "fill_text", "health", "metrics", "warning"):
+        w[key].configure(text=view.get(key) or "")
+    color = _LEVEL_HEX.get(view.get("level"), _LEVEL_HEX["idle"])
+    w["dot"].configure(fg=color)
+    w["phase"].configure(fg=color)
+    hist = view.get("history") or []
+    w["spark_label"].configure(text=_spark_label(hist))
+
+    k = w.get("k", 1.0)
+    _x, _t, bw, bh = _TL["bar"]
+    bw, bh = _px(bw, k), _px(bh, k)
+    bar = w["bar"]
+    bar.delete("all")
+    fill = view.get("fill")
+    if fill is not None:
+        bar.create_rectangle(0, 0, bw, bh, fill=_TRACK_HEX, width=0)
+        bar.create_rectangle(0, 0, bw * max(0.0, min(1.0, fill)), bh,
+                             fill=_LEVEL_HEX["ok"], width=0)
+
+    _x, _t, sw, sh = _TL["spark"]
+    sw, sh = _px(sw, k), _px(sh, k)
+    sp = w["spark"]
+    sp.delete("all")
+    bars = _spark_bars(hist, sw, sh)
+    live = bool(view.get("history_live"))
+    for k, (x, h, bwid) in enumerate(bars):
+        is_live = live and k == len(bars) - 1
+        sp.create_rectangle(x, sh - h, x + bwid, sh,
+                            fill=_ORANGE_HEX if is_live else _INK_DIM_HEX, width=0)
 
 
 class _WindowsOverlay:
@@ -792,6 +1016,42 @@ class _WindowsOverlay:
             self._dead = True
         return None
 
+    def show_training(self, view):
+        """「AI 训练」面板: 跟警告弹窗一样挂在主 HUD 的 root 下, 点击穿透/不抢焦点."""
+        if self._dead:
+            return None
+        try:
+            if getattr(self, "_train_window", None) is None:
+                win = tk.Toplevel(self._root)
+                win.overrideredirect(True)
+                win.geometry(self._geo["training"])
+                win.resizable(False, False)
+                win.update_idletasks()
+                hwnd = self._user32.GetParent(win.winfo_id())
+                self._train_hwnd = hwnd if hwnd else win.winfo_id()
+                self._train_widgets = _build_tk_training(win, self._k)
+                self._train_window = win
+                _apply_clickthrough_topmost(self._user32, self._train_hwnd)
+            _render_tk_training(self._train_widgets, view)
+            if self._train_window.state() == "withdrawn":
+                self._train_window.deiconify()
+                _apply_clickthrough_topmost(self._user32, self._train_hwnd)
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception:
+            self._dead = True
+        return None
+
+    def hide_training(self):
+        if self._dead or getattr(self, "_train_window", None) is None:
+            return None
+        try:
+            self._train_window.withdraw()
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception:
+            self._dead = True
+        return None
 
     def close(self):
         if self._dead:

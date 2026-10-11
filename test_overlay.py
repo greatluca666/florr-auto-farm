@@ -202,8 +202,7 @@ import pytest
 
 
 @pytest.mark.parametrize("state, level", [
-    ("刷怪中", "ok"),
-    ("寻路中", "ok"), ("完成", "ok"),
+    ("刷怪中", "ok"), ("刷怪中(RL)", "ok"), ("寻路中", "ok"), ("完成", "ok"),
     ("卡住", "warn"), ("无法检测位置", "warn"), ("AFK弹窗处理中", "warn"),
     ("出错", "bad"), ("已死亡", "bad"),
     ("-", "idle"), (None, "idle"), ("没见过的状态", "idle"),
@@ -274,6 +273,11 @@ for k in (1.0, 1.25, 1.5, 2.0):
     r["hud"] = boxes(win)
     r["wrap"] = int(hud["message"].cget("wraplength"))
     win = tk.Toplevel(root)
+    w = o._build_tk_training(win, **kw)
+    r["training"] = boxes(win)
+    o._render_tk_training(w, {"fill": 1.0, "history": [3, 5]})
+    r["bar_fill_right"] = w["bar"].coords(w["bar"].find_all()[-1])[2]
+    win = tk.Toplevel(root)
     o._build_tk_card(win, "t", 560, 200, **kw)
     r["card"] = boxes(win)
 root.destroy()
@@ -304,18 +308,18 @@ def _assert_scaled(base, scaled, k):
 
 
 @pytest.mark.parametrize("k", [1.25, 1.5, 2.0])
-@pytest.mark.parametrize("part", [
-    "hud",
-    "card",
-])
+@pytest.mark.parametrize("part", ["hud", "training", "card"])
 def test_tk_layout_scales_with_dpi(tk_layouts, part, k):
     _assert_scaled(tk_layouts["1.0"][part], tk_layouts[str(k)][part], k)
 
 
 @pytest.mark.parametrize("k", [1.25, 1.5, 2.0])
-def test_tk_wraplength_scales_with_dpi(tk_layouts, k):
+def test_tk_wraplength_and_drawing_scale_with_dpi(tk_layouts, k):
     base, scaled = tk_layouts["1.0"], tk_layouts[str(k)]
     assert scaled["wrap"] == pytest.approx(base["wrap"] * k, abs=1)
+    _x, _t, bw, _h = overlay_module._TL["bar"]
+    assert base["bar_fill_right"] == pytest.approx(bw, abs=1)
+    assert scaled["bar_fill_right"] == pytest.approx(bw * k, abs=1)
 
 
 def test_tk_window_geometries_scale_sizes_but_keep_the_hud_anchor():
@@ -323,6 +327,8 @@ def test_tk_window_geometries_scale_sizes_but_keep_the_hud_anchor():
     g = overlay_module._tk_geometries(1.5, 1920, 1080)
     assert g1["hud"] == f"300x132+{overlay_module._LEFT}+{overlay_module._TOP_OFFSET}"
     assert g["hud"] == f"450x198+{overlay_module._LEFT}+{overlay_module._TOP_OFFSET}"
+    # 训练面板紧贴放大后的 HUD 下沿, 不能叠上去
+    assert g["training"] == f"450x357+{overlay_module._LEFT}+{overlay_module._TOP_OFFSET + 198 + 12}"
     # 警告 / 确认弹窗放大后仍在屏幕正中
     assert g["warning"] == "840x300+540+390"
     assert g["confirm"] == "540x255+690+412"

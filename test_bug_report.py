@@ -227,7 +227,7 @@ def test_ctx_is_an_allowlist_and_never_carries_accounts_or_paths():
              "auto_switch_server": False, "combat": "rules", "invert_attack": True,
              "invert_defense": False, "enemy_rules": {"species": {"rock": "ignore"},
                                                        "knobs": {"avoid_min_rarity": "Epic"}},
-             "enter_game_swap": {"enabled": True}}
+             "rl_model": r"C:\Users\Alice\runs\desert", "enter_game_swap": {"enabled": True}}
     r = br.build_report("worker_traceback", tb=TB, ctx=block)
     assert set(r["ctx"]) == {"map", "enemy_ai_enabled", "auto_switch_server", "combat",
                              "invert_attack", "invert_defense", "enemy_rules"}

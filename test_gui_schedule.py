@@ -37,6 +37,7 @@ def test_block_to_active_shapes():
         "farming_duration": 120, "consecutive_short_round_limit": 2,
         "enemy_ai_enabled": True, "auto_switch_server": True,
         "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
         "enter_game_swap": _off, "reach_area_swap": _off,
         "enemy_rules": {"species": {}, "knobs": {}},
     }
@@ -299,6 +300,43 @@ class TestInvertTogglesInGuiSchedule:
 
 
 
+# ── 刷怪区内的战斗模式 ──────────────────────────────────────────────────────
+
+def test_a_new_block_defaults_to_rule_based_combat():
+    """RL 要先有一个训好的策略。新建时块默认开了的话, 每一局都会报错。"""
+    blk = gs.new_block_template({"profiles": [{"alias": "默认"}]})
+    assert blk["combat"] == "rules" and blk["rl_train"] is False
+
+
+def test_block_to_active_keeps_a_valid_combat_value(monkeypatch):
+    monkeypatch.setattr(gs, "RL_UI_ENABLED", True)        # 界面总开关打开时的行为(恢复 RL 用)
+    a = gs.block_to_active(_blk(combat="rl", rl_model="runs/x", rl_train=True))
+    assert a["combat"] == "rl" and a["rl_model"] == "runs/x" and a["rl_train"] is True
+
+
+@pytest.mark.parametrize("bad", ["RL", "", None, True, "ru"])
+def test_block_to_active_rejects_an_unknown_combat_value(bad, monkeypatch):
+    """界面写坏了也不能悄悄跑成 RL —— 那会拿一个可能不存在的策略去刷。"""
+    monkeypatch.setattr(gs, "RL_UI_ENABLED", True)
+    assert gs.block_to_active(_blk(combat=bad))["combat"] == "rules"
+
+
+def test_rl_ui_is_off_in_this_build():
+    assert gs.RL_UI_ENABLED is False
+
+
+def test_block_to_active_never_emits_rl_while_the_rl_ui_is_off():
+    """RL 的界面停用后, 老 config 里已经存着 combat="rl" / rl_train=True 的时块, 经 GUI 调度
+    写给 worker 的 active 切片也必须是规则战斗、不训练 —— 只藏控件的话这些老时块还会照跑 RL。"""
+    a = gs.block_to_active(_blk(combat="rl", rl_model="runs/x", rl_train=True))
+    assert a["combat"] == "rules" and a["rl_train"] is False
+    assert a["rl_model"] == "runs/x"                      # 路径原样保留, 恢复 RL 时不丢
+
+
+def test_block_to_active_falls_back_on_a_blank_model_path():
+    assert gs.block_to_active(_blk(rl_model="   "))["rl_model"] == "runs/desert"
+
+
 @pytest.mark.parametrize("days, expected", [
     (list(range(7)), "每天"),
     ([4, 3, 2, 1, 0], "工作日"),
@@ -495,6 +533,7 @@ def test_rules_from_inputs_range_edges_are_inclusive():
 
 def test_enemy_rules_editor_and_dialog_wiring(monkeypatch):
     """真造 Tk root(跟上面 enemy_switch 那条一样需要显示): 按钮布线、换图过滤、_collect、子窗确认 / 报错。"""
+    monkeypatch.setattr(gs, "RL_UI_ENABLED", True)        # 下面要拨 RL 开关, 得是界面总开关打开的状态
     monkeypatch.setattr(gui_map_picker, "_MAP_DIR",
                         os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps"))
     root = gs.ctk.CTk()
@@ -507,12 +546,18 @@ def test_enemy_rules_editor_and_dialog_wiring(monkeypatch):
         assert ed._rules_summary.cget("text") == "自定义 2 个物种, 1 项数值"
         assert ed._rules_btn.cget("state") == "normal"
 
-        # 索敌开关关掉 -> 按钮置灰; 恢复 -> 可点
+        # 索敌开关关掉 / RL 模式 -> 按钮置灰; 恢复 -> 可点
         ed._enemy.deselect()
         ed._sync_rules_button()
         assert ed._rules_btn.cget("state") == "disabled"
         ed._enemy.select()
         ed._sync_rules_button()
+        assert ed._rules_btn.cget("state") == "normal"
+        ed._combat.select()
+        ed._sync_combat_enabled()
+        assert ed._rules_btn.cget("state") == "disabled"
+        ed._combat.deselect()
+        ed._sync_combat_enabled()
         assert ed._rules_btn.cget("state") == "normal"
 
         # _collect: 非空写进时块, 空则不写键
@@ -611,8 +656,9 @@ def test_enemy_rules_dialog_lifecycle_inside_the_editor(monkeypatch):
 
 
 def test_the_rules_dialog_closes_when_the_button_greys_out_so_it_cannot_stay_confirmable(monkeypatch):
-    """按钮置灰(索敌关)时, 已经开着的子窗不能留着 —— 否则界面上按钮是灰的、子窗却还能点「确定」,
+    """按钮置灰(索敌关 / RL 开)时, 已经开着的子窗不能留着 —— 否则界面上按钮是灰的、子窗却还能点「确定」,
     把一份「不生效」的规则写回编辑器。换图那条路径早就会关(见上一条), 这里补另外两条。"""
+    monkeypatch.setattr(gs, "RL_UI_ENABLED", True)        # 第 2 步要切到 RL 战斗
     monkeypatch.setattr(gui_map_picker, "_MAP_DIR",
                         os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps"))
     root = gs.ctk.CTk()
@@ -629,15 +675,112 @@ def test_the_rules_dialog_closes_when_the_button_greys_out_so_it_cannot_stay_con
         assert ed._rules_btn.cget("state") == "disabled"
         assert not dlg.winfo_exists() and ed._rules_dlg is None
 
-        # 2) 索敌开着时又能开; 按钮本来就可点、子窗开着时再同步一次, 不能把子窗误关
+        # 2) 索敌开着时又能开; 开着的时候切到 RL 战斗
         ed._enemy.toggle()
         assert ed._rules_btn.cget("state") == "normal"
         ed._open_rules()
         dlg = ed._rules_dlg
         assert dlg.winfo_exists()
+        ed._combat.select()
+        ed._sync_combat_enabled()
+        assert ed._rules_btn.cget("state") == "disabled"
+        assert not dlg.winfo_exists() and ed._rules_dlg is None
+
+        # 3) 按钮本来就可点、子窗开着时再同步一次(索敌仍开、非 RL), 不能把子窗误关
+        ed._combat.deselect()
+        ed._sync_combat_enabled()
+        ed._open_rules()
+        dlg = ed._rules_dlg
         ed._sync_rules_button()
         assert ed._rules_btn.cget("state") == "normal"
         assert dlg.winfo_exists() and ed._rules_dlg is dlg
+    finally:
+        root.destroy()
+
+
+def test_sync_rules_button_treats_a_missing_combat_switch_as_rl_off(monkeypatch):
+    """_sync_enemy_enabled 读 _combat 用的是 getattr(..., None); 它调用的 _sync_rules_button 之前直接
+    self._combat.get(), 在 _combat 还没建出来的时刻会 AttributeError。两处要一致: 缺了就当 RL 关。"""
+    monkeypatch.setattr(gs, "RL_UI_ENABLED", True)
+    monkeypatch.setattr(gui_map_picker, "_MAP_DIR",
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps"))
+    root = gs.ctk.CTk()
+    root.withdraw()
+    try:
+        ed = gs.TimeBlockEditor(root, block=_blk(map="ocean"), others=[],
+                                profiles=[{"alias": "默认", "dir": "d"}], on_save=lambda b: None)
+        ed._combat.select()
+        ed._sync_combat_enabled()
+        assert ed._rules_btn.cget("state") == "disabled"          # RL 开: 灰
+        del ed._combat
+        ed._sync_rules_button()                                   # 缺 _combat: 不抛, 当 RL 关
+        assert ed._rules_btn.cget("state") == "normal"
+    finally:
+        root.destroy()
+
+
+def _label_texts(widget):
+    """递归收一棵控件树里所有 CTkLabel 的文字。"""
+    out = []
+    for w in widget.winfo_children():
+        if isinstance(w, gs.ctk.CTkLabel):
+            out.append(str(w.cget("text")))
+        out.extend(_label_texts(w))
+    return out
+
+
+def test_rl_controls_are_greyed_out_and_unselectable_while_the_rl_ui_is_off(monkeypatch):
+    """RL 界面停用: 开关 / 策略目录 / 训练开关全置灰, 提示说清已停用; 老时块存着 combat="rl" 也不选中,
+    保存出来的是规则战斗 —— 索敌那一组照常可用(RL 不再把它们压灰)。"""
+    monkeypatch.setattr(gui_map_picker, "_MAP_DIR",
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "maps"))
+    root = gs.ctk.CTk()
+    root.withdraw()
+    try:
+        legacy = _blk(map="desert", combat="rl", rl_model="runs/x", rl_train=True)
+        saved = []
+        ed = gs.TimeBlockEditor(root, block=legacy, others=[],
+                                profiles=[{"alias": "默认", "dir": "d"}], on_save=saved.append)
+        assert ed._combat.cget("state") == "disabled" and not ed._combat.get()
+        assert "已停用" in ed._combat.cget("text")
+        assert ed._rl_model_e.cget("state") == "disabled"
+        assert ed._rl_train.cget("state") == "disabled" and not ed._rl_train.get()
+        assert "暂时停用" in ed._combat_hint.cget("text")
+        assert ed._enemy.cget("state") == "normal"            # 索敌没被 RL 压灰
+        assert ed._rules_btn.cget("state") == "normal"
+
+        blk = ed._collect()
+        assert blk["combat"] == "rules" and blk["rl_train"] is False
+        assert blk["rl_model"] == "runs/x"                    # 路径保留, 将来恢复 RL 不丢
+
+        # 就算有人绕过禁用态把开关直接拨上(测试里的 select() 不看 state), 也不会生效
+        ed._combat.select()
+        ed._sync_combat_enabled()
+        assert ed._enemy.cget("state") == "normal"
+        assert ed._rules_btn.cget("state") == "normal"
+        assert "RL 模式下不生效" not in ed._enemy_hint.cget("text")
+        blk = ed._collect()
+        assert blk["combat"] == "rules" and blk["rl_train"] is False
+    finally:
+        root.destroy()
+
+
+def test_the_schedule_list_does_not_tag_a_legacy_rl_block_as_rl_combat(monkeypatch):
+    """列表上的标签要跟实际会跑的一致: RL 停用后, 老的 combat="rl" 时块实际按规则战斗跑, 标签就不能写「RL 战斗」。"""
+    root = gs.ctk.CTk()
+    root.withdraw()
+    try:
+        def tags_for(**kw):
+            blk = _blk(**kw)
+            cfg = {"profiles": [{"alias": "默认"}], "schedule": [blk]}
+            lst = gs.ScheduleList(root, get_cfg=lambda: cfg, save_cfg=lambda c: None,
+                                  open_editor=lambda b: None)
+            return " ".join(_label_texts(lst))
+
+        assert "RL 战斗" not in tags_for(combat="rl")
+        assert "索敌" in tags_for(combat="rl")
+        monkeypatch.setattr(gs, "RL_UI_ENABLED", True)
+        assert "RL 战斗" in tags_for(combat="rl")
     finally:
         root.destroy()
 
@@ -1127,3 +1270,4 @@ def test_column_headers_and_cells_share_the_same_grid_columns_so_they_cannot_dri
             assert abs((h.winfo_x() + h.winfo_width() / 2) - (c.winfo_x() + c.winfo_width() / 2)) <= 2, col
     finally:
         root.destroy()
+

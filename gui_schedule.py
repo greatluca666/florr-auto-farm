@@ -17,6 +17,10 @@ WEEKDAY_LABELS = ("一", "二", "三", "四", "五", "六", "日")
 
 _ACTIVE_KEYS = app_config._ACTIVE_KEYS
 
+# RL 战斗的界面总开关。False = 编辑器里「AI 战斗 (RL)」那一组控件置灰且不可选, 时块列表不再标
+# 「RL 战斗」, 写给 worker 的 active 切片一律是 combat="rules"。只管界面这一层: main.py 里
+# RL 的后端代码和 app_config 的 combat / rl_* 键原样保留, 想恢复只要把它改回 True。
+RL_UI_ENABLED = False
 
 # loadout 切换和弦: 每个字段 = 开关 + 修饰键下拉 + 数字下拉.
 _SWAP_MOD_LABELS = {"none": "无", "k": "k", "l": "l"}
@@ -52,6 +56,12 @@ def block_to_active(block):
         "auto_switch_server": bool(block["auto_switch_server"]),
         "invert_attack": bool(block.get("invert_attack", True)),
         "invert_defense": bool(block.get("invert_defense", False)),
+        # RL_UI_ENABLED 关着时, 老 config 里已经存着 combat="rl" 的时块也不能再跑成 RL。
+        "combat": (block.get("combat") if RL_UI_ENABLED and block.get("combat") in ("rules", "rl")
+                   else "rules"),
+        "rl_model": (block["rl_model"] if isinstance(block.get("rl_model"), str)
+                     and block["rl_model"].strip() else "runs/desert"),
+        "rl_train": bool(block.get("rl_train", False)) and RL_UI_ENABLED,
         "enter_game_swap": _coerce_swap_obj(block.get("enter_game_swap")),
         "reach_area_swap": _coerce_swap_obj(block.get("reach_area_swap")),
         "enemy_rules": _coerce_enemy_rules(block.get("enemy_rules"), block.get("map")),
@@ -150,6 +160,8 @@ def new_block_template(cfg):
         "farming_duration": 300, "consecutive_short_round_limit": 2,
         "enemy_ai_enabled": True, "auto_switch_server": True,
         "invert_attack": True, "invert_defense": False,
+        # 新建时块默认走规则战斗 —— RL 要先有一个训好的策略, 默认开了只会每局报错。
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
         "enter_game_swap": {"enabled": False, "mod": "none", "digit": "1"},
         "reach_area_swap": {"enabled": False, "mod": "none", "digit": "1"},
     }
@@ -956,6 +968,31 @@ class TimeBlockEditor(ctk.CTkToplevel):
 
     def _build_combat(self):
         sec = self._section("战斗")
+        self._combat = theme.switch(
+            sec, "刷怪区内用 AI 战斗 (RL)" if RL_UI_ENABLED else "刷怪区内用 AI 战斗 (RL) · 已停用",
+            command=self._sync_combat_enabled)
+        if RL_UI_ENABLED and self._block.get("combat") == "rl":
+            self._combat.select()
+        if not RL_UI_ENABLED:
+            self._combat.configure(state="disabled")
+        self._combat.pack(anchor="w")
+        self._combat_hint = theme.hint(sec, wraplength=520)
+        self._combat_hint.pack(anchor="w", padx=(46, 0), pady=(2, 6))
+
+        rl = ctk.CTkFrame(sec, fg_color="transparent")
+        rl.pack(fill="x", padx=(46, 0), pady=(0, 8))
+        ctk.CTkLabel(rl, text="策略目录", text_color=theme.MUTED,
+                     font=theme.font(12)).pack(side="left", padx=(0, 8))
+        self._rl_model_e = ctk.CTkEntry(rl, width=200, placeholder_text="runs/desert",
+                                        font=theme.font(12))
+        self._rl_model_e.insert(0, self._block.get("rl_model", "runs/desert"))
+        self._rl_model_e.pack(side="left")
+        self._rl_train = theme.switch(sec, "边刷边继续训练(会回存策略)")
+        if RL_UI_ENABLED and self._block.get("rl_train", False):
+            self._rl_train.select()
+        self._rl_train.pack(anchor="w", padx=(46, 0), pady=(0, 10))
+
+        ctk.CTkFrame(sec, height=1, fg_color=theme.BORDER).pack(fill="x", pady=(0, 10))
 
         self._enemy = theme.switch(sec, "索敌 AI(追击 / 先清青怪)", command=self._sync_rules_button)
         if self._block.get("enemy_ai_enabled", True):
@@ -984,7 +1021,7 @@ class TimeBlockEditor(ctk.CTkToplevel):
         _help_mark(inv, "florr 设置里的「反转攻击 / 防御键」。每轮开局由 worker 自动写进游戏;"
                         "寻路时脚本不按攻击键, 靠反转攻击才能边走边打。").pack(
             side="left", padx=6)
-        self._sync_enemy_enabled()
+        self._sync_combat_enabled()
 
     def _build_server_and_loadout(self):
         sec = self._section("换服与换装")
@@ -1111,6 +1148,11 @@ class TimeBlockEditor(ctk.CTkToplevel):
         else:
             self._map_hint.pack_forget()
 
+    def _rl_on(self):
+        """RL 战斗是否生效: 界面总开关开着、_combat 开关已建出来(没建出来就当关)且拨在开。
+        _sync_enemy_enabled / _sync_rules_button / _collect 都读这一处, 口径一致。"""
+        combat = getattr(self, "_combat", None)
+        return RL_UI_ENABLED and combat is not None and bool(combat.get())
 
     def _sync_enemy_enabled(self):
         """索敌只在物种表非空的图上可用(现在七张图都有; 空表图留给以后新增的图)。空表图上开关置灰 ——
@@ -1119,6 +1161,12 @@ class TimeBlockEditor(ctk.CTkToplevel):
         # 延迟导入: enemy_detect 会拉进 cv2 / cdp_bridge / canvas_decode, GUI 的
         # 启动路径不该为了一个开关状态背这些。(同文件里 MapPicker 也是这么导的。)
         from enemy_detect import species_supported
+        if self._rl_on():
+            # RL 模式下索敌整个不生效, 别把它又点亮回来。
+            self._enemy.configure(state="disabled")
+            self._enemy_hint.configure(text="RL 模式下不生效")
+            self._sync_rules_button()
+            return
         supported = species_supported(self._map.get())
         self._enemy.configure(state="normal" if supported else "disabled")
         self._enemy_hint.configure(
@@ -1126,10 +1174,10 @@ class TimeBlockEditor(ctk.CTkToplevel):
         self._sync_rules_button()
 
     def _sync_rules_button(self):
-        """「索敌设置…」只在索敌真会生效时可点: 索敌开关开着、本图有物种表。
+        """「索敌设置…」只在索敌真会生效时可点: 索敌开关开着、不是 RL 模式、本图有物种表。
         按钮置灰时顺手关掉已经开着的子窗 —— 不然灰按钮底下还有个能点「确定」的窗口。"""
         from enemy_detect import species_supported
-        on = bool(self._enemy.get()) and species_supported(self._map.get())
+        on = bool(self._enemy.get()) and not self._rl_on() and species_supported(self._map.get())
         self._rules_btn.configure(state="normal" if on else "disabled")
         if not on:
             self._close_rules_dialog()
@@ -1150,6 +1198,29 @@ class TimeBlockEditor(ctk.CTkToplevel):
         self._rules = rules
         self._rules_summary.configure(text=rules_summary(rules))
 
+    def _sync_combat_enabled(self):
+        """RL 模式下把真的用不上的开关置灰, 并说清每个开关还管不管用。
+
+        **反转攻击/防御键在 RL 模式下仍然有用** —— 寻路途中脚本自己从不按攻击键,
+        全靠反转开着才能边走边打。它们只在策略真正接管的那一段里被临时关掉(策略要
+        自己控制这两维), 一出来立刻还原。所以这里不能置灰。
+
+        索敌那一整套规则战斗才是真的整个被跳过, 那个才置灰。
+        """
+        rl = self._rl_on()
+        theme.set_entry_enabled(self._rl_model_e, rl)
+        self._rl_train.configure(state="normal" if rl else "disabled")
+        if not RL_UI_ENABLED:
+            self._combat_hint.configure(
+                text="RL 战斗暂时停用, 刷怪区内统一用下面的索敌 / 追击 / 清青怪规则。")
+        elif rl:
+            # 注意: CTkLabel 是纯文本, 不认 markdown —— 以前这里的 **加粗** 会原样显示星号.
+            self._combat_hint.configure(
+                text="寻路 / 进图 / 死亡重开 / 换服仍归脚本, 只有刷怪区内的战斗交给策略。"
+                     "下面的反转攻击/防御键只在寻路时生效 —— 策略接管期间会被临时关掉。")
+        else:
+            self._combat_hint.configure(text="关闭时用现有的索敌 / 追击 / 清青怪规则。")
+        self._sync_enemy_enabled()
 
     def _on_point(self, pt):
         self._point = pt
@@ -1195,6 +1266,9 @@ class TimeBlockEditor(ctk.CTkToplevel):
             auto_switch_server=bool(self._autosw.get()),
             invert_attack=bool(self._inv_attack.get()),
             invert_defense=bool(self._inv_defense.get()),
+            combat="rl" if self._rl_on() else "rules",
+            rl_model=self._rl_model_e.get().strip() or "runs/desert",
+            rl_train=self._rl_on() and bool(self._rl_train.get()),
             enter_game_swap=self._collect_swap(self._enter_swap_w),
             reach_area_swap=self._collect_swap(self._reach_swap_w),
         )
@@ -1300,6 +1374,7 @@ class ScheduleList(ctk.CTkScrollableFrame):
                          text_color=theme.FAINT).pack(side="left", padx=4)
 
         tags = [blk["profile"], theme.map_label(blk["map"]),
+                "RL 战斗" if RL_UI_ENABLED and blk.get("combat") == "rl" else
                 ("索敌" if blk.get("enemy_ai_enabled") else "不索敌"),
                 f"刷 {blk.get('farming_duration', 0)} 秒"]
         if blk.get("auto_switch_server"):

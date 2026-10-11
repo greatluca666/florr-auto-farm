@@ -1,6 +1,6 @@
 """把仓库里所有会被送进浏览器的 JS 过一遍 `node --check`。
 
-起因(2026-09-22 实机): 有一段 JS 写在普通三引号字符串里,
+起因(2026-09-22 实机): debug_wasm_counters.py 里那段 JS 写在普通三引号字符串里,
 `.split("\\n")` 的 `\\n` 被 **Python** 先解释成了一个真的换行字符, 于是送到浏览器的
 JS 字符串字面量里真的断了行 -> `SyntaxError: Invalid or unexpected token`。
 
@@ -42,6 +42,12 @@ def test_js_files_parse(name, tmp_path):
     _check((ROOT / name).read_text(encoding="utf-8"), name, tmp_path)
 
 
+def test_mob_list_js_parses(tmp_path):
+    """这条就是当初炸的那一段。"""
+    debug_wasm_counters = pytest.importorskip("debug_wasm_counters")      # 公开树不带
+    _check(debug_wasm_counters.MOB_LIST_JS, "debug_wasm_counters.MOB_LIST_JS", tmp_path)
+
+
 def test_ws_probe_js_parses(tmp_path):
     import florr_server
     _check(florr_server._WS_PROBE_JS, "florr_server._WS_PROBE_JS", tmp_path)
@@ -51,6 +57,26 @@ def test_settings_js_template_parses(tmp_path):
     """_JS_TEMPLATE 带 {addr}/{want} 占位符, 填完才是合法 JS。"""
     import florr_settings
     _check(florr_settings._js(0x53430E, 1), "florr_settings._JS_TEMPLATE", tmp_path)
+
+
+def test_mob_list_js_has_no_literal_newline_inside_a_string():
+    """直指当初那个 bug: JS 字符串字面量里不能出现真的换行。
+
+    node --check 已经能抓到, 但这条把失败信息说清楚 —— 免得下次有人看到
+    "Invalid or unexpected token" 还要从头查一遍是谁转义错了。
+    """
+    debug_wasm_counters = pytest.importorskip("debug_wasm_counters")      # 公开树不带
+    for i, line in enumerate(debug_wasm_counters.MOB_LIST_JS.splitlines(), 1):
+        assert line.count('"') % 2 == 0, (
+            f"第 {i} 行引号不成对, 多半是 Python 把 \\n 提前解释成了真换行: {line!r}")
+
+
+@pytest.mark.parametrize("counters", [False, True])
+@pytest.mark.parametrize("with_input", [False, True])
+def test_record_session_peek_js_parses(counters, with_input, tmp_path):
+    record_session = pytest.importorskip("record_session")      # 公开树不带
+    _check(record_session.peek_js(counters, with_input=with_input),
+           f"record_session.peek_js({counters}, {with_input})", tmp_path)
 
 
 def test_canvas_self_dot_js_parses(tmp_path):

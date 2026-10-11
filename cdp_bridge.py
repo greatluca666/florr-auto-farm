@@ -497,3 +497,80 @@ def inject_canvas_hook(timeout=5):
     if len({r.get("frame") for r in recs}) < 2:
         _maybe_reload(timeout)
         raise RuntimeError("canvas hook 注入没生效 (帧号没推进) —— 已 reload, 请重进游戏后重试")
+
+
+class CdpSession:
+    """一条一直开着的 CDP 连接, 给高频求值的调用方(RL 后端)用。
+
+    **为什么不直接改 _send_cdp_command**: 它被主循环、afk 线程、换服都用着, 那些是
+    多线程。共享一条 socket 会让两个线程的收发交织 —— A 线程读到 B 线程的响应, 而且
+    这种错不会立刻炸, 只会让某次调用拿到别人的结果。所以这里单开一条, 只给单线程的
+    高频调用方用, 原来那条路一个字没动。
+
+    实机量出来(cdp_breakdown.py, 30 次中位): 每次调用光 HTTP GET /json 找标签页就
+    10.3ms, 加 WebSocket 握手 6.9ms —— 一共 17.2ms 是纯粹浪费掉的。10Hz 下这是一拍
+    预算的六分之一。
+
+    连接断了(florr 重连/换服触发 Page.reload/标签页关了)会自动重连一次再重试; 再失败
+    就抛 —— 调用方(rl_backend)拿到异常会结束这一段 rollout, 那是对的: 页面都换了,
+    之前注入的钩子和探针基准都没了。
+    """
+
+    def __init__(self, *, timeout=20, connect=None, find_tab=None):
+        self._connect = connect or (lambda url, timeout: websocket.create_connection(
+            url, timeout=timeout))
+        self._find_tab = find_tab or find_florr_tab
+        self.timeout = timeout
+        self._ws = None
+        self._id = 0
+        self.reconnects = 0
+
+    def _open(self):
+        tab = self._find_tab()
+        if tab is None:
+            raise RuntimeError("找不到 florr.io 标签页(CDP)")
+        self._ws = self._connect(tab["webSocketDebuggerUrl"], self.timeout)
+
+    def _round_trip(self, expression):
+        self._id += 1
+        rid = self._id
+        self._ws.send(json.dumps({"id": rid, "method": "Runtime.evaluate",
+                                  "params": {"expression": expression}}))
+        # 同一条连接上会混进页面事件等跟这次调用无关的消息 —— 按 id 对上号才是我们的。
+        while True:
+            msg = json.loads(self._ws.recv())
+            if msg.get("id") == rid:
+                return msg
+
+    def eval_value(self, expression, timeout=None):
+        """求值并把结果 JSON 解回来。签名跟 rl_backend.eval_value 一致, 可直接替换。
+
+        timeout 收下但不用 —— 超时是连接建立时设在 socket 上的。
+        """
+        resp = None
+        for last_try in (False, True):
+            if self._ws is None:
+                self._open()
+            try:
+                resp = self._round_trip(f"JSON.stringify({expression})")
+                break
+            except Exception:
+                self.close()
+                self.reconnects += 1
+                if last_try:
+                    raise
+        if "error" in resp:
+            raise RuntimeError(f"CDP执行出错: {resp['error']}")
+        inner = resp.get("result", {}).get("result", {})
+        if "value" not in inner:
+            raise RuntimeError(f"JS 没返回值: {inner!r}")
+        raw = inner["value"]
+        return None if raw is None else json.loads(raw)
+
+    def close(self):
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
