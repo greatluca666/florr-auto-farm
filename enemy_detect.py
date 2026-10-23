@@ -474,6 +474,19 @@ CAUTIOUS_HOLD_PX = 500
 # 一拍进一拍退地抖。0.15 跟蚁群保持距离的 SWARM_KEEP_BAND 同一个数, **未标定**。
 CAUTIOUS_RETREAT_BAND = 0.15
 
+# 每张图的谨慎保持距离(屏幕像素)。不在表里的图用 CAUTIOUS_HOLD_PX。
+# 蚁穴: 用户 2026-10-11 "U 兵蚁我还是能打的, 只是离得太远打不着"。录像量的(8 份, 1920x1080, zoom 0.72): 兵蚁掉血
+# 的比例 0~200px 内 60~70%, 200px 外掉到底噪(20~30%, 别的玩家 / 别的伤害) —— 花瓣够得着的只有 ~200px 以内;
+# 默认 500 时保持在 425~500px, 一整段录像里 Ultra 兵蚁在 200px 内的拍数只占 8%(80/1043), 想打也打不着。
+# 取 130: 站在 110~130px(花瓣够得着)打, 比 110px 还近才退。别取更大: 兵蚁贴身交手时中心距离就在 110~125px
+# (Ultra 更大, 录像里 113px 一直挂着打), 退的门限(130 x 0.85 = 110)得落在它下面, 不然一交手就在"站着打 / 后退"
+# 之间来回切, 正好在最该打的时候退。
+CAUTIOUS_HOLD_PX_BY_MAP = {"anthell": 130}
+
+
+def cautious_hold_px_for(map_name, default):
+    return CAUTIOUS_HOLD_PX_BY_MAP.get(map_name, default)
+
 # AVOID 怪规避触发半径的默认值(屏幕像素)。main.AVOID_TRIGGER_PX 取它, select_action 的默认实参取它,
 # GUI 索敌设置的 placeholder 也读它。
 DEFAULT_AVOID_TRIGGER_PX = 400

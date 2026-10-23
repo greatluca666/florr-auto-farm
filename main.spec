@@ -20,7 +20,8 @@ datas = [("canvas_hook.js", ".")]
 binaries = []
 hiddenimports = [
     "pyautogui", "pyscreeze", "pymsgbox", "pytweening", "pygetwindow", "mouseinfo",
-    "PIL", "PIL._tkinter_finder", "websocket", "certifi", "tkinter", "customtkinter",
+    "PIL", "PIL._tkinter_finder", "websocket", "certifi", "tkinter", "customtkinter", "psutil",
+    "afk_solver",     # afk_watch 里函数内才 import, 显式列上保险
 ]
 
 from PyInstaller.utils.hooks import collect_all

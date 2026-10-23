@@ -23,6 +23,7 @@ import map_routes
 import florr_server
 import loadout_swap
 import keep_awake
+import stall_watch
 import flee_planner
 import phase_marks
 
@@ -143,6 +144,33 @@ def _los_penalty(map, pen, node1, node2):
 # 键带地图内容指纹(开了传送门缺口的图是另一张图); 只缓存找到路的结果(失败不缓存, 地图可能马上就好了)。
 _PLAN_CACHE = {}
 _PLAN_CACHE_MAX = 32
+# 起点相近也复用。死亡后的出生点每次差几格((58,285)(61,285)(55,281)(53,288)...), 卡点重规划的起点也差几格
+# ((149,199)(152,200)(150,206)...), 精确键永远不命中 —— 2026-10-15 的 10 份录像里每条命规划 2~3 次、每次
+# 5~10 秒、人站着不动, 一条命白站 ~20 秒。同图 + 同终点 + 同净空开关 + 起点 <= NEAR 格的已规划路径, 把当前
+# 起点用直线接到它开头最靠后的、能直接看见且这条直线不贴墙的那个点上(路径的后半段原样用)。
+_PLAN_REUSE_NEAR = 8.0       # 格: 缓存路径的起点离这次起点这么近才考虑复用
+_PLAN_REUSE_NODES = 12       # 只往缓存路径开头这么多个点上接
+_PLAN_REUSE_PEN_MAX = 4.0    # 接上去那条直线沿线的贴墙惩罚(_wall_penalty)之和上限: 约两格净空 1 的地方
+_PLAN_REUSE_OFF = False      # 总开关: 想退回只认精确起点的老行为改这里
+
+
+def _join_to_cached_plan(map, start, path, pen):
+    """start 能直线看见 path 开头(<= _PLAN_REUSE_NODES 个)里最靠后的哪个点、且这条直线不贴墙, 就返回
+    [start] + path[该点:]; 一个都接不上返回 None。视线判定跟规划器同一套(line_of_sight / _los_penalty);
+    pen=None(不带净空的老规划)只看视线。"""
+    from types import SimpleNamespace
+    here = SimpleNamespace(x=start[0], y=start[1])
+    for i in range(min(len(path), _PLAN_REUSE_NODES) - 1, -1, -1):
+        node = path[i]
+        there = SimpleNamespace(x=node[0], y=node[1])
+        if pen is None:
+            ok = line_of_sight(map, here, there)
+        else:
+            cost = _los_penalty(map, pen, here, there)
+            ok = cost is not None and cost <= _PLAN_REUSE_PEN_MAX
+        if ok:
+            return ([tuple(start)] + list(path[i:])) if tuple(node) != tuple(start) else list(path[i:])
+    return None
 
 
 def lazy_theta_star(map, start, goal, clearance=None):
@@ -153,10 +181,21 @@ def lazy_theta_star(map, start, goal, clearance=None):
         return None
     use_clearance = CLEARANCE_PLANNING if clearance is None else bool(clearance)
     import zlib
-    cache_key = (map.shape, zlib.adler32(map.tobytes()), tuple(start), tuple(goal), use_clearance)
+    fingerprint = (map.shape, zlib.adler32(map.tobytes()))
+    cache_key = fingerprint + (tuple(start), tuple(goal), use_clearance)
     hit = _PLAN_CACHE.get(cache_key)
     if hit is not None:
         return list(hit)
+    if not _PLAN_REUSE_OFF:
+        near = sorted(
+            (math.dist(k[2], start), k) for k in _PLAN_CACHE
+            if k[:2] == fingerprint and k[3] == tuple(goal) and k[4] == use_clearance
+            and math.dist(k[2], start) <= _PLAN_REUSE_NEAR)
+        for _, k in near:
+            joined = _join_to_cached_plan(map, start, _PLAN_CACHE[k],
+                                          _wall_penalty(map) if use_clearance else None)
+            if joined is not None:
+                return joined                        # 派生的不入缓存: 绕路不会一层层累积
     path = _lazy_theta_star(map, start, goal, use_clearance)
     if path is not None:
         if len(_PLAN_CACHE) >= _PLAN_CACHE_MAX:
@@ -655,8 +694,17 @@ def execute_path(path, stop_when=None, binary_map=None, enemy_watch=None, deadli
 # 纯追踪(pure pursuit): 瞄**路径上前方 PURSUIT_LOOKAHEAD 格**的点, 永远在前面, 不存在"冲过节点再折回来";
 # 鼠标偏移满量(不做比例增益, 增益不稳定的根源), 只有临近终点才减速; 查死亡 / 开局画面降到每 0.5 秒一次
 # (一次要 ~200ms, 以前每拍两次)。只给 PURSUIT_MAPS(别的图逐点走法是实机验证过的, 不动)。
+#
+# 2026-10-18 蚁穴也开(用户定): 15 份蚁穴录像里每条命从复活点 (121,101) 走到刷怪区 (32,89) 要 ~65 秒(~100 格,
+# 中位速度 327 u/s ≈ 1.5 格/秒, 偶尔冲到 900), 逐点走每个节点都有到达 / 停顿 / 转向的开销。纯追踪的数值是按工厂
+# 高速段调的, 蚁穴没实机验证过(更窄、怪更多、速度慢得多) —— 所以带保险: PURSUIT_UNVERIFIED_MAPS 里的图, 同一次
+# 寻路(lazy_theta_pathing)里纯追踪累计卡住 PURSUIT_FALLBACK_STUCKS 次, 这次剩下的路改回实机验证过的逐点走;
+# 下一次寻路重新试纯追踪。工厂的纯追踪是验证过的(高速段逐点走会冲过头), 不退。想关蚁穴: 从 PURSUIT_MAPS 里删掉。
+AFK_SELF_SOLVE = True          # worker 自己解挂机检测弹窗(见 afk_solver.py); False = 只靠 florr-auto-afk
 PURSUIT_ENABLED = True
-PURSUIT_MAPS = ("factory",)
+PURSUIT_MAPS = ("factory", "anthell")
+PURSUIT_UNVERIFIED_MAPS = ("anthell",)
+PURSUIT_FALLBACK_STUCKS = 3
 PURSUIT_LOOKAHEAD = 6.0        # 格。一拍(~0.15 秒)跑 12 格/秒 x 0.15 = 1.8 格, 取它的 3 倍多: 修正横向偏差不过冲
 PURSUIT_SLOW_RADIUS = 8.0      # 离终点这么近(格)才按距离收鼠标偏移
 PURSUIT_SCREEN_CHECK_S = 0.5   # 抓屏查死亡 / 开局画面的最短间隔(同 FARM_SCREEN_CHECK_S)
@@ -1073,6 +1121,7 @@ def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
     """
     retry_count = 0
     no_progress = 0
+    pursuit_stucks = 0           # 这次寻路里纯追踪卡住了几次(PURSUIT_UNVERIFIED_MAPS 的保险用)
     # 先装 canvas hook 再读第一次位置: 刚进游戏时钩子还没装(装钩子只在刷怪索敌扫描里), 位置只能退回截图
     # 认小地图金点 —— 小地图大小跟 300x300 的假设对不上时读出个假坐标(录像里每次都是 (250,45)), 路径从假起点
     # 规划, 人往错的方向走了 10 秒才卡住。装不上(页面在重载 / CDP 抖)就照旧退回截图, 不能拦住寻路。
@@ -1166,9 +1215,15 @@ def lazy_theta_pathing(location, area=[], deadline=None, enemy_watch=None):
             # 一滑就出区, 「离开刷怪区域 -> 重新寻路回去」每 25 秒一轮(2026-10-11 录像 8 轮/200 秒)。
             return bool(entry_area) and here is not None and if_in_area(entry_area, here)
 
-        stat = (follow_path if _use_pursuit() else execute_path)(
+        use_pursuit = _use_pursuit() and not (utils.MAP in PURSUIT_UNVERIFIED_MAPS
+                                              and pursuit_stucks >= PURSUIT_FALLBACK_STUCKS)
+        stat = (follow_path if use_pursuit else execute_path)(
             path, stop_when=_inside, binary_map=binary_map,
             enemy_watch=enemy_watch, deadline=deadline)
+        if use_pursuit and stat == "stuck":
+            pursuit_stucks += 1
+            if utils.MAP in PURSUIT_UNVERIFIED_MAPS and pursuit_stucks >= PURSUIT_FALLBACK_STUCKS:
+                print(f"   ↩️ 纯追踪这次寻路里已经卡住 {pursuit_stucks} 次, 剩下的路改回逐点走(这张图的纯追踪还没实机验证)")
         if stat == "enemy":
             _flee_while_pathing(enemy_watch)
             continue
@@ -1385,7 +1440,8 @@ def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, p
                 "avoid_px", enemy_detect.avoid_trigger_px_for(utils.MAP, AVOID_TRIGGER_PX)),
             avoid_early_px=enemy_detect.avoid_early_px_for(utils.MAP),
             can_reach=can_reach, in_area=in_area,
-            cautious_hold_px=enemy_detect.knob("cautious_px", CAUTIOUS_HOLD_PX),
+            cautious_hold_px=enemy_detect.knob(
+                "cautious_px", enemy_detect.cautious_hold_px_for(utils.MAP, CAUTIOUS_HOLD_PX)),
             center=enemy_detect.current_center(),
             chase_min_conf=CHASE_MIN_CONF,
             target_policy=enemy_detect.target_policy_for(utils.MAP),
@@ -1516,8 +1572,9 @@ class _FleePlan:
         self.dir = None
 
     def target(self, avoid_positions, detections, center, map_pos, binary_map, now=None,
-               me_world=None):
-        """me_world: 自己的世界坐标; 不给就用最近一次索敌扫描的(analyze_recording 离线重放时给)。"""
+               me_world=None, label="躲究极"):
+        """me_world: 自己的世界坐标; 不给就用最近一次索敌扫描的(analyze_recording 离线重放时给)。
+        label: 换目标时日志里写的是在躲什么(谨慎怪后退也走这里, 见 auto_farming 的追击分支)。"""
         now = time.time() if now is None else now
         fallback = _steer_clear_of_walls(
             enemy_detect.flee_mouse_target(avoid_positions, center=center),
@@ -1563,7 +1620,7 @@ class _FleePlan:
         if prev is None or math.hypot(prev[0] - plan["goal"][0],
                                       prev[1] - plan["goal"][1]) > flee_planner.KEEP_R:
             how = f"早到 {plan['lead']:.1f} 格" if plan["safe"] else f"被堵住了, 亏得最少(差 {-plan['lead']:.1f} 格)"
-            print(f"🏃 躲究极: 往 {plan['goal']} 跑 ({how}, 绕开怪群 {len(crowd)} 只)")
+            print(f"🏃 {label}: 往 {plan['goal']} 跑 ({how}, 绕开怪群 {len(crowd)} 只)")
         ux, uy = plan["dir"]
         return (center[0] + ux * extend, center[1] + uy * extend)
 
@@ -2331,7 +2388,12 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
             # 跟躲究极同一个坑), 偏一偏找条前方走得通的路。
             retreating = enemy_detect.is_cautious_retreat(target, hold_px, center)
             if retreating:
-                mouse_target = _steer_clear_of_walls(mouse_target, center, current_pos, binary_map)
+                # 后退也要看死胡同, 不只是前方 3 格有没有墙: 2026-10-11 蚁穴 8 份录像, 16 次死亡里 9 次死前
+                # 5 秒在"后退", 后退的 436 拍里 21% 贴着墙没动(往刷怪带东头的死胡同退, 究极兵蚁跟自己一样快, 退到头
+                # 就被贴死)。跟躲究极同一个规划器(自己比追兵先到、跑得最远的格子, 死胡同自然落选, 绕开怪群);
+                # 规划不出来它自己退回"背离 + 避墙"。
+                mouse_target = _FLEE_PLAN.target([target["screen_pos"]], detections, center,
+                                                 current_pos, binary_map, label="后退")
             circling = enemy_detect.tactic_for(target["species"]) == "strafe"
             verb = "后退拉开距离" if retreating else ("绕圈打" if circling else "追击")
             _drive_and_check_stall(mouse_target, current_pos, chase_pos_history,
@@ -3555,7 +3617,15 @@ def run_worker(cfg):
     #     又给它拉回去.
     global overlay
     overlay = create_overlay()
+    # AFK 开着才让 poll_afk_pause 自己盯画布: 弹窗字一出现就停手, 不等 florr-auto-afk 的日志行
+    # (2026-10-15 录像: 日志晚了 35~39 秒, 期间 bot 一直在动鼠标, 两次弹窗都没解开)。
+    # 开关在 GUI 全局的 cfg 顶层(afk_enabled), 不在时块切片里。
+    afk_watch.set_canvas_watch(bool(cfg.get("afk_enabled")))
+    # 弹窗出现就自己解(afk_solver): florr-auto-afk 总在 31~43 秒后才发现、赶不上 ~58 秒的时限(10-15 / 10-18 录像
+    # 6 次里 3 次被踢)。跟 afk_enabled 无关。想关: 把 AFK_SELF_SOLVE 改成 False。
+    afk_watch.set_self_solve(AFK_SELF_SOLVE)
     keep_awake.start()   # 无人值守别让显示器休眠 / 进屏保(见 keep_awake 的说明)
+    stall_watch.start()  # 进程 / 整机被卡住时记主线程停在哪 + 谁在吃 CPU(2026-10-15 卡了 12 分钟没留下线索)
 
     # bot 自己不按攻击键, 靠 florr 的「反转攻击键」持续输出;「反转防御键」是对称的
     # 可选项. florr 每次从菜单进局都会从账号数据重载设置、把这两个字节盖回原值 ——

@@ -432,6 +432,7 @@ def test_knob_defaults_are_the_engines_builtin_values():
                  "avoid_px": enemy_detect.DEFAULT_AVOID_TRIGGER_PX,
                  "cautious_px": enemy_detect.CAUTIOUS_HOLD_PX}
     assert gs.knob_defaults("anthell")["avoid_px"] == 200      # 蚁穴自己的躲避半径
+    assert gs.knob_defaults("anthell")["cautious_px"] == 130   # 蚁穴自己的谨慎距离(花瓣够得着)
     assert set(d) == set(gs.app_config.ENEMY_KNOB_RANGES)
 
 

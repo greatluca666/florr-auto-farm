@@ -93,6 +93,14 @@ PAUSE_SECONDS = 12
 # 4~5秒, 6秒留了余量. 见 poll_afk_pause() 的两段式暂停设计.
 PROVISIONAL_PAUSE_SECONDS = 6
 
+# 画布直查(见 _canvas_popup_hold): 弹窗字一出现 worker 就自己停手, 不等 florr-auto-afk 写日志。
+# 2026-10-15 实机录像: 弹窗 02:49:40 就在画布上, 日志触发的暂停 02:50:19 才来(晚 39 秒; 03:04 那次
+# 晚 35 秒), 来了只停 12 秒, 弹窗还在, 两次都没解开(弹窗约 58 秒后自己消失)。
+POPUP_CHECK_INTERVAL_S = 0.4   # 空闲时隔多久问一次画布(一次 CDP eval, 几毫秒); 停着时每次 poll 都问
+POPUP_GONE_GRACE_S = 1.5       # 弹窗字没了之后再停这么久: 解题器拖完球还要松鼠标
+POPUP_MAX_HOLD_S = 90          # 一次弹窗最多停这么久。录像里弹窗只活约 58 秒; 页面卡死时缓冲里
+                               # 最后几帧带着弹窗字永远不更新, 不能因此永远停手
+
 _FOUND_MARKER = "EVENT: Found AFK window"
 # florr-auto-afk自己承认这次"Found AFK window"没能真正分割出弹窗内容 —— 挑
 # ERROR级别这条(而不是它前面两条WARNING: No start found / No end found)当
@@ -136,6 +144,18 @@ _started_here = False
 _confirmed_since = None    # 画布确认过真弹窗的时刻; 弹窗从画面上消失就提前结束暂停
 # 上一条还没确认是真是假的"Found AFK window"的时间戳; None = 没有待确认的.
 _pending_since = None
+# 画布直查的状态。_canvas_watch 由 worker 按 afk_enabled 打开(没开 florr-auto-afk 就没人来解,
+# 停着不动只会挨打 —— 弹窗到点反正会踢人)。
+_canvas_watch = False
+_popup_since = None        # 画布上第一次看到弹窗字的时刻; None = 当前没在为弹窗停手
+_popup_gone_at = None      # 停手期间第一次看到字没了的时刻(宽限期的起点)
+_popup_check_at = 0.0      # 上次问画布的时刻(节流用)
+_popup_gave_up = False     # 停到顶放弃了; 要先看到弹窗字消失一次才重新武装
+# 自己解弹窗(afk_solver): 画布上第一次看到弹窗字就截图 -> 认管道 -> 鼠标把球拖到终点, 不等 florr-auto-afk
+# (它总是弹窗出现 31~43 秒后才"发现", 解题又要 13~24 秒, 弹窗只活 ~58 秒, 6 次里 3 次被踢)。每个弹窗只解一次
+# (最多 afk_solver.MAX_ATTEMPTS 次尝试); 解不开就继续停手, 让 florr-auto-afk 接手。
+_self_solve = False
+_solve_done = False        # 这个弹窗已经解过了(不论成败); 弹窗字消失后才重新武装
 # 还没做过第一次真实读取 —— 用来区分"模块刚加载, 从没poll过"和"poll过, offset
 # 合法为0"这两种情况, 好让下面的截断重置逻辑(size < _last_offset)只在后一种
 # 情况下生效. 参见_read_new_lines()里的用法.
@@ -231,6 +251,76 @@ def canvas_afk_popup(tries=3, gap=0.06):
     return None
 
 
+def set_canvas_watch(enabled):
+    """worker 起来时按 afk_enabled 开/关画布直查。"""
+    global _canvas_watch
+    _canvas_watch = bool(enabled)
+
+
+def set_self_solve(enabled):
+    """worker 起来时开/关"自己解弹窗"。跟 afk_enabled(florr-auto-afk 那个助手)无关: 助手没开也能自己解。"""
+    global _self_solve
+    _self_solve = bool(enabled)
+
+
+def _run_self_solve():
+    """调 afk_solver 解当前弹窗。任何异常都吞掉(解弹窗是加分项, 不能带崩 worker); 返回 True = 它说弹窗没了。"""
+    try:
+        import afk_solver
+        return bool(afk_solver.solve_popup())
+    except Exception as e:
+        print(f"🧩 自己解弹窗出错, 交给 florr-auto-afk: {e}")
+        return False
+
+
+def _canvas_popup_hold(now):
+    """画布上有挂机检测弹窗字就返回 True(= 调用方该立刻停手)。
+
+    不看 florr-auto-afk 的日志, 弹窗字出现的那一拍就停, 字消失后再停 POPUP_GONE_GRACE_S
+    (解题器拖完球要松鼠标)。三种"判断不了"(CDP 不通 / 没装钩子 / 缓冲刚被 scan_enemies 清空)
+    都不改变状态: 没在停就继续不停, 在停就继续停 —— 不能把一次空读当成"弹窗没了"而放人去乱动。
+    """
+    global _popup_since, _popup_gone_at, _popup_check_at, _popup_gave_up, _solve_done
+    if not (_canvas_watch or _self_solve):
+        return False
+    holding = _popup_since is not None
+    if not holding and now - _popup_check_at < POPUP_CHECK_INTERVAL_S:
+        return False
+    _popup_check_at = now
+    seen = canvas_afk_popup(tries=2, gap=0.04)
+    if seen is True:
+        _popup_gone_at = None
+        if _popup_gave_up:
+            return False
+        if _popup_since is None:
+            _popup_since = now
+            _solve_done = False
+            print("🛑 画布上出现挂机检测弹窗, 立刻停手" + ("(先自己解)" if _self_solve else ", 让 florr-auto-afk 解题"))
+        elif now - _popup_since > POPUP_MAX_HOLD_S:
+            _popup_gave_up = True
+            _popup_since = None
+            print(f"⚠️ 挂机检测弹窗停了 {POPUP_MAX_HOLD_S} 秒还在(画面可能卡住了), 不再等, 继续干活")
+            return False
+        if _self_solve and not _solve_done:
+            _solve_done = True                  # 不论成败每个弹窗只解一次, 失败了就停着让 florr-auto-afk 试
+            _run_self_solve()
+        return _canvas_watch                    # 没开画布停手(afk_enabled 关着): 只解, 不停着等
+    if seen is False:
+        _popup_gave_up = False                  # 字确实没了: 重新武装
+        _solve_done = False
+        if _popup_since is None:
+            return False
+        if _popup_gone_at is None:
+            _popup_gone_at = now
+        if now - _popup_gone_at >= POPUP_GONE_GRACE_S:
+            print("✅ 挂机检测弹窗已经消失, 恢复")
+            _popup_since = None
+            _popup_gone_at = None
+            return False
+        return True
+    return holding                              # None: 判断不了, 维持原状
+
+
 def poll_afk_pause():
     """轮询一次. 发现新的"Found AFK window"事件就开一段暂停窗口; 返回当前是否
     还在暂停中. 日志文件不存在(florr-auto-afk还没启动, 或者LATEST_LOG_PATH没配对)
@@ -253,6 +343,8 @@ def poll_afk_pause():
     """
     global _pause_until, _pending_since, _confirmed_since
     now = time.time()
+    # 先看画布: 弹窗字一出现就停(不等下面日志里的 Found 行, 也不受 PAUSE_SECONDS 封顶)
+    popup_hold = _canvas_popup_hold(now)
     provisional = min(PROVISIONAL_PAUSE_SECONDS, PAUSE_SECONDS)
     for line in _read_new_lines():
         if _MISDETECT_MARKER in line and _pending_since is not None:
@@ -290,7 +382,7 @@ def poll_afk_pause():
         print(f"⏸️  florr-auto-afk这次没等到误检信号, 按真弹窗补足到{PAUSE_SECONDS}秒")
         _pending_since = None
 
-    return time.time() < _pause_until
+    return popup_hold or time.time() < _pause_until
 
 
 def _prompt_download_confirm():

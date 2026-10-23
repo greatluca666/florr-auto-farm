@@ -198,9 +198,14 @@
       "蚂蚁地狱": 1, "沙漠": 1, "花园": 1, "下水道": 1, "工厂": 1,
       "Ant Hell": 1, "Desert": 1, "Garden": 1, "Sewers": 1, "Factory": 1,
     };
+    // 挂机检测弹窗的两行字: 同样不管缩放多少都记。1920x1080 时它是 UI 缩放 1.0 恰好能过 isUIScale, 窗口小了
+    // (1024x768 缩放 0.711)就只剩"碰巧离血条近"的那几帧 —— 2026-10-18 夜里 1024x768 的录像: worker 看到弹窗
+    // 又"消失"又出现, 分析器干脆认为画布里没出现过弹窗, 自己解弹窗(afk_solver)也读不到标题位置。
+    // 跟 afk_watch.AFK_POPUP_TEXTS 保持一致(test_afk_watch 钉着)。
+    var AFK_TEXTS = { "挂机检测": 1, "将圆球拖动到终点": 1 };
     function recordText(ctx, text, x, y) {
       var s = state(ctx);
-      if (!nearABarAnchor(s.m) && !isUIScale(s.m) && !ZONE_TEXTS[String(text)]) return;
+      if (!nearABarAnchor(s.m) && !isUIScale(s.m) && !ZONE_TEXTS[String(text)] && !AFK_TEXTS[String(text)]) return;
       var pt = apply(s.m, x, y);
       pushRecord({
         frame: window.__canvasFrame, op: "text", text: String(text),

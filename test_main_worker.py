@@ -230,6 +230,89 @@ def test_run_worker_does_not_start_florr_auto_afk(monkeypatch):
         main.run_worker({})
 
 
+@pytest.mark.parametrize("cfg, want", [({"afk_enabled": True}, True),
+                                       ({"afk_enabled": False}, False),
+                                       ({}, False)])
+def test_run_worker_turns_canvas_afk_watch_on_only_when_afk_is_enabled(monkeypatch, cfg, want):
+    """弹窗字一出现 worker 自己停手(afk_watch.set_canvas_watch)只在 AFK 开关开着时打开:
+    没开 florr-auto-afk 就没人来解, 停着不动只会挨打。开关在 GUI 全局的 cfg 顶层, 不在时块切片里。"""
+    seen = []
+    monkeypatch.setattr(main.afk_watch, "set_canvas_watch", lambda on: seen.append(on))
+    monkeypatch.setattr(main.cdp_bridge, "is_dedicated_chrome_ready", lambda: True)
+    monkeypatch.setattr(main, "create_overlay", lambda *a, **k: _StubOverlay())
+    monkeypatch.setattr(main, "overlay", None, raising=False)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+        "location": (1, 2), "farming_area": [(0, 0), (9, 9)], "farming_duration": 300,
+        "short_round_limit": 2, "enemy_ai_enabled": False, "auto_switch_server": False,
+        "biome": "desert", "map_name": "desert", "route": map_routes.route_for("desert"),
+        "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
+    })
+    monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
+    monkeypatch.setattr(main.florr_settings, "ensure_flag",
+                        lambda ej, addr, want: ("unchanged", ""))
+    monkeypatch.setattr(main, "on_death_screen",
+                        lambda: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker(cfg)
+
+    assert seen == [want]
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_run_worker_passes_the_self_solve_switch_to_afk_watch(monkeypatch, flag):
+    """自己解挂机检测弹窗(afk_solver): 开关是 main.AFK_SELF_SOLVE, 跟 afk_enabled 无关。"""
+    seen = []
+    monkeypatch.setattr(main, "AFK_SELF_SOLVE", flag)
+    monkeypatch.setattr(main.afk_watch, "set_self_solve", lambda on: seen.append(on))
+    monkeypatch.setattr(main.cdp_bridge, "is_dedicated_chrome_ready", lambda: True)
+    monkeypatch.setattr(main, "create_overlay", lambda *a, **k: _StubOverlay())
+    monkeypatch.setattr(main, "overlay", None, raising=False)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+        "location": (1, 2), "farming_area": [(0, 0), (9, 9)], "farming_duration": 300,
+        "short_round_limit": 2, "enemy_ai_enabled": False, "auto_switch_server": False,
+        "biome": "desert", "map_name": "desert", "route": map_routes.route_for("desert"),
+        "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
+    })
+    monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
+    monkeypatch.setattr(main.florr_settings, "ensure_flag",
+                        lambda ej, addr, want: ("unchanged", ""))
+    monkeypatch.setattr(main, "on_death_screen",
+                        lambda: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+    assert seen == [flag]
+
+
+def test_run_worker_starts_the_stall_watchdog(monkeypatch):
+    """进程 / 整机被卡住时要留下证据(主线程停在哪 + 谁在吃 CPU): 2026-10-15 那 12 分钟卡顿
+    日志里什么线索都没有。worker 起来就得把看门狗挂上。"""
+    started = []
+    monkeypatch.setattr(main.stall_watch, "start", lambda: started.append(1))
+    monkeypatch.setattr(main.cdp_bridge, "is_dedicated_chrome_ready", lambda: True)
+    monkeypatch.setattr(main, "create_overlay", lambda *a, **k: _StubOverlay())
+    monkeypatch.setattr(main, "overlay", None, raising=False)
+    monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+        "location": (1, 2), "farming_area": [(0, 0), (9, 9)], "farming_duration": 300,
+        "short_round_limit": 2, "enemy_ai_enabled": False, "auto_switch_server": False,
+        "biome": "desert", "map_name": "desert", "route": map_routes.route_for("desert"),
+        "invert_attack": True, "invert_defense": False,
+        "combat": "rules", "rl_model": "runs/desert", "rl_train": False,
+    })
+    monkeypatch.setattr(main, "select_biome_on_title", lambda *a, **k: None)
+    monkeypatch.setattr(main.florr_settings, "ensure_flag",
+                        lambda ej, addr, want: ("unchanged", ""))
+    monkeypatch.setattr(main, "on_death_screen",
+                        lambda: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        main.run_worker({})
+
+    assert started == [1]
+
+
 def test_worker_stdin_watcher_resets_keyboard_on_eof(monkeypatch):
     """GUI 关掉 worker 的 stdin 管道 = 停止请求. 打包成 console=False 之后
     CTRL_BREAK / SIGTERM 都不一定送得到, 这条 EOF 路径是唯一保证"停止"时
@@ -5241,15 +5324,27 @@ def test_maybe_scan_enemies_passes_builtin_values_when_no_knobs_are_set(monkeypa
     monkeypatch.setattr(main.enemy_detect, "select_action",
                         lambda ds, **k: seen.update(k) or ("wander", None))
     now = main.ENEMY_SCAN_INTERVAL + 1.0
-    for map_name, want_avoid in (("anthell", 200), ("desert", main.AVOID_TRIGGER_PX)):
+    for map_name, want_avoid, want_cautious in (
+            ("anthell", 200, 130), ("desert", main.AVOID_TRIGGER_PX, main.CAUTIOUS_HOLD_PX)):
         monkeypatch.setattr(main.utils, "MAP", map_name)
         main._maybe_scan_enemies(True, now, 0.0, ("wander", None), [])
         assert seen["avoid_trigger_px"] == want_avoid
         assert seen["engage_hold_px"] == main.enemy_detect.ENGAGE_HOLD_PX
         assert seen["chase_max_px"] == main.enemy_detect.CHASE_MAX_PX
         assert seen["far_chase_px"] == main.enemy_detect.FAR_CHASE_PX
-        assert seen["cautious_hold_px"] == main.CAUTIOUS_HOLD_PX == main.enemy_detect.CAUTIOUS_HOLD_PX
+        assert main.CAUTIOUS_HOLD_PX == main.enemy_detect.CAUTIOUS_HOLD_PX
+        assert seen["cautious_hold_px"] == want_cautious            # 蚁穴 130(花瓣够得着), 其余 500
         assert seen["swarm_enabled"] is True
+
+
+def test_anthell_cautious_hold_is_within_petal_reach_and_users_knob_still_wins():
+    """2026-10-11 用户: "U 兵蚁我还是能打的, 只是离得太远打不着"。录像里兵蚁掉血的比例 200px 内 60~70%,
+    外面是底噪; 默认 500 的谨慎距离根本打不着。蚁穴默认取花瓣够得着的 130, 其余图不动, 用户旋钮优先。"""
+    ed = main.enemy_detect
+    assert ed.cautious_hold_px_for("anthell", ed.CAUTIOUS_HOLD_PX) == 130
+    assert 130 * (1 - ed.CAUTIOUS_RETREAT_BAND) > 100              # 站桩带还在花瓣够得着的范围里, 不是贴脸
+    assert ed.cautious_hold_px_for("desert", ed.CAUTIOUS_HOLD_PX) == ed.CAUTIOUS_HOLD_PX     # 沙漠 250 实测太近, 不动
+    assert ed.cautious_hold_px_for("factory", ed.CAUTIOUS_HOLD_PX) == ed.CAUTIOUS_HOLD_PX
 
 
 def test_maybe_scan_enemies_passes_user_knobs_to_select_action(monkeypatch):
@@ -5500,6 +5595,36 @@ def test_auto_farming_cautious_retreat_steers_clear_of_walls_and_says_so(monkeyp
     mouse_target, state, message = seen["drive"]
     assert mouse_target == (11.0, 22.0)                              # 交给卡住检测 / moveTo 的是避墙后的
     assert state == "索敌中" and "后退" in message and "spider" in message
+
+
+def test_auto_farming_cautious_retreat_uses_the_flee_planner_not_just_a_wall_check(monkeypatch):
+    """2026-10-11 蚁穴 8 份录像: 16 次死亡里 9 次死前 5 秒在"后退", 后退 436 拍里 21% 贴墙没动 —— 往刷怪带东头的
+    死胡同退, 追兵跟自己一样快, 退到头就被贴死。后退跟躲究极用同一个规划器(死胡同自然落选)。"""
+    main.enemy_detect.set_rules({"species": {"spider": "cautious"}})
+    target = {"species": "spider", "rarity": "Mythic", "screen_pos": (1060, 540)}
+    calls = []
+
+    def fake_target(avoid_positions, detections, center, map_pos, binary_map, **kw):
+        calls.append((list(avoid_positions), center, map_pos, binary_map is not None, kw))
+        return (33.0, 44.0)
+
+    monkeypatch.setattr(main._FLEE_PLAN, "target", fake_target)
+    seen = _drive_one_chase_tick(monkeypatch, target, 300)
+    assert len(calls) == 1
+    avoid, center, pos, has_map, kw = calls[0]
+    assert avoid == [(1060, 540)] and pos == (20, 40) and has_map      # 追兵就是这只谨慎怪
+    assert kw.get("label") == "后退"                                    # 日志别写成"躲究极"
+    assert seen["drive"][0] == (33.0, 44.0)                            # 交给卡住检测 / moveTo 的是规划结果
+    assert "后退" in seen["drive"][2]
+
+
+def test_flee_plan_log_line_names_what_it_is_dodging(monkeypatch, capsys):
+    bm = _flee_plan_env(monkeypatch)
+    ultra = _det_at("soldier_ant", "Ultra", (800.0, 540.0))
+    main._FLEE_PLAN.goal = main._FLEE_PLAN.dir = None
+    main._FLEE_PLAN.target([ultra["screen_pos"]], [ultra], (960.0, 540.0), (150, 150), bm, label="后退")
+    out = capsys.readouterr().out
+    assert "🏃 后退:" in out and "躲究极" not in out
 
 
 def test_auto_farming_cautious_target_inside_the_stand_band_is_not_steered(monkeypatch):
@@ -6029,6 +6154,132 @@ def test_plan_cache_is_keyed_on_map_start_goal_and_clearance():
     assert main.lazy_theta_star(m, (6, 42), (47, 6)) == p1                # 原图原请求仍命中老结果
 
 
+# ── 起点相近也复用: 死亡后的出生点每次差几格((58,285)(61,285)(55,281)(53,288)…), 卡点重规划的起点也差几格
+# ((149,199)(152,200)(150,206)…), 精确键永远不命中 —— 2026-10-15 录像里每条命规划 2~3 次、每次 5~10 秒、人站着不动。
+
+def _count_real_plans(monkeypatch):
+    calls = []
+    real = main._lazy_theta_star
+    monkeypatch.setattr(main, "_lazy_theta_star",
+                        lambda *a, **k: calls.append(1) or real(*a, **k))
+    return calls
+
+
+def _open_field(n=80):
+    m = np.zeros((n, n), dtype=np.uint8)
+    m[2:n - 2, 2:n - 2] = 255
+    return m
+
+
+def test_nearby_start_reuses_the_cached_plan_without_replanning(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _wide_l_corridor(5)
+    calls = _count_real_plans(monkeypatch)
+    first = main.lazy_theta_star(m, (6, 42), (47, 6))
+    assert len(calls) == 1
+    near = main.lazy_theta_star(m, (9, 43), (47, 6))
+    assert len(calls) == 1, "起点只差几格, 不该重新规划"
+    assert near[0] == (9, 43) and near[-1] == (47, 6)
+    assert all(m[y, x] == 255 for x, y in near)
+    # 复用的是已规划路径的后半段, 不是另一条路
+    assert set(near[1:]) <= set(first)
+
+
+def test_reuse_joins_the_start_to_the_farthest_visible_node_not_a_detour(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    calls = _count_real_plans(monkeypatch)
+    first = main.lazy_theta_star(m, (10, 10), (60, 60))
+    assert first == [(10, 10), (60, 60)]                  # 空场: 一条直线
+    near = main.lazy_theta_star(m, (12, 7), (60, 60))
+    assert len(calls) == 1
+    assert near == [(12, 7), (60, 60)]                     # 直接朝终点, 不绕回 (10,10)
+
+
+def test_far_start_is_planned_for_real(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    calls = _count_real_plans(monkeypatch)
+    main.lazy_theta_star(m, (10, 10), (60, 60))
+    main.lazy_theta_star(m, (int(10 + main._PLAN_REUSE_NEAR) + 3, 10), (60, 60))
+    assert len(calls) == 2
+
+
+def test_nearby_start_behind_a_wall_is_planned_for_real(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    m[:, 30] = 0                                           # 一堵竖墙把两侧隔开(留一个缺口在最下面)
+    m[70:78, 30] = 255
+    calls = _count_real_plans(monkeypatch)
+    main.lazy_theta_star(m, (28, 10), (28, 60))
+    near = main.lazy_theta_star(m, (32, 10), (28, 60))     # 离得近, 但隔着墙: 视线不通, 不能硬接
+    assert len(calls) == 2
+    assert all(m[y, x] == 255 for x, y in near)
+
+
+def test_reuse_does_not_cut_a_corner_hugging_the_wall(monkeypatch):
+    # 起点离缓存起点只差 1 格, 但从它直接看终点的那条直线擦着墙角(净空 ~1): 不能为了省规划把人带去贴墙,
+    # 退一步接缓存路径更靠前(离墙远)的点。
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    m[2:43, 30:36] = 0                                     # 一块墙, 下沿在 y=42
+    first = main.lazy_theta_star(m, (10, 45), (60, 41))
+    near = main.lazy_theta_star(m, (10, 44), (60, 41))
+    assert first is not None and near is not None
+    assert near[1] != (60, 41), "直接接终点那条线贴着墙擦过去, 不该用"
+    assert near[-1] == (60, 41) and all(m[y, x] == 255 for x, y in near)
+
+
+def test_reuse_needs_the_same_goal_and_clearance_setting(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    calls = _count_real_plans(monkeypatch)
+    main.lazy_theta_star(m, (10, 10), (60, 60))
+    main.lazy_theta_star(m, (11, 10), (61, 60))                       # 终点不同
+    main.lazy_theta_star(m, (11, 10), (60, 60), clearance=False)      # 净空开关不同
+    assert len(calls) == 3
+
+
+def test_reused_plans_are_not_stored_so_detours_cannot_chain(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    main.lazy_theta_star(m, (10, 10), (60, 60))
+    main.lazy_theta_star(m, (12, 8), (60, 60))
+    assert len(main._PLAN_CACHE) == 1                      # 只有真规划出来的那条
+
+
+def test_reuse_returns_a_fresh_list_each_time(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    main.lazy_theta_star(m, (10, 10), (60, 60))
+    a = main.lazy_theta_star(m, (12, 8), (60, 60))
+    a.append((0, 0))
+    assert main.lazy_theta_star(m, (12, 8), (60, 60)) == [(12, 8), (60, 60)]
+
+
+def test_join_never_hands_out_the_cached_list_itself():
+    m = _open_field()
+    cached = [(10, 10), (60, 60)]
+    out = main._join_to_cached_plan(m, (10, 10), cached, None)     # 起点正好就是缓存路径的一个点
+    assert out == cached and out is not cached
+    out.append((0, 0))
+    assert cached == [(10, 10), (60, 60)]
+    m[34:37, 30:40] = 0                                            # 一堵墙挡住 (10,10)->(60,60): 只能接在起点自己那个点上
+    cached = [(10, 10), (60, 60)]
+    out = main._join_to_cached_plan(m, (10, 10), cached, None)
+    assert out == cached and out is not cached
+
+
+def test_start_on_a_wall_cell_is_not_reused(monkeypatch):
+    main._PLAN_CACHE.clear()
+    m = _open_field()
+    m[8, 12] = 0
+    calls = _count_real_plans(monkeypatch)
+    main.lazy_theta_star(m, (10, 10), (60, 60))
+    main.lazy_theta_star(m, (12, 8), (60, 60))             # 起点自己就是墙格: 接不上, 交给真规划(它会判无路)
+    assert len(calls) == 2
+
+
 def test_plan_cache_does_not_remember_failures_forever():
     main._PLAN_CACHE.clear()
     m = np.zeros((20, 20), dtype=np.uint8)
@@ -6446,9 +6697,102 @@ def test_follow_path_with_a_single_node_is_already_there(monkeypatch):
 
 
 def test_pathing_uses_the_pursuit_executor_only_on_pursuit_maps(monkeypatch):
-    for map_name, want in (("factory", True), ("desert", False), ("anthell", False)):
+    for map_name, want in (("factory", True), ("desert", False), ("anthell", True)):   # 蚁穴 2026-10-18 起也开
         monkeypatch.setattr(main.utils, "MAP", map_name)
         assert main._use_pursuit() is want, map_name
     monkeypatch.setattr(main, "PURSUIT_ENABLED", False)
     monkeypatch.setattr(main.utils, "MAP", "factory")
     assert main._use_pursuit() is False                                      # 总开关
+
+
+# ── 蚁穴也走纯追踪(2026-10-18): 10-18 的 15 份蚁穴录像里每条命从复活点走到刷怪区要 ~65 秒(~100 格, 中位速度 ──
+# 327 u/s ≈ 1.5 格/秒), 逐点走(execute_path)每个节点都有到达/停顿/转向的开销。纯追踪的数值是按工厂调的, 蚁穴没实机
+# 验证过, 所以带保险: 同一次寻路里纯追踪累计卡住 PURSUIT_FALLBACK_STUCKS 次, 剩下的路改回实机验证过的逐点走。
+
+def _walker_env(monkeypatch, map_name, *, follow, execute):
+    """蚁穴/工厂寻路的最小桩: 人一开始在区外 (5,5), 哪个 runner 返回 True 人就进区 (55,55)。"""
+    import numpy as np
+    clock = _stub_pathing_env(monkeypatch)
+    monkeypatch.setattr(main.utils, "MAP", map_name)
+    monkeypatch.setattr(main, "load_binary_map", lambda: np.full((120, 120), 255, dtype=np.uint8))
+    monkeypatch.setattr(main, "lazy_theta_star", lambda m, a, b: [a, b])
+    monkeypatch.setattr(main, "execute_anti_stuck", lambda *a, **k: None)
+    monkeypatch.setattr(main.cdp_bridge, "inject_canvas_hook", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(main, "_on_wrong_map", lambda: None)
+    state = {"in": False, "follow": 0, "execute": 0}
+
+    def run(kind, fn):
+        def _run(path, **kw):
+            state[kind] += 1
+            # 保险丝: 寻路"永不放弃", 保险缺了会一直重试 —— 测试要失败, 不能挂死
+            assert state[kind] <= 40, f"{kind} 被调了 40 次还停不下来"
+            r = fn(state[kind])
+            if r is True:
+                state["in"] = True
+            return r
+        return _run
+
+    monkeypatch.setattr(main, "follow_path", run("follow", follow))
+    monkeypatch.setattr(main, "execute_path", run("execute", execute))
+    monkeypatch.setattr(main, "get_player_position", lambda *a, **k: (55, 55) if state["in"] else (5, 5))
+    return state, clock
+
+
+AREA_A = [[(50, 50), (60, 60)]]
+
+
+@pytest.mark.parametrize("name, want", [("factory", True), ("anthell", True), ("desert", False),
+                                        ("garden", False), ("ocean", False), ("jungle", False),
+                                        ("sewers", False)])
+def test_pursuit_is_used_on_factory_and_anthell_only(monkeypatch, name, want):
+    monkeypatch.setattr(main.utils, "MAP", name)
+    assert main._use_pursuit() is want
+
+
+def test_anthell_pathing_walks_with_pursuit(monkeypatch):
+    state, _ = _walker_env(monkeypatch, "anthell", follow=lambda n: True,
+                            execute=lambda n: pytest.fail("蚁穴该走纯追踪"))
+    assert main.lazy_theta_pathing((55, 55), AREA_A) is True
+    assert state["follow"] == 1 and state["execute"] == 0
+
+
+def test_anthell_falls_back_to_waypoint_walking_after_repeated_pursuit_stucks(monkeypatch, capsys):
+    state, _ = _walker_env(monkeypatch, "anthell", follow=lambda n: "stuck", execute=lambda n: True)
+    assert main.lazy_theta_pathing((55, 55), AREA_A) is True
+    assert state["follow"] == main.PURSUIT_FALLBACK_STUCKS      # 卡够次数就不再试纯追踪
+    assert state["execute"] == 1                                 # 剩下的路改回逐点走
+    assert "改回逐点走" in capsys.readouterr().out
+
+
+def test_anthell_keeps_pursuit_while_it_gets_stuck_less_than_the_limit(monkeypatch):
+    k = main.PURSUIT_FALLBACK_STUCKS
+    state, _ = _walker_env(monkeypatch, "anthell",
+                            follow=lambda n: "stuck" if n < k else True,
+                            execute=lambda n: pytest.fail("还没卡够次数, 不该退回逐点走"))
+    assert main.lazy_theta_pathing((55, 55), AREA_A) is True
+    assert state["follow"] == k and state["execute"] == 0
+
+
+def test_the_pursuit_stuck_count_starts_over_on_every_pathing_call(monkeypatch):
+    state, _ = _walker_env(monkeypatch, "anthell", follow=lambda n: "stuck", execute=lambda n: True)
+    main.lazy_theta_pathing((55, 55), AREA_A)
+    state["in"] = False
+    before = state["follow"]
+    main.lazy_theta_pathing((55, 55), AREA_A)
+    assert state["follow"] - before == main.PURSUIT_FALLBACK_STUCKS      # 下一次寻路重新给纯追踪机会
+
+
+def test_factory_never_falls_back_however_often_pursuit_gets_stuck(monkeypatch):
+    # 工厂的纯追踪是验证过的(高速段逐点走会冲过头), 卡住只重规划, 不退回逐点走
+    state, _ = _walker_env(monkeypatch, "factory",
+                            follow=lambda n: "stuck" if n < 8 else True,
+                            execute=lambda n: pytest.fail("工厂不该退回逐点走"))
+    assert main.lazy_theta_pathing((55, 55), AREA_A) is True
+    assert state["follow"] == 8 and state["execute"] == 0
+
+
+def test_a_non_pursuit_map_never_touches_follow_path(monkeypatch):
+    state, _ = _walker_env(monkeypatch, "desert", follow=lambda n: pytest.fail("沙漠不走纯追踪"),
+                            execute=lambda n: True)
+    assert main.lazy_theta_pathing((55, 55), AREA_A) is True
+    assert state["execute"] == 1

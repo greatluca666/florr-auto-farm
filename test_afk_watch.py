@@ -22,6 +22,14 @@ def _reset(monkeypatch, log_path):
     monkeypatch.setattr(afk_watch, "_confirmed_since", None)
     # 画布确认默认"判断不了" —— 老用例测的就是没有画布信号时的两段式行为
     monkeypatch.setattr(afk_watch, "canvas_afk_popup", lambda **k: None)
+    # 画布直查默认关(worker 才按 afk_enabled 打开), 状态清零
+    monkeypatch.setattr(afk_watch, "_canvas_watch", False)
+    monkeypatch.setattr(afk_watch, "_popup_since", None)
+    monkeypatch.setattr(afk_watch, "_popup_gone_at", None)
+    monkeypatch.setattr(afk_watch, "_popup_check_at", 0.0)
+    monkeypatch.setattr(afk_watch, "_popup_gave_up", False)
+    monkeypatch.setattr(afk_watch, "_self_solve", False)
+    monkeypatch.setattr(afk_watch, "_solve_done", False)
 
 
 def test_poll_afk_pause_false_when_log_file_missing(tmp_path, monkeypatch):
@@ -1257,3 +1265,224 @@ def test_stopping_it_forgets_it_was_ours(monkeypatch):
     monkeypatch.setattr(afk_watch.subprocess, "run", lambda *a, **k: None)
     afk_watch.stop_florr_auto_afk()
     assert afk_watch.started_by_this_session() is False
+
+
+# ── 画布直查: 弹窗字一出现就停手, 不等 florr-auto-afk 的日志行 ──────────────────────
+# 2026-10-15 录像: 弹窗 02:49:40 就在画布上了, worker 靠日志 02:50:19 才发现(晚 39 秒), 发现后
+# 只停 12 秒, 弹窗还在屏幕上。两次都没解开, 弹窗约 58 秒后消失。
+
+
+class _Canvas:
+    """可编排的画布: 每次被问就按脚本返回 True/False/None, 并记下被问了几次。"""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    def __call__(self, **k):
+        self.calls += 1
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+def _watch(monkeypatch, tmp_path, canvas, interval=0.0, grace=0.0, max_hold=90.0):
+    _reset(monkeypatch, tmp_path / "no_such_latest.log")
+    monkeypatch.setattr(afk_watch, "_canvas_watch", True)
+    monkeypatch.setattr(afk_watch, "canvas_afk_popup", canvas)
+    monkeypatch.setattr(afk_watch, "POPUP_CHECK_INTERVAL_S", interval)
+    monkeypatch.setattr(afk_watch, "POPUP_GONE_GRACE_S", grace)
+    monkeypatch.setattr(afk_watch, "POPUP_MAX_HOLD_S", max_hold)
+
+
+def test_canvas_popup_pauses_at_once_without_any_log_line(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    assert afk_watch.poll_afk_pause() is True      # 没有 latest.log, 光靠画布
+
+
+def test_canvas_popup_is_ignored_when_watch_is_off(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_canvas_watch", False)
+    assert afk_watch.poll_afk_pause() is False
+    assert canvas.calls == 0                        # 没开就别白打 CDP
+
+
+def test_canvas_popup_holds_past_the_old_12_second_cap(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "PAUSE_SECONDS", 0.03)
+    assert afk_watch.poll_afk_pause() is True
+    time.sleep(0.08)                                # 老的定时暂停早过期了
+    assert afk_watch.poll_afk_pause() is True       # 弹窗还在 = 还停着
+
+
+def test_canvas_popup_resumes_after_it_disappears_and_the_grace_passes(tmp_path, monkeypatch):
+    canvas = _Canvas(True, False)
+    _watch(monkeypatch, tmp_path, canvas, grace=0.06)
+    assert afk_watch.poll_afk_pause() is True       # 弹窗在
+    assert afk_watch.poll_afk_pause() is True       # 刚消失, 宽限期内解题器还在松鼠标
+    time.sleep(0.1)
+    assert afk_watch.poll_afk_pause() is False      # 宽限过了
+
+
+def test_canvas_unknown_does_not_start_a_pause(tmp_path, monkeypatch):
+    canvas = _Canvas(None)
+    _watch(monkeypatch, tmp_path, canvas)
+    assert afk_watch.poll_afk_pause() is False
+
+
+def test_canvas_unknown_does_not_release_a_running_pause(tmp_path, monkeypatch):
+    # 缓冲被 scan_enemies 刚清空 -> 这一拍判断不了, 不能当成弹窗没了
+    canvas = _Canvas(True, None, None)
+    _watch(monkeypatch, tmp_path, canvas)
+    assert afk_watch.poll_afk_pause() is True
+    assert afk_watch.poll_afk_pause() is True
+    assert afk_watch.poll_afk_pause() is True
+
+
+def test_canvas_popup_hold_has_a_ceiling_and_does_not_retrigger_until_it_clears(tmp_path, monkeypatch):
+    # 页面卡死时缓冲里最后几帧带着弹窗字永远不更新 —— 不能因此永远停手
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas, max_hold=0.05)
+    assert afk_watch.poll_afk_pause() is True
+    time.sleep(0.08)
+    assert afk_watch.poll_afk_pause() is False      # 到顶放弃
+    assert afk_watch.poll_afk_pause() is False      # 字还在也不再重新触发
+    canvas.answers = [False]
+    assert afk_watch.poll_afk_pause() is False      # 看到字消失 = 重新武装
+    canvas.answers = [True]
+    assert afk_watch.poll_afk_pause() is True       # 新弹窗又能停
+
+
+def test_canvas_probe_is_throttled_while_idle(tmp_path, monkeypatch):
+    canvas = _Canvas(False)
+    _watch(monkeypatch, tmp_path, canvas, interval=10.0)
+    for _ in range(20):
+        afk_watch.poll_afk_pause()
+    assert canvas.calls == 1                        # 空闲时每 interval 才问一次
+
+
+def test_canvas_probe_runs_every_poll_while_holding(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas, interval=10.0)
+    for _ in range(5):
+        assert afk_watch.poll_afk_pause() is True
+    assert canvas.calls == 5                        # 停着时要尽快看到弹窗消失
+
+
+def test_set_canvas_watch_switches_the_direct_probe(monkeypatch):
+    monkeypatch.setattr(afk_watch, "_canvas_watch", False)
+    afk_watch.set_canvas_watch(True)
+    assert afk_watch._canvas_watch is True
+    afk_watch.set_canvas_watch(False)
+    assert afk_watch._canvas_watch is False
+
+
+# ── 自己解弹窗: 画布上第一次看到弹窗字就调 afk_solver, 每个弹窗只解一次 ─────────────────────────────────
+# 2026-10-18: florr-auto-afk 总在弹窗出现 31~43 秒后才发现, 解题要 13~24 秒, 弹窗只活 ~58 秒, 6 次里 3 次被踢。
+
+def _solver(monkeypatch, result=True, raises=None):
+    import afk_solver
+    calls = []
+
+    def fake():
+        calls.append(1)
+        if raises:
+            raise raises
+        return result
+
+    monkeypatch.setattr(afk_solver, "solve_popup", fake)
+    return calls
+
+
+def test_self_solve_runs_once_when_the_popup_first_appears(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_self_solve", True)
+    calls = _solver(monkeypatch, result=False)
+    for _ in range(5):
+        assert afk_watch.poll_afk_pause() is True
+    assert len(calls) == 1                         # 弹窗一直在: 只解一次, 不是每拍都去拖
+
+
+def test_self_solve_off_never_calls_the_solver(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    calls = _solver(monkeypatch)
+    assert afk_watch.poll_afk_pause() is True
+    assert calls == []
+
+
+def test_self_solve_rearms_after_the_popup_disappears(tmp_path, monkeypatch):
+    canvas = _Canvas(True, False, True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_self_solve", True)
+    calls = _solver(monkeypatch)
+    afk_watch.poll_afk_pause()                     # 弹窗 1
+    afk_watch.poll_afk_pause()                     # 字没了(宽限 0)
+    afk_watch.poll_afk_pause()                     # 弹窗 2
+    assert len(calls) == 2
+
+
+def test_self_solve_works_without_the_florr_auto_afk_helper_but_does_not_hold(tmp_path, monkeypatch):
+    # afk_enabled 关着(画布停手没开): 照样自己解, 但解完不停着等(没有助手来接手, 站着不动只会挨打)
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_canvas_watch", False)
+    monkeypatch.setattr(afk_watch, "_self_solve", True)
+    calls = _solver(monkeypatch)
+    assert afk_watch.poll_afk_pause() is False
+    assert len(calls) == 1
+
+
+def test_a_failed_self_solve_keeps_holding_so_florr_auto_afk_can_try(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_self_solve", True)
+    _solver(monkeypatch, result=False)
+    assert afk_watch.poll_afk_pause() is True
+    assert afk_watch.poll_afk_pause() is True
+
+
+def test_a_crashing_solver_never_takes_the_worker_down(tmp_path, monkeypatch, capsys):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_self_solve", True)
+    calls = _solver(monkeypatch, raises=RuntimeError("boom"))
+    assert afk_watch.poll_afk_pause() is True      # 照样停着
+    assert len(calls) == 1
+    assert "自己解弹窗出错" in capsys.readouterr().out
+
+
+def test_the_solver_runs_before_poll_returns_so_the_bot_is_still_while_it_drags(tmp_path, monkeypatch):
+    canvas = _Canvas(True)
+    _watch(monkeypatch, tmp_path, canvas)
+    monkeypatch.setattr(afk_watch, "_self_solve", True)
+    order = []
+    import afk_solver
+    monkeypatch.setattr(afk_solver, "solve_popup", lambda: order.append("solve") or True)
+    order.append("before")
+    afk_watch.poll_afk_pause()
+    order.append("after")
+    assert order == ["before", "solve", "after"]
+
+
+def test_set_self_solve_switches_the_flag(monkeypatch):
+    monkeypatch.setattr(afk_watch, "_self_solve", False)
+    afk_watch.set_self_solve(True)
+    assert afk_watch._self_solve is True
+    afk_watch.set_self_solve(False)
+    assert afk_watch._self_solve is False
+
+
+def test_the_hook_always_records_the_afk_popup_text_whatever_the_ui_scale():
+    """canvas_hook.js 只记 UI 缩放 1.0 / 离血条近 / 区域名的文字; 窗口小了(1024x768 缩放 0.711)弹窗标题就时有时无,
+    worker 看到弹窗又"消失"又出现、自己解弹窗读不到位置(2026-10-18 夜)。两行弹窗字必须无条件记, 并且跟
+    afk_watch.AFK_POPUP_TEXTS 同一份。"""
+    import re
+    from pathlib import Path
+    js = Path(__file__).with_name("canvas_hook.js").read_text(encoding="utf-8")
+    block = re.search(r"var AFK_TEXTS = \{(.*?)\};", js, re.S).group(1)
+    in_js = set(re.findall(r'"([^"]+)"\s*:', block))
+    assert in_js == set(afk_watch.AFK_POPUP_TEXTS)
+    assert "!AFK_TEXTS[String(text)]" in js

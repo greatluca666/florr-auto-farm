@@ -281,7 +281,7 @@ def knob_defaults(map_name):
         "far_chase_px": enemy_detect.FAR_CHASE_PX,
         "avoid_px": enemy_detect.avoid_trigger_px_for(
             map_name, enemy_detect.DEFAULT_AVOID_TRIGGER_PX),
-        "cautious_px": enemy_detect.CAUTIOUS_HOLD_PX,
+        "cautious_px": enemy_detect.cautious_hold_px_for(map_name, enemy_detect.CAUTIOUS_HOLD_PX),
     }
 
 
@@ -502,8 +502,8 @@ class EnemyRulesDialog(ctk.CTkToplevel):
         "chase_max_px": "只追这个半径内的怪, 再远的交回漫游。",
         "far_chase_px": "超出追击上限、但在刷怪区里且小地图上直线走得到的怪, 追到这个半径。",
         "cautious_px": "谨慎怪(你设成「谨慎」的, 以及内置的 Ultra 沙尘暴 / 仙人掌等)追到这个距离就停; "
-                       "比这个距离的 85% 还近就背离它走, 保持住。默认 500 屏幕像素, 随游戏 zoom 变。"
-                       "远程 / 召唤想离得近一点打, 就调小。",
+                       "比这个距离的 85% 还近就背离它走, 保持住。默认 500 屏幕像素(蚁穴 130, 花瓣够得着的范围), "
+                       "随游戏 zoom 变。远程 / 召唤想离得近一点打, 就调小。",
         "avoid_px": "躲避类怪(含你设成「躲」的)进到这个半径就跑。蚁穴内置 200, 其余图 400。只改触发半径, "
                     "不改躲开后继续躲的那 450px 滞回, 也不改蚁穴究极冲过来时 400px 的提前躲。",
     }

@@ -12,6 +12,7 @@ certifi                # server_lookup.py's explicit SSLContext (needed on Windo
 cryptography           # updater.py: verifies the Ed25519 signature on update packages
 customtkinter          # gui_app.py dark-theme GUI (pure Python; pulls darkdetect, packaging)
 flask                  # webctl.py: web control panel backend
+psutil                 # stall_watch.py: on a stall, logs system CPU/memory + the busiest processes (optional: it degrades to a note if missing)
 
 # --- packaging only, not needed to just run main.py ---
 pyinstaller
